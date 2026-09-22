@@ -1,0 +1,122 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/tests/html.bjo — (bjoweb html) on its own. No server anywhere.
+;;
+;;     bjo run tests/html.bjo
+;;
+;; Every node is on its own line, indented two spaces a level, and every line
+;; is terminated — including the last. The expectations below are written with
+;; explicit `\n` so that a stray trailing space cannot hide in them.
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjoweb core))
+(import (bjoweb html))
+
+(: shout (-> string string))
+(defun (shout s) (string-upcase s))
+
+(: item (-> string Node))
+(defun (item s) (NSub (list (NSym 'li) (NText s))))
+
+;; `defun`, not `defbjo`: nothing here suspends. Rendering is a pure walk over
+;; a tree, which is the point of keeping it in a module with no server in it.
+(defun (main args)
+  ;; --- the shape ------------------------------------------------------------
+  (expect "an element" (render '(p "hi")) "<p>\n  hi\n</p>\n")
+  (expect "nesting"
+          (render '(div (p "a") (p "b")))
+          "<div>\n  <p>\n    a\n  </p>\n  <p>\n    b\n  </p>\n</div>\n")
+  (expect "an empty element" (render '(div)) "<div>\n</div>\n")
+  (expect "a fragment has no wrapper"
+          (render '((li "a") (li "b")))
+          "<li>\n  a\n</li>\n<li>\n  b\n</li>\n")
+  (expect "nothing at all" (render '()) "")
+
+  ;; --- attributes -----------------------------------------------------------
+  (expect "an attribute"
+          (render '(a (@ (href "/next")) "go")) "<a href=\"/next\">\n  go\n</a>\n")
+  (expect "several"
+          (render '(div (@ (class "card") (id "main")) "x"))
+          "<div class=\"card\" id=\"main\">\n  x\n</div>\n")
+  (expect "a boolean attribute"
+          (render '(input (@ (type "checkbox") (checked))))
+          "<input type=\"checkbox\" checked>\n")
+  (expect "attributes are not also children"
+          (render '(p (@ (class "c")))) "<p class=\"c\">\n</p>\n")
+
+  ;; --- void elements --------------------------------------------------------
+  (expect "a void element has no closing tag" (render '(br)) "<br>\n")
+  (expect "and still takes attributes"
+          (render '(img (@ (src "/a.png") (alt "a")))) "<img src=\"/a.png\" alt=\"a\">\n")
+  (expect "a void element among children"
+          (render '(p "a" (br) "b")) "<p>\n  a\n  <br>\n  b\n</p>\n")
+
+  ;; --- whitespace-significant elements are left exactly alone ---------------
+  ;;
+  ;; The content of these *is* the content. Indenting inside one would not tidy
+  ;; it, it would edit it — so nothing is added, not even around child elements.
+  (expect "pre keeps its own newlines and adds none"
+          (render '(pre "line one\nline two"))
+          "<pre>line one\nline two</pre>\n")
+  (expect "pre with a child element is still byte for byte"
+          (render '(pre "a" (b "c") "d")) "<pre>a<b>c</b>d</pre>\n")
+  (expect "textarea keeps its spaces"
+          (render '(textarea (@ (name "t")) "  keep   me  "))
+          "<textarea name=\"t\">  keep   me  </textarea>\n")
+
+  ;; --- escaping, which is the whole reason this is typed --------------------
+  (expect "text is escaped"
+          (render '(p "a < b & c > d")) "<p>\n  a &lt; b &amp; c &gt; d\n</p>\n")
+  (expect "an ampersand is not double-escaped"
+          (render '(p "&lt;")) "<p>\n  &amp;lt;\n</p>\n")
+  (expect "a quote in an attribute"
+          (render '(p (@ (title "say \"hi\"")) "x"))
+          "<p title=\"say &quot;hi&quot;\">\n  x\n</p>\n")
+  (expect "an angle bracket in an attribute"
+          (render '(p (@ (title "a<b")) "x")) "<p title=\"a&lt;b\">\n  x\n</p>\n")
+  ;; An attribute value is a string, not markup, and must not gain a newline
+  ;; however the pretty printer feels about it.
+  (expect "an attribute value never gets a newline"
+          (render '(p (@ (title "one two")) "x")) "<p title=\"one two\">\n  x\n</p>\n")
+
+  ;; --- computed content -----------------------------------------------------
+  (def who "Bj<o>rn")
+  (expect "an unquoted string is text, and is escaped"
+          (render '(p "hi " ,who)) "<p>\n  hi \n  Bj&lt;o&gt;rn\n</p>\n")
+  (expect "an unquoted call" (render '(p ,(shout "abc"))) "<p>\n  ABC\n</p>\n")
+  (expect "a number written in the literal" (render '(p "n=" 41)) "<p>\n  n=\n  41\n</p>\n")
+  (def age 41)
+  (expect "a computed number, via int->string"
+          (render '(p ,(int->string age))) "<p>\n  41\n</p>\n")
+  (expect "a computed number, via the constructor"
+          (render '(p ,(NInt age))) "<p>\n  41\n</p>\n")
+
+  ;; --- raw, the escape hatch ------------------------------------------------
+  (expect "raw markup is passed through"
+          (render '(p ,(raw "<em>x</em>"))) "<p>\n  <em>x</em>\n</p>\n")
+  (expect "and is still distinguishable from text"
+          (render '(p "<em>x</em>")) "<p>\n  &lt;em&gt;x&lt;/em&gt;\n</p>\n")
+
+  ;; --- built by hand, not from a literal ------------------------------------
+  (def rows (list-map item (list "one" "two")))
+  (expect "a computed list of children"
+          (render '(ul ,(NSub rows)))
+          "<ul>\n  <li>\n    one\n  </li>\n  <li>\n    two\n  </li>\n</ul>\n")
+
+  ;; --- the document and the response ---------------------------------------
+  (expect "a document has a doctype"
+          (document '(html (body "x")))
+          "<!DOCTYPE html>\n<html>\n  <body>\n    x\n  </body>\n</html>\n")
+  (def r (page '(html (body "x"))))
+  (expect "a page is html" (response-content-type r) "text/html; charset=utf-8")
+  (expect "with the doctype in its body"
+          (response-body r)
+          "<!DOCTYPE html>\n<html>\n  <body>\n    x\n  </body>\n</html>\n")
+  (expect "and 200 by default" (response-status r) 200)
+  (expect "or whatever you say" (response-status (page '(p "gone") #:status 410)) 410)
+
+  (println "html ok")
+  0)

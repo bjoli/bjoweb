@@ -1,0 +1,186 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/src/core.bjo — the module (bjoweb core).
+;;
+;; Defines the core types `Request` and `Response`, and the `Handler` type
+;; (-bjo-> Request Response). This module is independent of ASP.NET and can
+;; be used for testing without a web server.
+
+(export
+  ;; Core types. Transparent records for easy testing and manipulation.
+  Request Response Handler Header
+
+  ;; Request construction.
+  make-request
+
+  ;; Reading one.
+  request-method request-path request-body
+  request-query request-header request-param
+  request-query-or request-header-or request-param-or
+
+  ;; Making an answer.
+  respond text html json-text redirect
+  not-found method-not-allowed bad-request server-error
+
+  ;; Reading one, and adding to it.
+  response-status response-content-type response-headers response-body
+  with-status with-content-type with-header)
+
+(import (std prelude))
+
+;; ---------------------------------------------------------------------------
+;; A header, and the two records
+;; ---------------------------------------------------------------------------
+
+;; A header name and value pair. Represented as a `Vec` to allow multiple headers
+;; with the same name (e.g., `Set-Cookie`).
+(type (: Header (Alias (Tuple string string))))
+
+;; Represents an HTTP request.
+;; Note: `headers` keys are lower-cased. `body` contains the fully read and
+;; UTF-8 decoded request body. For streaming, access the raw `HttpContext`.
+(type (: Request (Record (: method string)
+                         (: path string)
+                         (: query (Map string string))
+                         (: headers (Map string string))
+                         (: params (Map string string))
+                         (: body string))))
+
+;; Represents an HTTP response. The response is fully constructed in memory
+;; before being written to the client.
+(type (: Response (Record (: status int)
+                          (: content-type string)
+                          (: headers (Vec Header))
+                          (: body string))))
+
+;; A bjoroutine that processes a request and returns a response.
+(type (: Handler (-bjo-> Request Response)))
+
+;; ---------------------------------------------------------------------------
+;; Making a request
+;; ---------------------------------------------------------------------------
+
+;; Creates a new request. Route `params` are populated later by the router.
+(: make-request (-> string string (Map string string) (Map string string) string Request))
+(defun (make-request method path query headers body)
+  (Request (method method)
+           (path path)
+           (query query)
+           (headers headers)
+           (params (map-empty))
+           (body body)))
+
+;; ---------------------------------------------------------------------------
+;; Reading one
+;; ---------------------------------------------------------------------------
+
+;; The request method, e.g. `"GET"`, `"POST"`.
+(: request-method (-> Request string))
+(defun (request-method r) (record-ref r method))
+
+;; The request path, excluding the query string. Always starts with `/`.
+(: request-path (-> Request string))
+(defun (request-path r) (record-ref r path))
+
+;; The body, or `""` when there was none.
+(: request-body (-> Request string))
+(defun (request-body r) (record-ref r body))
+
+;; Gets a decoded query parameter, or `None` if absent. Keeps the first value
+;; if a parameter is provided multiple times.
+(: request-query (-> Request string (Option string)))
+(defun (request-query r name) (map-try-ref (record-ref r query) name))
+
+;; Gets a header value case-insensitively.
+(: request-header (-> Request string (Option string)))
+(defun (request-header r name)
+  (map-try-ref (record-ref r headers) (string-downcase name)))
+
+;; Gets a route parameter bound by the router, or `None` if absent.
+(: request-param (-> Request string (Option string)))
+(defun (request-param r name) (map-try-ref (record-ref r params) name))
+
+;; Accessors with fallback values for when the key is not present.
+(: request-query-or (-> Request string string string))
+(defun (request-query-or r name fallback)
+  (map-ref-or (record-ref r query) name fallback))
+
+(: request-header-or (-> Request string string string))
+(defun (request-header-or r name fallback)
+  (map-ref-or (record-ref r headers) (string-downcase name) fallback))
+
+(: request-param-or (-> Request string string string))
+(defun (request-param-or r name fallback)
+  (map-ref-or (record-ref r params) name fallback))
+
+;; ---------------------------------------------------------------------------
+;; Making an answer
+;; ---------------------------------------------------------------------------
+
+;; Creates a base response. Other helpers build on this.
+(: respond (-> int string (#:content-type string) (#:headers (Vec Header)) Response))
+(defun (respond status body #:content-type "text/plain; charset=utf-8" #:headers (vec-empty))
+  (Response (status status) (content-type content-type) (headers headers) (body body)))
+
+(: text (-> string (#:status int) Response))
+(defun (text body #:status 200) (respond status body))
+
+(: html (-> string (#:status int) Response))
+(defun (html body #:status 200)
+  (respond status body #:content-type "text/html; charset=utf-8"))
+
+;; Creates a JSON response from an already serialized JSON string.
+(: json-text (-> string (#:status int) Response))
+(defun (json-text body #:status 200)
+  (respond status body #:content-type "application/json; charset=utf-8"))
+
+;; Creates a redirect response. Defaults to 302 (Found) unless `#:permanent #t` is specified.
+(: redirect (-> string (#:permanent bool) Response))
+(defun (redirect location #:permanent #f)
+  (respond (if permanent 301 302) ""
+           #:headers [(Tuple "Location" location)]))
+
+(: not-found (-> (#:body string) Response))
+(defun (not-found #:body "404 Not Found\n") (respond 404 body))
+
+;; Creates a 405 Method Not Allowed response with the given `Allow` header.
+(: method-not-allowed (-> string Response))
+(defun (method-not-allowed allow)
+  (respond 405 "405 Method Not Allowed\n" #:headers [(Tuple "Allow" allow)]))
+
+(: bad-request (-> string Response))
+(defun (bad-request why) (respond 400 (str "400 Bad Request: " why "\n")))
+
+;; Creates a 500 Internal Server Error response. Exception details are not included.
+(: server-error (-> Response))
+(defun (server-error) (respond 500 "500 Internal Server Error\n"))
+
+;; ---------------------------------------------------------------------------
+;; Reading an answer, and adding to it
+;; ---------------------------------------------------------------------------
+
+(: response-status (-> Response int))
+(defun (response-status r) (record-ref r status))
+
+(: response-content-type (-> Response string))
+(defun (response-content-type r) (record-ref r content-type))
+
+(: response-headers (-> Response (Vec Header)))
+(defun (response-headers r) (record-ref r headers))
+
+(: response-body (-> Response string))
+(defun (response-body r) (record-ref r body))
+
+;; Helpers for modifying a response in a pipeline style.
+(: with-status (-> Response int Response))
+(defun (with-status r code) (record-set r (status code)))
+
+(: with-content-type (-> Response string Response))
+(defun (with-content-type r ct) (record-set r (content-type ct)))
+
+;; Appends a header to the response, allowing multiple headers with the same name.
+(: with-header (-> Response string string Response))
+(defun (with-header r name value)
+  (record-set r (headers (vec-add (record-ref r headers) (Tuple name value)))))

@@ -1,0 +1,321 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/tests/demo.bjo — the whole framework, exercised against itself.
+;;
+;;     bjo run tests/demo.bjo
+;;
+;; It starts a real Kestrel on a port the test picked, fetches from it with
+;; `(std http)`, and stops it again. Nothing is faked: the requests go out over
+;; a socket and come back through the inbox.
+;;
+;; `(std http)` is imported with its types under a prefix and two defs renamed,
+;; because it and `(bjoweb core)` both have a `Request`, a `Response`, a
+;; `response-status` and a `response-headers`. One set is about the thing being
+;; sent and the other about the thing being served, and they are not the same
+;; types. `prefix-types` for the two types, because `rename` is for defs and
+;; macros only, and it takes the union's constructors along with it — hence
+;; `http/Text` and `http/DELETE` below.
+
+(import (std prelude))
+(import (std simpletest))
+(import (prefix-types (rename (std http)
+                              (response-status http-status)
+                              (response-headers http-headers))
+                      "http/"))
+(import (bjoweb core))
+(import (bjoweb router))
+(import (bjoweb server))
+
+;; ---------------------------------------------------------------------------
+;; A free port, chosen here
+;; ---------------------------------------------------------------------------
+;; Asking the OS for port 0 and giving it straight back leaves a window in which
+;; somebody else could take it. The alternative is a hard-coded port, which has
+;; the same problem and no upper bound on how long it lasts.
+
+(import/class
+  (Listener  (: System.Net.Sockets.TcpListener (-> Address int Listener)))
+  (Address   (: System.Net.IPAddress))
+  (Endpoint  (: System.Net.EndPoint))
+  (Object    (: System.Object))
+  (Boom      (: System.InvalidOperationException (-> string Boom))))
+
+(import/extern
+  (loopback  (: System.Net.IPAddress.Loopback Address #:get))
+  (start-it  (: System.Net.Sockets.TcpListener.Start (-> Listener void)))
+  (stop-it   (: System.Net.Sockets.TcpListener.Stop (-> Listener void)))
+  (bound-to  (: System.Net.Sockets.TcpListener.LocalEndpoint (-> Listener Endpoint) #:get))
+  (ip-port   (: System.Net.IPEndPoint.Port (-> System.Net.IPEndPoint int) #:get)))
+
+(: free-port (-> int))
+(defun (free-port)
+  (def listener (Listener. loopback 0))
+  (start-it listener)
+  ;; `LocalEndpoint` is typed as the base `EndPoint`, and only an `IPEndPoint`
+  ;; has a port. A type test is how that is asked in this language.
+  (def port (match (cast Object (bound-to listener))
+              ((:is System.Net.IPEndPoint here) (ip-port here))
+              (_ 0)))
+  (stop-it listener)
+  port)
+
+;; ---------------------------------------------------------------------------
+;; The application
+;; ---------------------------------------------------------------------------
+
+;; A parameter installed around `start-server`, to see that a handler runs with
+;; the environment of the fiber that started the server rather than with
+;; Kestrel's — which has none.
+(def greeting (make-parameter "unset"))
+
+(: home (-bjo-> Request Response))
+(defbjo (home req) (text "hello"))
+
+;; `/hello/:name`, and the name arrives already percent-decoded.
+(: greet (-bjo-> Request Response))
+(defbjo (greet req)
+  (text (str "hello, " (request-param-or req "name" "nobody"))))
+
+;; A handler that suspends. This is the reason a handler is a bjoroutine: it
+;; may wait for anything a fiber may wait for, and the worker answering the
+;; next request is not held up by it.
+(: slow (-bjo-> Request Response))
+(defbjo (slow req)
+  (sync (timeout 30))
+  (text "eventually"))
+
+;; Slow enough that a burst cannot drain while it arrives, for the overflow
+;; check at the end.
+(: dawdle (-bjo-> Request Response))
+(defbjo (dawdle req)
+  (sync (timeout 400))
+  (text "done"))
+
+(def busy-app (router (route-get "/" dawdle)))
+
+(: echo (-bjo-> Request Response))
+(defbjo (echo req)
+  (json-text (str "{\"said\":\"" (request-body req) "\"}")))
+
+(: show-query (-bjo-> Request Response))
+(defbjo (show-query req)
+  (text (str (request-query-or req "a" "-") ";" (request-query-or req "b" "-"))))
+
+(: show-header (-bjo-> Request Response))
+(defbjo (show-header req)
+  (text (request-header-or req "x-note" "-")))
+
+(: show-rest (-bjo-> Request Response))
+(defbjo (show-rest req)
+  (text (request-param-or req "path" "-")))
+
+(: from-the-environment (-bjo-> Request Response))
+(defbjo (from-the-environment req)
+  (text (parameter-ref greeting)))
+
+;; Raises. The framework turns it into a 500 whose body says nothing about it.
+(: boom (-bjo-> Request Response))
+(defbjo (boom req)
+  (raise (cast Exception (Boom. "the handler exploded"))))
+
+(def app
+  (router
+    (route-get    "/"             home)
+    (route-get    "/hello/:name"  greet)
+    (route-get    "/slow"         slow)
+    (route-post   "/echo"         echo)
+    (route-get    "/query"        show-query)
+    (route-get    "/headers"      show-header)
+    (route-get    "/static/*path" show-rest)
+    (route-get    "/environment"  from-the-environment)
+    (route-get    "/boom"         boom)
+    ;; An ordinary lambda in a slot declared `(-bjo-> ...)`: the compiler lifts
+    ;; it, so a handler that never suspends needs no `defbjo` of its own.
+    (route-get    "/elsewhere"    (fun (req) (redirect "/")))
+    (route-delete "/thing"        (fun (req) (with-status (text "") 204)))))
+
+;; ---------------------------------------------------------------------------
+;; A client
+;; ---------------------------------------------------------------------------
+
+(: fetched (-bjo-> http/Request (Tuple int string)))
+(defbjo (fetched req)
+  (match (fetch req)
+    ((Err e) (Tuple 0 (.-Message e)))
+    ((Ok r)
+     (let* ((body (response-text r))
+            (code (http-status r)))
+       ;; A response owns a connection; `ignore` is what closes it.
+       (ignore r)
+       (Tuple code body)))))
+
+(: body-of (-bjo-> string (Tuple int string)))
+(defbjo (body-of url) (fetched (get url)))
+
+;; The status alone, and the header that goes with a refusal.
+(: status-and-retry (-bjo-> string (Tuple int string)))
+(defbjo (status-and-retry url)
+  (match (fetch (get url))
+    ((Err e) (Tuple 0 (.-Message e)))
+    ((Ok r)
+     (let* ((code (http-status r))
+            (retry (match (response-header r "retry-after")
+                     ((Some v) v)
+                     (None "-"))))
+       (ignore r)
+       (Tuple code retry)))))
+
+;; `n` requests at once, tallied by what came back — status *and* the header
+;; that goes with it, so that a refusal which forgot its `Retry-After` reads
+;; differently from one that has it. "200x2 503+retry-after=1x4".
+(: burst (-bjo-> string int string))
+(defbjo (burst url n)
+  (def waiting
+    (loop (:for i (range 0 n))
+          (:acc out (vecing (bjo (status-and-retry url))))))
+  (def labels
+    (loop (:for p waiting)
+          (:acc out (vecing (match (sync (promise-join p))
+                              ((Ok (Tuple code retry))
+                               (if (= retry "-")
+                                   (int->string code)
+                                   (str (int->string code) "+retry-after=" retry)))
+                              ((Err e) (.-Message e)))))))
+  (def tally
+    (loop (:for l labels)
+          (:acc all (folding (map-empty) (map-set all l (+ 1 (map-ref-or all l 0)))))))
+  (string-join (loop (:for l (list-sort (seq->list (map-keys tally))))
+                     (:acc out (vecing (str l "x" (int->string (map-ref-or tally l 0))))))
+               " "))
+
+;; Several at once, to see that the workers really do run side by side and that
+;; nothing crosses over between two requests in flight.
+(: fetch-together (-bjo-> string int (Vec string)))
+(defbjo (fetch-together url n)
+  (def waiting
+    (loop (:for i (range 0 n))
+          (:acc out (vecing (bjo (body-of (str url "/hello/" (int->string i))))))))
+  (loop (:for p waiting)
+        (:acc out (vecing (match (sync (promise-join p))
+                            ((Ok (Tuple code body)) body)
+                            ((Err e) (.-Message e)))))))
+
+;; ---------------------------------------------------------------------------
+;; The routing table on its own, with no server anywhere
+;; ---------------------------------------------------------------------------
+
+(: what-happens (-> string string string))
+(defun (what-happens method path)
+  (match (router-match app (make-request method path (map-empty) (map-empty) ""))
+    ((Matched bound handler)
+     (str "matched " (request-param-or bound "name" (request-param-or bound "path" ""))))
+    ((WrongMethod allow) (str "405 " allow))
+    (Unmatched "404")))
+
+;; ---------------------------------------------------------------------------
+;; Running it
+;; ---------------------------------------------------------------------------
+
+(defbjo (main args)
+  ;; --- the router, which needs nothing running -----------------------------
+  (expect "a literal route"        (what-happens "GET" "/") "matched ")
+  (expect "a bound parameter"      (what-happens "GET" "/hello/ada") "matched ada")
+  (expect "a trailing wildcard"    (what-happens "GET" "/static/css/site.css")
+          "matched css/site.css")
+  (expect "a trailing slash is the same path" (what-happens "GET" "/hello/ada/") "matched ada")
+  (expect "one segment too many"   (what-happens "GET" "/hello/ada/x") "404")
+  (expect "nothing claims it"      (what-happens "GET" "/nowhere") "404")
+  (expect "the wrong verb"         (what-happens "PUT" "/") "405 GET")
+  (expect "HEAD is served by GET"  (what-happens "HEAD" "/") "matched ")
+
+  ;; --- and now a real socket -----------------------------------------------
+  (def port (free-port))
+  (def base (str "http://127.0.0.1:" (int->string port)))
+
+  (parameterize ((greeting "from the fiber that started the server"))
+    (with-scope
+      ;; The workers are spawned into this scope. `stop-server!` in the
+      ;; `#:finally` is what lets it end.
+      (let ((server (start-server app #:port port #:workers 4 #:queue 32)))
+        (try
+            (let ()
+              (expect "the url it is listening on" (server-url server) base)
+
+              (expect "GET /" (body-of (str base "/")) (Tuple 200 "hello"))
+
+              ;; ASP.NET decodes the path before this framework ever sees it.
+              (expect "a percent-encoded parameter"
+                      (body-of (str base "/hello/Bj%C3%B6rn")) (Tuple 200 "hello, Björn"))
+
+              (expect "a query string, with + for a space"
+                      (body-of (str base "/query?a=1&b=two+words")) (Tuple 200 "1;two words"))
+
+              (expect "a request header"
+                      (fetched (get (str base "/headers") #:headers [(Tuple "X-Note" "hi")]))
+                      (Tuple 200 "hi"))
+
+              (expect "everything after the wildcard"
+                      (body-of (str base "/static/css/site.css")) (Tuple 200 "css/site.css"))
+
+              (expect "a body sent and read back"
+                      (fetched (post (str base "/echo") (http/Text "ping")))
+                      (Tuple 200 "{\"said\":\"ping\"}"))
+
+              (expect "a handler that suspends"
+                      (body-of (str base "/slow")) (Tuple 200 "eventually"))
+
+              (expect "the environment of whoever started the server"
+                      (body-of (str base "/environment"))
+                      (Tuple 200 "from the fiber that started the server"))
+
+              (expect "a redirect, followed by the client"
+                      (body-of (str base "/elsewhere")) (Tuple 200 "hello"))
+
+              (expect "no route" (body-of (str base "/nowhere")) (Tuple 404 "404 Not Found\n"))
+
+              (expect "the wrong verb"
+                      (fetched (post (str base "/") http/Empty))
+                      (Tuple 405 "405 Method Not Allowed\n"))
+
+              (expect "a handler that raised"
+                      (body-of (str base "/boom")) (Tuple 500 "500 Internal Server Error\n"))
+
+              (expect "a status with no body"
+                      (fetched (request http/DELETE (str base "/thing"))) (Tuple 204 ""))
+
+              ;; Twelve at once through four workers: every answer is the one
+              ;; its own request asked for, so no two requests were confused.
+              (expect "twelve at once, each answered its own question"
+                      (string-join (fetch-together base 12) "|")
+                      (string-join (loop (:for i (range 0 12))
+                                         (:acc out (vecing (str "hello, " (int->string i)))))
+                                   "|"))
+
+              (expect "nothing was dropped" (server-dropped-count server) 0))
+          #:finally (stop-server! server)))))
+
+  ;; --- a queue that overflows ----------------------------------------------
+  ;;
+  ;; One worker and one queue slot, six at once: four have nowhere to go. What
+  ;; they must get is 503 and not 500 — the server is up, it is busy — and the
+  ;; refusal must not cost an exception, because the load that overflows a
+  ;; queue is exactly the load that cannot afford a stack trace per request.
+  (def busy-port (free-port))
+  (def busy-base (str "http://127.0.0.1:" (int->string busy-port) "/"))
+  (with-scope
+    (let ((server (start-server busy-app #:port busy-port #:workers 1 #:queue 1)))
+      (try
+          (let ()
+            (expect "a full queue answers 503 with a Retry-After, not 500"
+                    (burst busy-base 6) "200x2 503+retry-after=1x4")
+            (expect "the refusals were counted" (server-dropped-count server) 4)
+            ;; And the server is still a server afterwards: a refusal is not a
+            ;; connection it has lost track of.
+            (expect "it serves normally once the queue has drained"
+                    (body-of busy-base) (Tuple 200 "done")))
+        #:finally (stop-server! server))))
+
+  (println "bjoweb ok")
+  0)

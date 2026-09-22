@@ -1,0 +1,43 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/examples/hello.bjo — the smallest whole thing.
+;;
+;;     bjo run examples/hello.bjo
+;;     curl http://127.0.0.1:8080/
+;;     curl http://127.0.0.1:8080/hello/ada
+;;     curl -X POST --data-binary 'shout' http://127.0.0.1:8080/echo
+;;
+;; Ctrl-C stops it: `serve` returns when the host does, the inbox is closed,
+;; and the workers land.
+
+(import (std prelude))
+(import (bjoweb core))
+(import (bjoweb router))
+(import (bjoweb server))
+
+;; A handler is `(-bjo-> Request Response)`. One that never suspends can be an
+;; ordinary `fun` — the compiler lifts it into the slot.
+(: hello (-bjo-> Request Response))
+(defbjo (hello req)
+  (text (str "hello, " (request-param-or req "name" "world") "\n")))
+
+;; One that does suspend is why a handler is a bjoroutine in the first place.
+;; This one only waits; a real one would read a file or call a service.
+(: slowly (-bjo-> Request Response))
+(defbjo (slowly req)
+  (sync (timeout 250))
+  (text "that took a moment\n"))
+
+(defbjo (main args)
+  (serve
+   (router
+     (route-get  "/"            (fun (req) (html "<h1>bjoweb</h1>\n")))
+     (route-get  "/hello/:name" hello)
+     (route-get  "/slow"        slowly)
+     (route-post "/echo"        (fun (req) (text (str (request-body req) "\n"))))
+     (route-get  "/headers"     (fun (req) (text (str (request-header-or req "user-agent" "?")
+                                                      "\n")))))
+   #:port 8080)
+  0)

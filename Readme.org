@@ -1,0 +1,293 @@
+* bjoweb — a small web framework for Bjolang
+
+Kestrel on one side, fibers on the other, an inbox between them.
+
+#+BEGIN_SRC scheme
+(import (std prelude))
+(import (bjoweb core))
+(import (bjoweb router))
+(import (bjoweb server))
+
+(: hello (-bjo-> Request Response))
+(defbjo (hello req)
+  (text (str "hello, " (request-param-or req "name" "world") "\n")))
+
+(defbjo (main args)
+  (serve (router
+           (route-get "/"            (fun (req) (html "<h1>bjoweb</h1>")))
+           (route-get "/hello/:name" hello))
+         #:port 8080)
+  0)
+#+END_SRC
+
+#+BEGIN_SRC sh
+bjo run examples/hello.bjo
+#+END_SRC
+
+** Architecture
+
+A .NET web server calls handlers on its own threads, which are not fibers and lack Bjolang's effect handlers, parameters, and cancellation scopes. To bridge this, `bjoweb` runs your code in worker fibers.
+
+The ASP.NET middleware simply posts the ~HttpContext~ into an inbox:
+
+#+BEGIN_SRC scheme
+(fun (ctx next) (cast Task (inbox-call/token requests ctx (ctx-aborted ctx))))
+#+END_SRC
+
+A worker fiber receives the call with its original environment intact, reads the request, runs your handler, writes the response, and completes the task. This returns the ~HttpContext~ to Kestrel for the next request.
+
+For more details, see ~(std inbox)~.
+
+** The four modules
+
+| Module            | What is in it                                       | ASP.NET? |
+|-------------------+-----------------------------------------------------+----------|
+| ~(bjoweb core)~   | ~Request~, ~Response~ and the functions over them    | no       |
+| ~(bjoweb router)~ | routes, patterns, matching                           | no       |
+| ~(bjoweb html)~   | SXML as a literal, escaping, rendering               | no       |
+| ~(bjoweb server)~ | Kestrel, the inbox, the workers, the two conversions | all of it |
+
+Two thirds of this package never name an ASP.NET type, which is why two thirds
+of it can be unit-tested with no socket anywhere:
+
+#+BEGIN_SRC scheme
+(router-match app (make-request "GET" "/hello/ada" (map-empty) (map-empty) ""))
+;; => (Matched <request with params {"name" "ada"}> <handler>)
+#+END_SRC
+
+It is also what the framework's ~(frameworks "Microsoft.AspNetCore.App")~ buys:
+declaring it lets ~(bjoweb server)~ *name* ASP.NET types. Your own package needs
+no declaration at all unless it names one too — see ~Docs/Projects.org~,
+"Shared frameworks".
+
+** A handler
+
+#+BEGIN_SRC scheme
+(: show-user (-bjo-> Request Response))
+(defbjo (show-user req)
+  (match (load-user (request-param-or req "id" ""))
+    (None (not-found))
+    ((Some u) (json-text (user->json u)))))
+#+END_SRC
+
+A handler is a bjoroutine ~(-bjo-> Request Response)~. A handler that doesn't suspend can be an ordinary ~(fun (req) ...)~; the compiler will lift it automatically.
+
+Because handlers return a complete ~Response~ value, nothing is written to the client until the function returns. If a handler raises an exception, the server responds with a clean 500 error instead of a partially written response.
+
+*** Reading the request
+
+| ~(request-method req)~              | ~"GET"~, ~"POST"~ — upper case, as it arrived      |
+| ~(request-path req)~                | ~"/hello/ada"~, already percent-decoded            |
+| ~(request-body req)~                | the whole body as UTF-8 text, or ~""~              |
+| ~(request-param req "id")~          | what ~/users/:id~ bound — an ~Option~              |
+| ~(request-query req "page")~        | ~?page=2~, decoded, ~+~ counted as a space         |
+| ~(request-header req "Accept")~     | case-insensitive                                   |
+
+Each of the last three has an ~-or~ form taking a fallback:
+~(request-query-or req "page" "1")~.
+
+*** Writing the response
+
+| ~(text "hi")~                  | ~text/plain; charset=utf-8~            |
+| ~(html "<p>hi</p>")~           | ~text/html; charset=utf-8~             |
+| ~(json-text "{\"a\":1}")~      | ~application/json; charset=utf-8~      |
+| ~(respond 418 "no" #:content-type "text/plain")~ | anything else        |
+| ~(redirect "/next")~           | 302, or 301 with ~#:permanent #t~      |
+| ~(not-found)~ ~(bad-request why)~ ~(method-not-allowed allow)~ ~(server-error)~ | |
+
+All of them take ~#:status~ where a status makes sense, and three combinators
+build on any of them:
+
+#+BEGIN_SRC scheme
+(with-header (with-status (text "gone") 410) "X-Why" "tidied up")
+#+END_SRC
+
+~with-header~ appends rather than replaces, so a response can carry two
+~Set-Cookie~ s.
+
+There is no JSON writer here. ~(text json)~ is one import away, and putting one
+in this package would make every program that serves plain text carry it.
+
+** HTML
+
+#+BEGIN_SRC scheme
+(page '(html (head (title "bjoweb"))
+             (body (@ (class "card"))
+                   (h1 "bjoweb")
+                   (p "you asked for " (b ,what))
+                   (hr)
+                   (ul ,(NSub rows)))))
+#+END_SRC
+
+SXML, as a quoted literal. *No macro and no per-tag functions* — a quoted
+literal with nesting in it stands for a union, and which case each piece becomes
+is decided by its shape before anything is inferred: a symbol is a tag, a string
+is text, a nested list is a child. See
+~TestFiles/100_literal_elaboration.bjo~ in the compiler for the mechanism.
+
+Which also means the tag vocabulary costs nothing and collides with nothing —
+~a~, ~b~, ~p~, ~map~ and ~table~ are data here, not names.
+
+- ~(@ (class "card") (id "main"))~ as the first child is the attribute list.
+  A pair with no value is a boolean attribute: ~(@ (checked))~.
+- ~,expr~ splices a computed value in, inside the *ordinary* quote — there is no
+  backtick. It is chosen by its type: a ~string~ becomes text, a ~Raw~ is passed
+  through unescaped.
+- A list whose head is not a symbol is a fragment, so ~'((li "a") (li "b"))~
+  renders with no wrapper.
+- Void elements — ~br~, ~img~, ~meta~, ~hr~ and the rest — get no closing tag.
+
+*Text is escaped and attribute values doubly so*, which is the reason to have
+this rather than string concatenation. ~,(raw "<em>x</em>")~ is the way past,
+spelled as a call so that every place trust is claimed can be grepped for.
+
+*** The output has newlines
+
+Every node on its own line, two spaces a level, every line terminated. There is
+no minified mode and no flag asking for one.
+
+#+BEGIN_SRC html
+<ul>
+  <li>
+    <a href="/page/banana">
+      banana
+    </a>
+  </li>
+</ul>
+#+END_SRC
+
+What that costs, because it is not free: a newline is whitespace, and HTML
+collapses runs of whitespace to a single space in ordinary content. So
+~'(p "a" (b "c") "d")~ is printed across four lines and a browser renders
+~a c d~ rather than ~acd~. Indented markup and byte-exact inline text are not
+both available, and this picks the first.
+
+Where the text *is* the content — ~pre~ and ~textarea~ — nothing whatsoever is
+added, child elements included, because indenting inside one of those does not
+tidy it up, it edits it. Attribute values are never broken either: a newline in
+one is not a nicety, it is a different value.
+
+One sharp edge: an unquoted *number* is not chosen, because a numeric literal
+stays polymorphic until it is defaulted — the error reads "'41' is a number, and
+it is being used where a 'Node' is wanted". A number written literally in the
+quote is fine; for a computed one write ~,(int->string n)~ or ~,(NInt n)~.
+
+~render~ gives a string, ~document~ the same with a doctype, and ~page~ a whole
+~Response~ with ~text/html; charset=utf-8~ on it.
+
+** Routing
+
+#+BEGIN_SRC scheme
+(router
+  (route-get    "/"                home)
+  (route-get    "/users/:id"       show-user)
+  (route-post   "/users"           create-user)
+  (route-delete "/users/:id"       delete-user)
+  (route-get    "/static/*path"    serve-file))
+#+END_SRC
+
+A pattern is split on ~/~. A piece beginning with ~:~ matches one segment and
+binds it; a piece beginning with ~*~ matches everything left, slashes included,
+and binds that; anything else is a literal. Empty pieces are dropped, so ~/a~
+and ~/a/~ are one path.
+
+First match wins, and *there is no specificity ranking*. Routes are evaluated in the order they are defined. Ensure more specific routes (like ~/users/new~) are listed before general ones (like ~/users/:id~).
+
+Three things happen to a request:
+
+- a route matches — its handler runs;
+- the *path* matches but no route has that verb — 405, with the ~Allow~ header
+  the RFC asks for and nobody sends;
+- nothing matches — the fallback, which is a plain 404 until
+  ~(with-fallback rt handler)~ says otherwise.
+
+A ~HEAD~ with no ~HEAD~ route of its own is answered by the ~GET~ one.
+
+~(route "OPTIONS" "/*path" preflight)~ is the general form, for verbs with no
+helper.
+
+** Running it
+
+~serve~ is what a ~main~ wants: start, serve until Ctrl-C, stop.
+
+#+BEGIN_SRC scheme
+(serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t)
+#+END_SRC
+
+~start-server~ and ~stop-server!~ are the pair for a program that has something
+else to do — a test, mostly:
+
+#+BEGIN_SRC scheme
+(with-scope
+  (let ((server (start-server app #:port port)))
+    (try
+        (... use it ...)
+      #:finally (stop-server! server))))
+#+END_SRC
+
+*Workers are spawned into the caller's scope.* Therefore, ~start-server~ must be used inside a ~with-scope~ that shouldn't end until ~stop-server!~ is called. Using ~serve~ handles this automatically.
+
+~stop-server!~ stops Kestrel first and closes the inbox second. Kestrel's stop
+waits for the requests already in the pipeline, and those are calls the workers
+still have to answer — so the inbox has to be open while it runs. Closing it
+afterwards is what tells the workers there will be no more.
+
+*** The two numbers
+
+~#:workers~ sets concurrency. ~#:queue~ sets how many requests can wait before the server returns a 503. The queue drops the *newest* requests to fail fast. 
+
+A refused request returns ~503 Service Unavailable~ with ~Retry-After: 1~. This is handled gracefully without throwing exceptions in the middleware, avoiding unnecessary stack traces in Kestrel under load. ~(server-dropped-count server)~ returns the number of refused requests.
+
+*** A client that goes away
+
+The framework listens to Kestrel's ~RequestAborted~ token to detect disconnected clients:
+
+- *Still queued:* The request is dropped and never reaches a worker.
+- *Already processing:* The response is discarded and not written to the socket. The handler itself is *not* killed; it is allowed to finish to ensure side effects are safely completed.
+
+** What this is not
+
+No dependency injection, no configuration system, no authentication, no static
+file server, no content negotiation, no TLS, no HTTP/2, no websockets, no
+streaming bodies. Kestrel can do all of those and none of them is here.
+
+~(bjoweb server)~ exports ~Ctx~ — the ~HttpContext~ type itself — so a program
+that needs one of them can reach for it, and so that reaching for it is visible.
+
+** Installing it
+
+It is an ordinary ~bjo~ package. From a project of your own:
+
+#+BEGIN_SRC scheme
+(depends
+  (package (name (bjoweb)) (source (path (dir "../bjoweb")))))
+#+END_SRC
+
+Note that *the ASP.NET runtime has to be installed wherever the program runs*.
+Not just where it is built: a framework-dependent program asks the host for
+~Microsoft.AspNetCore.App~ at startup. The Docker image ~dotnet/runtime~ does
+not have it; ~dotnet/aspnet~ does.
+
+** Running the tests
+
+#+BEGIN_SRC sh
+bjo run tests/html.bjo    ;; 33 checks, no server anywhere
+bjo run tests/demo.bjo    ;; 27 checks, a real socket
+#+END_SRC
+
+~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
+boolean attributes, void elements, ~pre~ and ~textarea~ left byte for byte,
+escaping in text and in attribute values, that an attribute value never gains a
+newline, computed content through ~,~, ~raw~, fragments, and the document and
+response wrappers.
+
+Twenty-seven checks: the routing table on its own, then a real Kestrel on a port
+the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
+query strings, request headers, a POST body, a suspending handler, a handler
+that raises, the 404 and the 405, a redirect, and twelve requests at once
+through four workers, each getting the answer to its own question. Then a second
+server with one worker and one queue slot, to see that six at once come back
+~200x2 503+retry-after=1x4~ and that it still serves afterwards.
+
+It also checks the thing this framework is for: a parameter installed around
+~start-server~ is readable inside a handler. Kestrel's thread never had it.

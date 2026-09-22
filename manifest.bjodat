@@ -1,0 +1,19 @@
+(package
+  (name (bjoweb))
+  (version "0.1.0")
+  (description "A small web framework: Kestrel on one side, fibers on the other, an inbox between them.")
+  (license "MPL-2.0")
+
+  ;; ASP.NET's assemblies are not part of the base runtime, and this package
+  ;; names types out of them — `HttpContext`, `WebApplication`. Declaring the
+  ;; framework is what lets it: see Docs/Projects.org, "Shared frameworks".
+  ;;
+  ;; A package that only *uses* what `(bjoweb router)` and `(bjoweb server)`
+  ;; hand it needs no declaration of its own. It does need the ASP.NET runtime
+  ;; installed wherever the program runs — the `dotnet/runtime` image does not
+  ;; have it; `dotnet/aspnet` does.
+  (frameworks "Microsoft.AspNetCore.App")
+
+  ;; A library: there is no src/main.bjo, so `bjo build` builds every module
+  ;; under src/ rather than a program.
+  )

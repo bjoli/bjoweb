@@ -1,0 +1,222 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/src/router.bjo — the module (bjoweb router).
+;;
+;; Defines the router for matching requests to handlers.
+;; Routes are evaluated in the order they are defined. First match wins.
+;; Supported pattern segments:
+;; - Literal: exact match (e.g., "users")
+;; - Param: matches one segment and binds it (e.g., ":id")
+;; - Rest: matches remaining segments and binds them (e.g., "*path")
+
+(export
+  ;; Routing types.
+  Segment Route Router Match
+
+  ;; Building a table.
+  router route with-fallback
+  route-get route-post route-put route-patch route-delete route-head
+
+  ;; Using one.
+  router-match handle
+
+  ;; Reading one, and the path splitter the two of them share.
+  router-routes router-fallback route-method route-pattern route-handler
+  path-segments)
+
+(import (std prelude))
+(import (bjoweb core))
+
+;; ---------------------------------------------------------------------------
+;; The types
+;; ---------------------------------------------------------------------------
+
+;; One segment of a route pattern.
+;; `Rest` binds the remaining path. A bare `*` binds to `"rest"`.
+(type (: Segment (Union (Literal string) (Param string) (Rest string))))
+
+;; A single route definition, including its parsed segments.
+(type (: Route (Record (: method string)
+                       (: pattern string)
+                       (: segments (Vec Segment))
+                       (: handler Handler))))
+
+(type (: Router (Record (: routes (Vec Route))
+                        (: fallback Handler))))
+
+;; The result of matching a request against the router.
+;; Can be matched, unmatched (404), or wrong method (405).
+(type (: Match (Union (Matched Request Handler)
+                      (WrongMethod string)
+                      Unmatched)))
+
+;; ---------------------------------------------------------------------------
+;; Building a table
+;; ---------------------------------------------------------------------------
+
+;; Splits a path into segments, ignoring empty segments (e.g., trailing slashes).
+(: path-segments (-> string (Vec string)))
+(defun (path-segments path)
+  (loop (:for piece (string-split path "/"))
+        (:when (not (string-empty? piece)))
+        (:acc out (vecing piece))))
+
+;; Returns the string without its first character.
+(: drop-first (-> string string))
+(defun (drop-first s)
+  (substring/cursors s
+                     (string-cursor-next s (string-cursor-start s))
+                     (string-cursor-end s)))
+
+(: parse-segment (-> string Segment))
+(defun (parse-segment piece)
+  (cond
+    ((string-starts-with? piece ":") (Param (drop-first piece)))
+    ((string-starts-with? piece "*")
+     (Rest (if (= (string-count piece) 1) "rest" (drop-first piece))))
+    (else (Literal piece))))
+
+;; Creates a route for a specific HTTP method.
+(: route (-> string string Handler Route))
+(defun (route method pattern handler)
+  (Route (method (string-upcase method))
+         (pattern pattern)
+         (segments (loop (:for piece (path-segments pattern))
+                         (:acc out (vecing (parse-segment piece)))))
+         (handler handler)))
+
+(: route-get (-> string Handler Route))
+(defun (route-get pattern handler) (route "GET" pattern handler))
+
+(: route-post (-> string Handler Route))
+(defun (route-post pattern handler) (route "POST" pattern handler))
+
+(: route-put (-> string Handler Route))
+(defun (route-put pattern handler) (route "PUT" pattern handler))
+
+(: route-patch (-> string Handler Route))
+(defun (route-patch pattern handler) (route "PATCH" pattern handler))
+
+(: route-delete (-> string Handler Route))
+(defun (route-delete pattern handler) (route "DELETE" pattern handler))
+
+;; Creates a HEAD route. (Note: GET routes automatically handle HEAD requests).
+(: route-head (-> string Handler Route))
+(defun (route-head pattern handler) (route "HEAD" pattern handler))
+
+;; The default fallback handler (returns 404).
+(: default-fallback (-bjo-> Request Response))
+(defbjo (default-fallback req) (not-found))
+
+;; Constructs a Router from a list of routes.
+(: router (-> #:rest Route Router))
+(defun (router #:rest rs)
+  (Router (routes (loop (:for r (in-array rs)) (:acc out (vecing r))))
+          (fallback default-fallback)))
+
+;; Sets a custom fallback handler for unmatched requests.
+(: with-fallback (-> Router Handler Router))
+(defun (with-fallback rt handler) (record-set rt (fallback handler)))
+
+(: router-routes (-> Router (Vec Route)))
+(defun (router-routes rt) (record-ref rt routes))
+
+(: router-fallback (-> Router Handler))
+(defun (router-fallback rt) (record-ref rt fallback))
+
+(: route-method (-> Route string))
+(defun (route-method r) (record-ref r method))
+
+(: route-pattern (-> Route string))
+(defun (route-pattern r) (record-ref r pattern))
+
+(: route-handler (-> Route Handler))
+(defun (route-handler r) (record-ref r handler))
+
+;; ---------------------------------------------------------------------------
+;; Matching
+;; ---------------------------------------------------------------------------
+
+;; Matches a list of segments against path pieces.
+;; Returns bound parameters on success, or `None` on failure.
+(: match-segments (-> (Vec Segment) (Vec string) (Option (Map string string))))
+(defun (match-segments segs pieces)
+  (def n (vec-length segs))
+  (def m (vec-length pieces))
+  (let go ((i 0) (params (map-empty)))
+    (if (>= i n)
+        ;; Match succeeds only if all path pieces are consumed.
+        (if (= m i) (Some params) None)
+        (match (vec-ref segs i)
+          ((Rest name)
+           ;; `Rest` consumes all remaining pieces.
+           (Some (map-set params name (join-from pieces i))))
+          ((Param name)
+           (if (>= i m)
+               None
+               (go (+ i 1) (map-set params name (vec-ref pieces i)))))
+          ((Literal want)
+           (if (or (>= i m) (not (= want (vec-ref pieces i))))
+               None
+               (go (+ i 1) params)))))))
+
+;; Joins elements of `pieces` from index `from` using slashes.
+(: join-from (-> (Vec string) int string))
+(defun (join-from pieces from)
+  (string-join (loop (:for j (range from (vec-length pieces)))
+                     (:acc out (vecing (vec-ref pieces j))))
+               "/"))
+
+;; Finds the first matching route for the given method and path pieces.
+(: find-route (-> Router (Vec string) string (Option (Tuple Route (Map string string)))))
+(defun (find-route rt pieces method)
+  (def rs (record-ref rt routes))
+  (let go ((i 0))
+    (if (>= i (vec-length rs))
+        None
+        (let ((r (vec-ref rs i)))
+          (if (not (= (record-ref r method) method))
+              (go (+ i 1))
+              (match (match-segments (record-ref r segments) pieces)
+                (None (go (+ i 1)))
+                ((Some params) (Some (Tuple r params)))))))))
+
+;; Returns all methods that match the path pieces.
+(: allowed-methods (-> Router (Vec string) (Vec string)))
+(defun (allowed-methods rt pieces)
+  (loop (:for r (record-ref rt routes))
+        (:when (some? (match-segments (record-ref r segments) pieces)))
+        (:acc out (vecing (record-ref r method)))))
+
+;; Matches a request against the router's routes.
+;; Falls back to matching GET routes for HEAD requests.
+(: router-match (-> Router Request Match))
+(defun (router-match rt req)
+  (def pieces (path-segments (request-path req)))
+  (def wanted (request-method req))
+  (match (find-route rt pieces wanted)
+    ((Some found) (bind-match req found))
+    (None
+     (match (if (= wanted "HEAD") (find-route rt pieces "GET") None)
+       ((Some found) (bind-match req found))
+       (None
+        (let ((allow (allowed-methods rt pieces)))
+          (if (vec-empty? allow)
+              Unmatched
+              (WrongMethod (string-join allow ", ")))))))))
+
+(: bind-match (-> Request (Tuple Route (Map string string)) Match))
+(defun (bind-match req found)
+  (match found
+    ((Tuple r params)
+     (Matched (record-set req (params params)) (record-ref r handler)))))
+
+;; Dispatches a request to the appropriate handler based on the router.
+(: handle (-bjo-> Router Request Response))
+(defbjo (handle rt req)
+  (match (router-match rt req)
+    ((Matched bound handler) (handler bound))
+    ((WrongMethod allow) (method-not-allowed allow))
+    (Unmatched ((record-ref rt fallback) req))))

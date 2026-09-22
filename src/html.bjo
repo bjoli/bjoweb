@@ -1,0 +1,304 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/src/html.bjo — the module (bjoweb html).
+;;
+;; SXML, as a quoted literal:
+;;
+;;     (page '(html (head (title "banana"))
+;;                  (body (@ (class "card"))
+;;                        "hello " (b ,name))))
+;;
+;; No macro and no per-tag functions. A quoted literal with nesting in it
+;; *stands for* a union, and which case each piece becomes is decided by its
+;; shape before anything is inferred: a symbol is a tag, a string is text, a
+;; nested list is a child node. The expected type comes from the parameter the
+;; literal is passed to — which is why `render` and friends take `Nodes`, the
+;; alias for `(List Node)`, rather than `Node`. A literal's *elements* are
+;; injected; the literal itself is not, so a `Node` parameter would have
+;; nothing to push down and you would get `string` against `Symbol`.
+;;
+;; See `TestFiles/100_literal_elaboration.bjo` for the mechanism.
+;;
+;; `,expr` splices a computed value in, inside the ordinary quote — there is no
+;; backtick. An unquoted value has no shape, so it is chosen by its *type*: a
+;; `string` becomes text, a `Raw` is passed through unescaped.
+;;
+;; THE ONE SHARP EDGE. An unquoted *number* is not chosen, because a numeric
+;; literal stays polymorphic until it is defaulted, and the error reads
+;; "'41' is a number, and it is being used where a 'Node' is wanted". A number
+;; written literally in the quote is fine — `'(p "n=" 41)`. For a computed one
+;; write `,(int->string n)` or `,(NInt n)`.
+
+(export
+  ;; The tree, and the escape hatch for markup you have already built.
+  Node Nodes Raw raw
+
+  ;; Rendering.
+  render document
+
+  ;; The whole point: a `Response` with the right content type.
+  page
+
+  ;; For anyone building markup by hand rather than from a literal.
+  escape escape-attribute)
+
+(import (std prelude))
+(import (bjoweb core))
+
+;; ---------------------------------------------------------------------------
+;; The tree
+;; ---------------------------------------------------------------------------
+
+;; Markup that is already markup. A record and not a second `string` case,
+;; because the case a literal or an unquote becomes is chosen by *type* — two
+;; cases carrying a `string` could not be told apart, and the safe one would
+;; not reliably win.
+(type (: Raw (Record (: html string))))
+
+;; `(raw "<hr>")` — trusted markup, spliced with `,`. It is spelled as a call
+;; so that every place trust is being claimed is greppable.
+(: raw (-> string Raw))
+(defun (raw markup) (Raw (html markup)))
+
+(type-rec
+  (: Node (Union (NText string)
+                 (NRaw Raw)
+                 (NSym Symbol)
+                 (NInt int)
+                 (NSub (List Node))))
+  ;; What a parameter must say. See the head of this file.
+  (: Nodes (Alias (List Node))))
+
+;; ---------------------------------------------------------------------------
+;; Escaping
+;; ---------------------------------------------------------------------------
+
+;; Text. `&` first, or the ampersands introduced by the later replacements are
+;; escaped a second time and `<` comes out as `&amp;lt;`.
+(: escape (-> string string))
+(defun (escape s)
+  (string-replace (string-replace (string-replace s "&" "&amp;") "<" "&lt;") ">" "&gt;"))
+
+;; An attribute value, which is inside double quotes and so needs one more.
+(: escape-attribute (-> string string))
+(defun (escape-attribute s)
+  (string-replace (escape s) "\"" "&quot;"))
+
+;; ---------------------------------------------------------------------------
+;; Tag tables
+;; ---------------------------------------------------------------------------
+;;
+;; Both are one delimited string rather than a set: the lookup is a substring
+;; search over a line of text, which beats building a hash of a dozen entries
+;; per process.
+
+;; Elements with no closing tag.
+(def void-tags " area base br col embed hr img input link meta param source track wbr ")
+
+(: void-tag? (-> string bool))
+(defun (void-tag? name) (string-contains? void-tags (str " " name " ")))
+
+;; Elements whose content is the content. Every byte between the tags is part
+;; of the value, so indenting inside one does not tidy it up — it edits it.
+;; These are therefore printed with no added whitespace whatsoever.
+(def preformatted-tags " pre textarea ")
+
+(: preformatted-tag? (-> string bool))
+(defun (preformatted-tag? name) (string-contains? preformatted-tags (str " " name " ")))
+
+;; ---------------------------------------------------------------------------
+;; Rendering
+;; ---------------------------------------------------------------------------
+;;
+;; Every node gets its own line, indented by depth. There is no minified mode
+;; and no flag to ask for one: output that has to be read by a person is the
+;; only kind this produces.
+;;
+;; WHAT THAT COSTS, because it is not free. A newline is whitespace, and HTML
+;; collapses runs of whitespace to a single space in ordinary content. So
+;; `'(p "a" (b "c") "d")` prints across four lines and the browser renders
+;; "a c d" rather than "acd". Indented markup and byte-exact inline text are
+;; not both available; this module picks the first and says so. Where the text
+;; is the point — `pre`, `textarea` — nothing is added at all.
+
+;; Two spaces a level. Tabs are a fight nobody needs to have in generated
+;; output.
+(: indent (-> StringBuilder int void))
+(defun (indent sb depth)
+  (loop (:for i (range 0 depth))
+        (:do (stringbuilder-add-string! sb "  "))))
+
+;; ---- the compact emitter ---------------------------------------------------
+;;
+;; No whitespace added anywhere. Used for two things: the inside of a
+;; preformatted element, and an attribute value — a newline in either is not a
+;; nicety, it is a different value.
+
+(: emit-compact (-> StringBuilder Node void))
+(defun (emit-compact sb n)
+  (match n
+    ((NText s) (stringbuilder-add-string! sb (escape s)))
+    ((NInt i) (stringbuilder-add-string! sb (int->string i)))
+    ((NSym s) (stringbuilder-add-string! sb (escape (symbol->string s))))
+    ((NRaw r) (stringbuilder-add-string! sb (record-ref r html)))
+    ((NSub kids) (emit-compact-nodes sb kids))))
+
+(: emit-compact-nodes (-> StringBuilder Nodes void))
+(defun (emit-compact-nodes sb nodes)
+  (match nodes
+    (Nil unit)
+    ((Cons (NSym tag) body)
+     (def name (symbol->string tag))
+     (emit-open sb name body)
+     (unless (void-tag? name)
+       (emit-compact-children sb body)
+       (stringbuilder-add-string! sb "</")
+       (stringbuilder-add-string! sb name)
+       (stringbuilder-add! sb #\>)))
+    (fragment (emit-compact-children sb fragment))))
+
+(: emit-compact-children (-> StringBuilder (List Node) void))
+(defun (emit-compact-children sb kids)
+  (match kids
+    (Nil unit)
+    ((Cons k rest)
+     (unless (attributes? k) (emit-compact sb k))
+     (emit-compact-children sb rest))))
+
+;; ---- attributes ------------------------------------------------------------
+
+;; Is this child the `(@ ...)` clause?
+(: attributes? (-> Node bool))
+(defun (attributes? n)
+  (match n
+    ((NSub (Cons (NSym head) rest)) (= (symbol->string head) "@"))
+    (_ #f)))
+
+;; An attribute's value, flattened with no whitespace added.
+(: flatten (-> Node string))
+(defun (flatten n)
+  (def sb (stringbuilder-empty))
+  (emit-compact sb n)
+  (stringbuilder->string sb))
+
+;; `(@ (class "card") (disabled))` -> ` class="card" disabled`
+;;
+;; A pair with no value is a boolean attribute, which is how HTML spells
+;; `disabled`, `checked` and `selected`.
+(: emit-attributes (-> StringBuilder (List Node) void))
+(defun (emit-attributes sb pairs)
+  (match pairs
+    (Nil unit)
+    ((Cons (NSub (Cons (NSym name) rest)) more)
+     (stringbuilder-add! sb #\space)
+     (stringbuilder-add-string! sb (symbol->string name))
+     (match rest
+       (Nil unit)
+       ((Cons value ignored)
+        (stringbuilder-add-string! sb "=\"")
+        ;; The compact path, deliberately: an attribute value is a string, and
+        ;; a newline in it is content.
+        (stringbuilder-add-string! sb (escape-attribute (flatten-text value)))
+        (stringbuilder-add! sb #\")))
+     (emit-attributes sb more))
+    ;; Anything else in an `(@ ...)` is not an attribute and is dropped rather
+    ;; than guessed at.
+    ((Cons ignored more) (emit-attributes sb more))))
+
+;; An attribute value is text, not markup: it is escaped once, here, rather
+;; than being emitted as tags and escaped again.
+(: flatten-text (-> Node string))
+(defun (flatten-text n)
+  (match n
+    ((NText s) s)
+    ((NInt i) (int->string i))
+    ((NSym s) (symbol->string s))
+    ((NRaw r) (record-ref r html))
+    ((NSub kids) (flatten (NSub kids)))))
+
+;; `<tag attrs...>`, shared by both emitters.
+(: emit-open (-> StringBuilder string (List Node) void))
+(defun (emit-open sb name body)
+  (stringbuilder-add! sb #\<)
+  (stringbuilder-add-string! sb name)
+  (match body
+    ((Cons (NSub (Cons (NSym at) pairs)) ignored)
+     (when (= (symbol->string at) "@") (emit-attributes sb pairs)))
+    (other unit))
+  (stringbuilder-add! sb #\>))
+
+;; ---- the pretty emitter ----------------------------------------------------
+
+(: emit-line (-> StringBuilder int string void))
+(defun (emit-line sb depth s)
+  (indent sb depth)
+  (stringbuilder-add-string! sb s)
+  (stringbuilder-add! sb #\newline))
+
+(: emit-node (-> StringBuilder int Node void))
+(defun (emit-node sb depth n)
+  (match n
+    ((NText s) (emit-line sb depth (escape s)))
+    ((NInt i) (emit-line sb depth (int->string i)))
+    ;; A bare symbol in child position is text. A tag is a symbol in *head*
+    ;; position, and that is handled by `emit-nodes`.
+    ((NSym s) (emit-line sb depth (escape (symbol->string s))))
+    ((NRaw r) (emit-line sb depth (record-ref r html)))
+    ((NSub kids) (emit-nodes sb depth kids))))
+
+(: emit-children (-> StringBuilder int (List Node) void))
+(defun (emit-children sb depth kids)
+  (match kids
+    (Nil unit)
+    ((Cons k rest)
+     (unless (attributes? k) (emit-node sb depth k))
+     (emit-children sb depth rest))))
+
+;; A list whose head is a symbol is an element; anything else is a fragment,
+;; which renders its children with no wrapper. That is what makes
+;; `'((li "a") (li "b"))` work as a return value.
+(: emit-nodes (-> StringBuilder int Nodes void))
+(defun (emit-nodes sb depth nodes)
+  (match nodes
+    (Nil unit)
+    ((Cons (NSym tag) body)
+     (def name (symbol->string tag))
+     (indent sb depth)
+     (emit-open sb name body)
+     (cond
+       ;; A void element has no children and no closing tag. Children written
+       ;; on one anyway are dropped, because emitting `</br>` is worse.
+       ((void-tag? name) (stringbuilder-add! sb #\newline))
+       ;; Content that *is* content: opened, filled byte for byte, closed.
+       ((preformatted-tag? name)
+        (emit-compact-children sb body)
+        (stringbuilder-add-string! sb "</")
+        (stringbuilder-add-string! sb name)
+        (stringbuilder-add! sb #\>)
+        (stringbuilder-add! sb #\newline))
+       (else
+        (stringbuilder-add! sb #\newline)
+        (emit-children sb (+ depth 1) body)
+        (indent sb depth)
+        (stringbuilder-add-string! sb "</")
+        (stringbuilder-add-string! sb name)
+        (stringbuilder-add! sb #\>)
+        (stringbuilder-add! sb #\newline))))
+    (fragment (emit-children sb depth fragment))))
+
+(: render (-> Nodes string))
+(defun (render nodes)
+  (def sb (stringbuilder-empty))
+  (emit-nodes sb 0 nodes)
+  (stringbuilder->string sb))
+
+;; The same, with the doctype in front. A page without one is rendered in
+;; quirks mode by every browser there is.
+(: document (-> Nodes string))
+(defun (document nodes) (str "<!DOCTYPE html>\n" (render nodes)))
+
+;; A whole `Response`, which is what a handler returns.
+(: page (-> Nodes (#:status int) Response))
+(defun (page nodes #:status 200) (html (document nodes) #:status status))

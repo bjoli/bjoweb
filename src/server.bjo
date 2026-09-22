@@ -1,0 +1,305 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/src/server.bjo — the module (bjoweb server).
+;;
+;; Provides a web server integrating ASP.NET Kestrel with Bjolang fibers.
+;; Requests are bridged from Kestrel threads into an inbox, where worker
+;; fibers process them using the provided `Router`.
+
+(export
+  ;; Server lifecycle and info.
+  Server serve start-server stop-server!
+  server-url server-port server-dropped-count
+
+  ;; The raw `HttpContext`, exposed for advanced use cases (e.g., streaming, websockets).
+  Ctx)
+
+(import (std inbox))
+(import (bjoweb core))
+(import (bjoweb router))
+
+;; ===========================================================================
+;; Interop
+;; ===========================================================================
+;;
+;; .NET interoperability definitions.
+
+(import/class
+  (App         (: Microsoft.AspNetCore.Builder.WebApplication))
+  (AppBuilder  (: Microsoft.AspNetCore.Builder.WebApplicationBuilder))
+  (Pipeline    (: Microsoft.AspNetCore.Builder.IApplicationBuilder))
+  (Ctx         (: Microsoft.AspNetCore.Http.HttpContext))
+  (Incoming    (: Microsoft.AspNetCore.Http.HttpRequest))
+  (Outgoing    (: Microsoft.AspNetCore.Http.HttpResponse))
+  (PathText    (: Microsoft.AspNetCore.Http.PathString))
+  (QueryText   (: Microsoft.AspNetCore.Http.QueryString))
+  (HeaderDict  (: Microsoft.AspNetCore.Http.IHeaderDictionary))
+  ;; Represents one or more string values for a header.
+  (Values      (: Microsoft.Extensions.Primitives.StringValues (-> string Values)))
+  ((Collection %a) (: System.Collections.Generic.ICollection))
+  (Stream      (: System.IO.Stream))
+  (Reader      (: System.IO.StreamReader (-> Stream Encoding Reader)))
+  (Buffered    (: Bjolang.Runtime.BjoPort (-> TextInputPort Buffered)))
+  (Encoding    (: System.Text.Encoding))
+  (Object      (: System.Object))
+  ((Pairing %k %v) (: System.Collections.Generic.KeyValuePair)))
+
+(import/extern
+  ;; --- Building and running the host ---
+  ;;
+  ;; Uses CreateSlimBuilder for a faster startup with fewer default services.
+  (slim-builder  (: Microsoft.AspNetCore.Builder.WebApplication.CreateSlimBuilder (-> AppBuilder)))
+  (build-app     (: Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build (-> AppBuilder App)))
+  (app-urls      (: Microsoft.AspNetCore.Builder.WebApplication.Urls (-> App (Collection string)) #:get))
+  (app-start     (: Microsoft.AspNetCore.Builder.WebApplication.StartAsync (-> App void) #:async))
+  (app-stop      (: Microsoft.AspNetCore.Builder.WebApplication.StopAsync (-> App void) #:async))
+  ;; Runs the application and blocks until host shutdown.
+  ;; `#:uncancellable` is used because RunAsync relies on host signal handling.
+  (app-run       (: Microsoft.AspNetCore.Builder.WebApplication.RunAsync (-> App string void)
+                    #:async #:uncancellable))
+
+  ;; Registers middleware. Uses the `Func<HttpContext, Func<Task>, Task>` overload.
+  (use!          (: Microsoft.AspNetCore.Builder.UseExtensions.Use
+                    (-> Pipeline (-> Ctx (-> Task) Task) Pipeline)))
+
+  ;; --- Reading a request ---
+  (ctx-request   (: Microsoft.AspNetCore.Http.HttpContext.Request  (-> Ctx Incoming) #:get))
+  (ctx-response  (: Microsoft.AspNetCore.Http.HttpContext.Response (-> Ctx Outgoing) #:get))
+  ;; Token triggered when the client disconnects.
+  (ctx-aborted   (: Microsoft.AspNetCore.Http.HttpContext.RequestAborted (-> Ctx CancellationToken) #:get))
+  (in-method     (: Microsoft.AspNetCore.Http.HttpRequest.Method      (-> Incoming string) #:get))
+  (in-path       (: Microsoft.AspNetCore.Http.HttpRequest.Path        (-> Incoming PathText) #:get))
+  (in-query      (: Microsoft.AspNetCore.Http.HttpRequest.QueryString (-> Incoming QueryText) #:get))
+  (in-headers    (: Microsoft.AspNetCore.Http.HttpRequest.Headers     (-> Incoming HeaderDict) #:get))
+  (in-body       (: Microsoft.AspNetCore.Http.HttpRequest.Body        (-> Incoming Stream) #:get))
+  (path-text     (: Microsoft.AspNetCore.Http.PathString.Value        (-> PathText string) #:get))
+  (query-text    (: Microsoft.AspNetCore.Http.QueryString.Value       (-> QueryText string) #:get))
+
+  ;; --- Writing a response ---
+  (out-status!   (: Microsoft.AspNetCore.Http.HttpResponse.StatusCode  (-> Outgoing int void) #:set))
+  (out-type!     (: Microsoft.AspNetCore.Http.HttpResponse.ContentType (-> Outgoing string void) #:set))
+  (out-headers   (: Microsoft.AspNetCore.Http.HttpResponse.Headers     (-> Outgoing HeaderDict) #:get))
+  (header-add!   (: Microsoft.AspNetCore.Http.HeaderDictionaryExtensions.Append
+                    (-> HeaderDict string Values void)))
+  (write-text!   (: Microsoft.AspNetCore.Http.HttpResponseWritingExtensions.WriteAsync
+                    (-> Outgoing string void) #:async))
+
+  ;; --- Base .NET ---
+  (utf8          (: System.Text.Encoding.UTF8 #:get))
+  (unescape      (: System.Uri.UnescapeDataString (-> string string)))
+  ;; A completed task.
+  (nothing-to-do (: System.Threading.Tasks.Task.CompletedTask Task #:get)))
+
+;; Extracts a string, returning an empty string if null.
+(: text-or-empty (-> string string))
+(defun (text-or-empty s)
+  (match (cast Object s)
+    ((:is System.String present) present)
+    (_ "")))
+
+;; ===========================================================================
+;; The server
+;; ===========================================================================
+
+;; An opaque record representing a running server instance.
+(type
+  (: Server #:opaque
+     (Record (: app App)
+             (: requests (Inbox (Call Ctx Unit)))
+             (: url string)
+             (: port int))))
+
+;; The queue between Kestrel and the workers.
+;;
+;; Creates an inbox that drops the newest request if full (resulting in a 503).
+(: make-request-inbox (-> int (Inbox (Call Ctx Unit))))
+(defun (make-request-inbox queue) (make-inbox queue DropNewest))
+
+;; Creates the ASP.NET WebApplication.
+;; Sets the environment variable to reduce ASP.NET logging noise unless `#:quiet #f`.
+(: new-app (-> bool App))
+(defun (new-app quiet)
+  (when quiet
+    (set-environment-variable! "Logging__LogLevel__Default" "Warning"))
+  (build-app (slim-builder)))
+
+;; Middleware function bridging Kestrel requests to the worker inbox.
+;; Returns a 503 if the queue is full.
+(: knock (-> (Inbox (Call Ctx Unit)) Ctx (-> Task) Task))
+(defun (knock requests ctx next)
+  (match (inbox-try-call/token requests ctx (ctx-aborted ctx))
+    ((Some answering) (cast Task answering))
+    (None (refuse! ctx))))
+
+;; Rejects a request with a 503 Service Unavailable status.
+(: refuse! (-> Ctx Task))
+(defun (refuse! ctx)
+  (def out (ctx-response ctx))
+  (out-status! out 503)
+  (header-add! (out-headers out) "Retry-After" (Values. "1"))
+  nothing-to-do)
+
+(: install-inbox! (-> App (Inbox (Call Ctx Unit)) void))
+(defun (install-inbox! app requests)
+  (ignore (use! (cast Pipeline app)
+                (fun (ctx next) (knock requests ctx next)))))
+
+;; Starts the server asynchronously. Workers are spawned in the caller's scope.
+(: start-server (-bjo-> Router
+                        (#:port int) (#:host string) (#:workers int) (#:queue int)
+                        (#:quiet bool)
+                        Server))
+(defbjo (start-server rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t)
+  (def requests (make-request-inbox queue))
+  (def app (new-app quiet))
+  (def url (str "http://" host ":" (int->string port)))
+  (ignore (.Add (app-urls app) url))
+  (install-inbox! app requests)
+  (loop (:for i (range 0 workers))
+        (:do (spawn (worker rt requests))))
+  (app-start app)
+  (Server (app app) (requests requests) (url url) (port port)))
+
+;; Stops accepting requests, finishes pending ones, and shuts down the workers.
+(: stop-server! (-bjo-> Server void))
+(defbjo (stop-server! s)
+  (app-stop (record-ref s app))
+  (inbox-close! (record-ref s requests)))
+
+;; Starts the server and blocks until stopped by an external signal (e.g., Ctrl-C).
+(: serve (-bjo-> Router
+                 (#:port int) (#:host string) (#:workers int) (#:queue int)
+                 (#:quiet bool)
+                 void))
+(defbjo (serve rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t)
+  (def requests (make-request-inbox queue))
+  (def app (new-app quiet))
+  (install-inbox! app requests)
+  (ignore
+   (with-scope
+     (loop (:for i (range 0 workers))
+           (:do (spawn (worker rt requests))))
+     (try
+         (app-run app (str "http://" host ":" (int->string port)))
+       #:finally (inbox-close! requests)))))
+
+(: server-url (-> Server string))
+(defun (server-url s) (record-ref s url))
+
+(: server-port (-> Server int))
+(defun (server-port s) (record-ref s port))
+
+;; Returns the number of requests dropped (503s) due to a full queue.
+(: server-dropped-count (-> Server int))
+(defun (server-dropped-count s) (inbox-dropped-count (record-ref s requests)))
+
+;; ===========================================================================
+;; A worker
+;; ===========================================================================
+
+;; A worker fiber processing requests until the inbox is closed.
+(: worker (-bjo-> Router (Inbox (Call Ctx Unit)) Unit))
+(defbjo (worker rt requests)
+  (let go ()
+    (match (sync (choose (wrap (inbox-recv requests) (fun (c) (Some c)))
+                         (wrap (inbox-closed requests) (fun (e) None))))
+      (None unit)
+      ((Some c) (answer rt c) (go)))))
+
+;; Processes a single request call, ensuring a response is always sent.
+(: answer (-bjo-> Router (Call Ctx Unit) void))
+(defbjo (answer rt c)
+  (try
+      (ignore (try (answer-now rt c) #:catch (System.Exception)))
+    #:finally (ignore (call-reply! c unit))))
+
+;; Executes the handler and writes the response.
+;; Handles exceptions and client disconnections appropriately.
+(: answer-now (-bjo-> Router (Call Ctx Unit) Unit))
+(defbjo (answer-now rt c)
+  (def ctx (call-request c))
+  (def req (read-request ctx))
+  (match (sync (choose (wrap (promise-join (bjo (handle rt req))) (fun (r) (Some r)))
+                       (wrap (call-abandoned c) (fun (u) None))))
+    ((Some (Ok answer)) (write-response! ctx answer) unit)
+    ;; The handler raised. What it said goes to the log, not to the page.
+    ((Some (Err e)) (log (str "bjoweb: " (request-method req) " " (request-path req)
+                              " raised: " (.-Message e)))
+                    (write-response! ctx (server-error))
+                    unit)
+    (None unit)))
+
+;; ===========================================================================
+;; HttpContext -> Request
+;; ===========================================================================
+
+(: read-request (-bjo-> Ctx Request))
+(defbjo (read-request ctx)
+  (def in (ctx-request ctx))
+  (make-request (in-method in)
+                ;; The path text is already percent-decoded.
+                (text-or-empty (path-text (in-path in)))
+                (parse-query (text-or-empty (query-text (in-query in))))
+                (collect-headers (cast (Seq (Pairing string Values)) (in-headers in)))
+                (read-body in)))
+
+;; Reads the entire request body as a UTF-8 string.
+(: read-body (-bjo-> Incoming string))
+(defbjo (read-body in)
+  (read-all (cast TextInputPort
+                  (Buffered. (cast TextInputPort (Reader. (in-body in) utf8))))))
+
+;; Collects headers into a map with lower-cased keys.
+(: collect-headers (-> (Seq (Pairing string Values)) (Map string string)))
+(defun (collect-headers headers)
+  (loop (:for h headers)
+        (:acc all (mapping (Tuple (string-downcase (.-Key h)) (.ToString (.-Value h)))))))
+
+;; Parses a query string into a map, keeping the first value for repeated keys.
+(: parse-query (-> string (Map string string)))
+(defun (parse-query raw)
+  (def text (if (string-starts-with? raw "?") (drop-first raw) raw))
+  (loop (:for pair (string-split text "&"))
+        (:when (not (string-empty? pair)))
+        (:acc all (folding (map-empty) (add-parameter all pair)))))
+
+(: add-parameter (-> (Map string string) string (Map string string)))
+(defun (add-parameter all pair)
+  (def parts (string-split pair "="))
+  (def name (url-decode (vec-ref parts 0)))
+  ;; Splits on the first '=' to separate key and value.
+  (def value (if (< (vec-length parts) 2) "" (url-decode (join-rest parts))))
+  (if (map-contains? all name) all (map-set all name value)))
+
+(: join-rest (-> (Vec string) string))
+(defun (join-rest parts)
+  (string-join (loop (:for i (range 1 (vec-length parts)))
+                     (:acc out (vecing (vec-ref parts i))))
+               "="))
+
+;; URL-decodes a string, replacing '+' with spaces.
+(: url-decode (-> string string))
+(defun (url-decode s) (unescape (string-replace s "+" " ")))
+
+(: drop-first (-> string string))
+(defun (drop-first s)
+  (substring/cursors s
+                     (string-cursor-next s (string-cursor-start s))
+                     (string-cursor-end s)))
+
+;; ===========================================================================
+;; Response -> HttpResponse
+;; ===========================================================================
+
+;; Writes the response status, headers, and body to the client.
+(: write-response! (-bjo-> Ctx Response void))
+(defbjo (write-response! ctx answer)
+  (def out (ctx-response ctx))
+  (out-status! out (response-status answer))
+  (out-type! out (response-content-type answer))
+  (loop (:for h (response-headers answer))
+        (:do (match h
+               ((Tuple name value) (header-add! (out-headers out) name (Values. value))))))
+  (write-text! out (response-body answer)))

@@ -21,15 +21,29 @@
 ;;
 ;; See `TestFiles/100_literal_elaboration.bjo` for the mechanism.
 ;;
-;; `,expr` splices a computed value in, inside the ordinary quote — there is no
+;; `,expr` places one computed value, inside the ordinary quote — there is no
 ;; backtick. An unquoted value has no shape, so it is chosen by its *type*: a
 ;; `string` becomes text, a `Raw` is passed through unescaped.
+;;
+;; `,@expr` places the *elements* of a computed `(List Node)` where it stands,
+;; which is what a page driven by data needs:
+;;
+;;     (render '(ul ,@(list-map link items)))
+;;
+;; The spliced value is not elaborated — it is already a `(List Node)`, which
+;; is exactly what the splice asks of it. Everything written beside it still
+;; is, so `'(ul (li "first") ,@rows)` gets its `li` and its text the usual way.
+;; This used to be spelled `,(NSub rows)`, which wrapped a list of children in
+;; one child; the wrapper is gone.
 ;;
 ;; THE ONE SHARP EDGE. An unquoted *number* is not chosen, because a numeric
 ;; literal stays polymorphic until it is defaulted, and the error reads
 ;; "'41' is a number, and it is being used where a 'Node' is wanted". A number
 ;; written literally in the quote is fine — `'(p "n=" 41)`. For a computed one
 ;; write `,(int->string n)` or `,(NInt n)`.
+;;
+;; This does not have a form for matching HTML, so sadly you will need to
+;; do a bunch of (NSub ...) matching :/
 
 (export
   ;; The tree, and the escape hatch for markup you have already built.
@@ -95,6 +109,7 @@
 ;; per process.
 
 ;; Elements with no closing tag.
+;; TODO: make this a SET. stupid. 
 (def void-tags " area base br col embed hr img input link meta param source track wbr ")
 
 (: void-tag? (-> string bool))
@@ -103,6 +118,8 @@
 ;; Elements whose content is the content. Every byte between the tags is part
 ;; of the value, so indenting inside one does not tidy it up — it edits it.
 ;; These are therefore printed with no added whitespace whatsoever.
+;; why i chose to do it like this is beyond me.
+;; TODO i guess.
 (def preformatted-tags " pre textarea ")
 
 (: preformatted-tag? (-> string bool))

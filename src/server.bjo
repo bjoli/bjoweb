@@ -63,6 +63,8 @@
   ;; Registers middleware. Uses the `Func<HttpContext, Func<Task>, Task>` overload.
   (use!          (: Microsoft.AspNetCore.Builder.UseExtensions.Use
                     (-> Pipeline (-> Ctx (-> Task) Task) Pipeline)))
+  (use-static-files! (: Microsoft.AspNetCore.Builder.StaticFileExtensions.UseStaticFiles
+                        (-> Pipeline Pipeline)))
 
   ;; --- Reading a request ---
   (ctx-request   (: Microsoft.AspNetCore.Http.HttpContext.Request  (-> Ctx Incoming) #:get))
@@ -119,10 +121,11 @@
 
 ;; Creates the ASP.NET WebApplication.
 ;; Sets the environment variable to reduce ASP.NET logging noise unless `#:quiet #f`.
-(: new-app (-> bool App))
-(defun (new-app quiet)
+(: new-app (-> bool string App))
+(defun (new-app quiet static-dir)
   (when quiet
     (set-environment-variable! "Logging__LogLevel__Default" "Warning"))
+  (set-environment-variable! "ASPNETCORE_WEBROOT" static-dir)
   (build-app (slim-builder)))
 
 ;; Middleware function bridging Kestrel requests to the worker inbox.
@@ -141,22 +144,24 @@
   (header-add! (out-headers out) "Retry-After" (Values. "1"))
   nothing-to-do)
 
-(: install-inbox! (-> App (Inbox (Call Ctx Unit)) void))
-(defun (install-inbox! app requests)
+(: install-inbox! (-> App (Inbox (Call Ctx Unit)) bool void))
+(defun (install-inbox! app requests static-files?)
+  (when static-files?
+    (ignore (use-static-files! (cast Pipeline app))))
   (ignore (use! (cast Pipeline app)
                 (fun (ctx next) (knock requests ctx next)))))
 
 ;; Starts the server asynchronously. Workers are spawned in the caller's scope.
 (: start-server (-bjo-> Router
                         (#:port int) (#:host string) (#:workers int) (#:queue int)
-                        (#:quiet bool)
+                        (#:quiet bool) (#:static-files bool) (#:static-dir string)
                         Server))
-(defbjo (start-server rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t)
+(defbjo (start-server rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot")
   (def requests (make-request-inbox queue))
-  (def app (new-app quiet))
+  (def app (new-app quiet static-dir))
   (def url (str "http://" host ":" (int->string port)))
   (ignore (.Add (app-urls app) url))
-  (install-inbox! app requests)
+  (install-inbox! app requests static-files)
   (loop (:for i (range 0 workers))
         (:do (spawn (worker rt requests))))
   (app-start app)
@@ -171,12 +176,12 @@
 ;; Starts the server and blocks until stopped by an external signal (e.g., Ctrl-C).
 (: serve (-bjo-> Router
                  (#:port int) (#:host string) (#:workers int) (#:queue int)
-                 (#:quiet bool)
+                 (#:quiet bool) (#:static-files bool) (#:static-dir string)
                  void))
-(defbjo (serve rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t)
+(defbjo (serve rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot")
   (def requests (make-request-inbox queue))
-  (def app (new-app quiet))
-  (install-inbox! app requests)
+  (def app (new-app quiet static-dir))
+  (install-inbox! app requests static-files)
   (ignore
    (with-scope
      (loop (:for i (range 0 workers))

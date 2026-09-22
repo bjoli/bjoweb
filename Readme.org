@@ -116,7 +116,7 @@ in this package would make every program that serves plain text carry it.
                    (h1 "bjoweb")
                    (p "you asked for " (b ,what))
                    (hr)
-                   (ul ,(NSub rows)))))
+                   (ul ,@rows))))
 #+END_SRC
 
 SXML, as a quoted literal. *No macro and no per-tag functions* — a quoted
@@ -130,9 +130,13 @@ Which also means the tag vocabulary costs nothing and collides with nothing —
 
 - ~(@ (class "card") (id "main"))~ as the first child is the attribute list.
   A pair with no value is a boolean attribute: ~(@ (checked))~.
-- ~,expr~ splices a computed value in, inside the *ordinary* quote — there is no
+- ~,expr~ places one computed value, inside the *ordinary* quote — there is no
   backtick. It is chosen by its type: a ~string~ becomes text, a ~Raw~ is passed
   through unescaped.
+- ~,@expr~ places the *elements* of a computed ~(List Node)~ where it stands,
+  which is what a page driven by data needs. Anything written beside it is
+  still elaborated the usual way, so ~'(ul (li "first") ,@rows)~ works. The
+  spliced value is not elaborated — it is already a ~(List Node)~.
 - A list whose head is not a symbol is a fragment, so ~'((li "a") (li "b"))~
   renders with no wrapper.
 - Void elements — ~br~, ~img~, ~meta~, ~hr~ and the rest — get no closing tag.
@@ -211,7 +215,7 @@ helper.
 ~serve~ is what a ~main~ wants: start, serve until Ctrl-C, stop.
 
 #+BEGIN_SRC scheme
-(serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t)
+(serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot")
 #+END_SRC
 
 ~start-server~ and ~stop-server!~ are the pair for a program that has something
@@ -245,11 +249,15 @@ The framework listens to Kestrel's ~RequestAborted~ token to detect disconnected
 - *Still queued:* The request is dropped and never reaches a worker.
 - *Already processing:* The response is discarded and not written to the socket. The handler itself is *not* killed; it is allowed to finish to ensure side effects are safely completed.
 
+*** Serving Static Files
+
+You can opt into serving static files using Kestrel's highly optimized built-in static file server. Pass `#:static-files #t` to `serve` or `start-server`. By default, Kestrel will serve files out of a `wwwroot` directory in the current working directory, but you can override this by passing a different folder name to `#:static-dir`.
+
 ** What this is not
 
-No dependency injection, no configuration system, no authentication, no static
-file server, no content negotiation, no TLS, no HTTP/2, no websockets, no
-streaming bodies. Kestrel can do all of those and none of them is here.
+No dependency injection, no configuration system, no authentication, no content
+negotiation, no TLS, no HTTP/2, no websockets, no streaming bodies. Kestrel can
+do all of those and none of them is here.
 
 ~(bjoweb server)~ exports ~Ctx~ — the ~HttpContext~ type itself — so a program
 that needs one of them can reach for it, and so that reaching for it is visible.

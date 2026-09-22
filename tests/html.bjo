@@ -103,8 +103,41 @@
   ;; --- built by hand, not from a literal ------------------------------------
   (def rows (list-map item (list "one" "two")))
   (expect "a computed list of children"
-          (render '(ul ,(NSub rows)))
+          (render '(ul ,@rows))
           "<ul>\n  <li>\n    one\n  </li>\n  <li>\n    two\n  </li>\n</ul>\n")
+
+  ;; `,@` puts a computed list's elements where it stands. What is written
+  ;; beside it is still elaborated the usual way — the two `li` below become
+  ;; nodes by shape, and `rows` is passed through because it is already a
+  ;; `(List Node)`.
+  (expect "spliced among written children"
+          (render '(ul (li "first") ,@rows (li "last")))
+          (str "<ul>\n"
+               "  <li>\n    first\n  </li>\n"
+               "  <li>\n    one\n  </li>\n"
+               "  <li>\n    two\n  </li>\n"
+               "  <li>\n    last\n  </li>\n"
+               "</ul>\n"))
+  (expect "two splices"
+          (render '(ul ,@rows ,@rows))
+          (str "<ul>\n"
+               "  <li>\n    one\n  </li>\n"
+               "  <li>\n    two\n  </li>\n"
+               "  <li>\n    one\n  </li>\n"
+               "  <li>\n    two\n  </li>\n"
+               "</ul>\n"))
+  (def (: none Nodes) (list))
+  (expect "an empty splice contributes nothing"
+          (render '(ul ,@none))
+          "<ul>\n</ul>\n")
+  (expect "a splice one level down"
+          (render '(div (ul ,@rows)))
+          (str "<div>\n"
+               "  <ul>\n"
+               "    <li>\n      one\n    </li>\n"
+               "    <li>\n      two\n    </li>\n"
+               "  </ul>\n"
+               "</div>\n"))
 
   ;; --- the document and the response ---------------------------------------
   (expect "a document has a doctype"

@@ -10,15 +10,15 @@
 
 (export
   ;; Core types. Transparent records for easy testing and manipulation.
-  Request Response Handler Header
+  Request Response Handler Header Middleware
 
   ;; Request construction.
   make-request
 
   ;; Reading one.
   request-method request-path request-body
-  request-query request-header request-param
-  request-query-or request-header-or request-param-or
+  request-query request-header request-param request-form
+  request-query-or request-header-or request-param-or request-form-or
 
   ;; Making an answer.
   respond text html json-text redirect
@@ -26,7 +26,10 @@
 
   ;; Reading one, and adding to it.
   response-status response-content-type response-headers response-body
-  with-status with-content-type with-header)
+  with-status with-content-type with-header
+  
+  ;; Middleware pipeline
+  pipeline)
 
 (import (std prelude))
 
@@ -46,6 +49,7 @@
                          (: query (Map string string))
                          (: headers (Map string string))
                          (: params (Map string string))
+                         (: form (Map string string))
                          (: body string))))
 
 ;; Represents an HTTP response. The response is fully constructed in memory
@@ -58,18 +62,22 @@
 ;; A bjoroutine that processes a request and returns a response.
 (type (: Handler (-bjo-> Request Response)))
 
+;; A function that wraps a Handler to produce a new Handler.
+(type (: Middleware (Alias (-> Handler Handler))))
+
 ;; ---------------------------------------------------------------------------
 ;; Making a request
 ;; ---------------------------------------------------------------------------
 
 ;; Creates a new request. Route `params` are populated later by the router.
-(: make-request (-> string string (Map string string) (Map string string) string Request))
-(defun (make-request method path query headers body)
+(: make-request (-> string string (Map string string) (Map string string) string (Map string string) Request))
+(defun (make-request method path query headers body form)
   (Request (method method)
            (path path)
            (query query)
            (headers headers)
            (params (map-empty))
+           (form form)
            (body body)))
 
 ;; ---------------------------------------------------------------------------
@@ -102,6 +110,10 @@
 (: request-param (-> Request string (Option string)))
 (defun (request-param r name) (map-try-ref (record-ref r params) name))
 
+;; Gets a parsed form field, or `None` if absent.
+(: request-form (-> Request string (Option string)))
+(defun (request-form r name) (map-try-ref (record-ref r form) name))
+
 ;; Accessors with fallback values for when the key is not present.
 (: request-query-or (-> Request string string string))
 (defun (request-query-or r name fallback)
@@ -114,6 +126,10 @@
 (: request-param-or (-> Request string string string))
 (defun (request-param-or r name fallback)
   (map-ref-or (record-ref r params) name fallback))
+
+(: request-form-or (-> Request string string string))
+(defun (request-form-or r name fallback)
+  (map-ref-or (record-ref r form) name fallback))
 
 ;; ---------------------------------------------------------------------------
 ;; Making an answer
@@ -184,3 +200,17 @@
 (: with-header (-> Response string string Response))
 (defun (with-header r name value)
   (record-set r (headers (vec-add (record-ref r headers) (Tuple name value)))))
+
+;; ---------------------------------------------------------------------------
+;; Middleware Pipeline
+;; ---------------------------------------------------------------------------
+
+;; Composes middlewares to wrap a target handler.
+;; `(pipeline h m1 m2)` results in `(m1 (m2 h))`.
+(: pipeline (-> Handler #:rest Middleware Handler))
+(defun (pipeline h #:rest middlewares)
+  (def ms (loop (:for m (in-array middlewares)) (:acc out (vecing m))))
+  (let go ((i (- (vec-length ms) 1)) (curr h))
+    (if (< i 0)
+        curr
+        (go (- i 1) ((vec-ref ms i) curr)))))

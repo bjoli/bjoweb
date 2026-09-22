@@ -51,7 +51,7 @@ Two thirds of this package never name an ASP.NET type, which is why two thirds
 of it can be unit-tested with no socket anywhere:
 
 #+BEGIN_SRC scheme
-(router-match app (make-request "GET" "/hello/ada" (map-empty) (map-empty) ""))
+(router-match app (make-request "GET" "/hello/ada" (map-empty) (map-empty) "" (map-empty)))
 ;; => (Matched <request with params {"name" "ada"}> <handler>)
 #+END_SRC
 
@@ -81,9 +81,10 @@ Because handlers return a complete ~Response~ value, nothing is written to the c
 | ~(request-body req)~                | the whole body as UTF-8 text, or ~""~              |
 | ~(request-param req "id")~          | what ~/users/:id~ bound — an ~Option~              |
 | ~(request-query req "page")~        | ~?page=2~, decoded, ~+~ counted as a space         |
+| ~(request-form req "email")~        | from an ~application/x-www-form-urlencoded~ body   |
 | ~(request-header req "Accept")~     | case-insensitive                                   |
 
-Each of the last three has an ~-or~ form taking a fallback:
+Each of the last four has an ~-or~ form taking a fallback:
 ~(request-query-or req "page" "1")~.
 
 *** Writing the response
@@ -107,6 +108,21 @@ build on any of them:
 
 There is no JSON writer here. ~(text json)~ is one import away, and putting one
 in this package would make every program that serves plain text carry it.
+
+*** Middleware Pipeline
+
+A middleware is a function that takes a handler and returns a new handler (`(-> Handler Handler)`). You can compose these cleanly using the `pipeline` function.
+
+Because `pipeline` takes a target handler followed by a variable number of middleware functions, they are applied from right to left, wrapping the handler logically:
+
+#+BEGIN_SRC scheme
+(defbjo (main args)
+  (def wrapped-home (pipeline home logger auth))
+  (serve (router (route-get "/" wrapped-home)) #:port 8080)
+  0)
+#+END_SRC
+
+Here, `logger` wraps `auth`, which wraps `home`. The request flows through `logger`, then `auth`, then `home`.
 
 ** HTML
 

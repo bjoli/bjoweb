@@ -243,12 +243,23 @@
 (: read-request (-bjo-> Ctx Request))
 (defbjo (read-request ctx)
   (def in (ctx-request ctx))
+  (def body-text (read-body in))
+  (def headers (collect-headers (cast (Seq (Pairing string Values)) (in-headers in))))
+  (def ctype (map-try-ref headers "content-type"))
+  (def form-map
+    (match ctype
+      ((Some ct)
+       (if (string-starts-with? ct "application/x-www-form-urlencoded")
+           (parse-query body-text)
+           (map-empty)))
+      (None (map-empty))))
   (make-request (in-method in)
                 ;; The path text is already percent-decoded.
                 (text-or-empty (path-text (in-path in)))
                 (parse-query (text-or-empty (query-text (in-query in))))
-                (collect-headers (cast (Seq (Pairing string Values)) (in-headers in)))
-                (read-body in)))
+                headers
+                body-text
+                form-map))
 
 ;; Reads the entire request body as a UTF-8 string.
 (: read-body (-bjo-> Incoming string))

@@ -208,7 +208,7 @@
 
 (: what-happens (-> string string string))
 (defun (what-happens method path)
-  (match (router-match app (make-request method path (map-empty) (map-empty) ""))
+  (match (router-match app (make-request method path (map-empty) (map-empty) "" (map-empty)))
     ((Matched bound handler)
      (str "matched " (request-param-or bound "name" (request-param-or bound "path" ""))))
     ((WrongMethod allow) (str "405 " allow))

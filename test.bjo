@@ -1,0 +1,65 @@
+;; bjoweb/test.bjo — hello world, and a page.
+;;
+;;     bjo run test.bjo
+;;     curl http://127.0.0.1:8080/
+;;     curl http://127.0.0.1:8080/echo/hello
+;;     curl http://127.0.0.1:8080/page/banana
+;;
+;; Ctrl-C stops it.
+
+(import (std prelude))
+(import (bjoweb core)
+        (bjoweb router)
+        (bjoweb server)
+        (bjoweb html))
+
+(: show (-bjo-> Request Response))
+(defbjo (show req)
+  (def what (request-param-or req "what" "nothing"))
+  (page '(html (head (title "bjoweb")
+                     (meta (@ (charset "utf-8"))))
+               (body (@ (class "card"))
+                     (h1 "bjoweb")
+                     (p "you asked for " (b ,what))
+                     (hr)
+                     (ul ,@(list-map link (list "banana" "apple" "<script>")))))))
+
+;; A computed list of children, which is what a page driven by data needs.
+;;
+;; `,@` is what puts one in: it places the *elements* of a `(List Node)` where
+;; it stands, so the `ul` above gets three `li` children rather than one child
+;; holding three. Anything written beside a splice is still elaborated the
+;; usual way.
+;;
+;; This used to read `(ul (NSub (list-map link ...)))`, and that was a bug of
+;; exactly the kind the next two notes are about: with no `,` in front of it,
+;; `(NSub ...)` inside a quote is *data* — a nested list whose head is the
+;; symbol `NSub` — so the page served `<NSub><list-map>link<list>banana...`
+;; instead of a list of links. It type-checked, because every piece of it has a
+;; shape the union has a case for.
+;;
+;; Two things to know, both of which bite once:
+;;
+;;   * a literal elaborates against a *list* type, so it cannot be returned as
+;;     a `Node` directly — `(NSub '(...))` is the wrapper, and a constructor's
+;;     parameter type is pushed into the literal exactly as a function's is.
+;;     That is why `link` still has one, and why `,@` removed the outer one and
+;;     not this;
+;;   * inside a quote, `(str "/page/" ...)` is a *list* whose head is the
+;;     symbol `str`, not a call. Unquote the whole call instead.
+(: link (-> string Node))
+(defun (link what)
+  (NSub '(li (a (@ (href ,(str "/page/" what))) ,what))))
+
+
+
+(defbjo (main args)
+  (serve (router
+           (route-get "/" (fun (req) (text "hello, world\n")))
+           ;; `:what` matches one segment and binds it under that name. It
+           ;; arrives percent-decoded — that is the server's job, not yours.
+           (route-get "/echo/:what"
+                      (fun (req) (text (str (request-param-or req "what" "") "\n"))))
+           (route-get "/page/:what" show))
+         #:port 8080)
+  0)

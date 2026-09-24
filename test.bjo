@@ -7,7 +7,6 @@
 ;;
 ;; Ctrl-C stops it.
 
-(import (std prelude))
 (import (bjoweb core)
         (bjoweb router)
         (bjoweb server)
@@ -24,29 +23,8 @@
                      (hr)
                      (ul ,@(list-map link (list "banana" "apple" "<script>")))))))
 
-;; A computed list of children, which is what a page driven by data needs.
-;;
-;; `,@` is what puts one in: it places the *elements* of a `(List Node)` where
-;; it stands, so the `ul` above gets three `li` children rather than one child
-;; holding three. Anything written beside a splice is still elaborated the
-;; usual way.
-;;
-;; This used to read `(ul (NSub (list-map link ...)))`, and that was a bug of
-;; exactly the kind the next two notes are about: with no `,` in front of it,
-;; `(NSub ...)` inside a quote is *data* — a nested list whose head is the
-;; symbol `NSub` — so the page served `<NSub><list-map>link<list>banana...`
-;; instead of a list of links. It type-checked, because every piece of it has a
-;; shape the union has a case for.
-;;
-;; Two things to know, both of which bite once:
-;;
-;;   * a literal elaborates against a *list* type, so it cannot be returned as
-;;     a `Node` directly — `(NSub '(...))` is the wrapper, and a constructor's
-;;     parameter type is pushed into the literal exactly as a function's is.
-;;     That is why `link` still has one, and why `,@` removed the outer one and
-;;     not this;
-;;   * inside a quote, `(str "/page/" ...)` is a *list* whose head is the
-;;     symbol `str`, not a call. Unquote the whole call instead.
+;; Currently elaboration only works one way, so in return position i need to wrap it
+;; 
 (: link (-> string Node))
 (defun (link what)
   (NSub '(li (a (@ (href ,(str "/page/" what))) ,what))))

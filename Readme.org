@@ -3,7 +3,6 @@
 Kestrel on one side, fibers on the other, an inbox between them.
 
 #+BEGIN_SRC scheme
-(import (std prelude))
 (import (bjoweb core))
 (import (bjoweb router))
 (import (bjoweb server))
@@ -231,6 +230,7 @@ helper.
 ~serve~ is what a ~main~ wants: start, serve until Ctrl-C, stop.
 
 #+BEGIN_SRC scheme
+;; default values. Does not serve static files. 
 (serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot")
 #+END_SRC
 
@@ -315,3 +315,7 @@ server with one worker and one queue slot, to see that six at once come back
 
 It also checks the thing this framework is for: a parameter installed around
 ~start-server~ is readable inside a handler. Kestrel's thread never had it.
+
+** Planned features
+
+Websockets. 

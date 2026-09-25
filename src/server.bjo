@@ -206,7 +206,8 @@
   (: Serving (Record (: router Router)
                      (: going-away (Inbox Unit))
                      (: trusted (Vec Network))
-                     (: max-body int))))
+                     (: max-body int)
+                     (: cancel-on-disconnect bool))))
 
 ;; The queue between Kestrel and the workers.
 ;;
@@ -291,13 +292,17 @@
 ;; `#:max-body` is how many bytes of a request body may be read into memory,
 ;; 1 MiB unless told otherwise. A body over it is answered 413 once a handler
 ;; asks for it; `request-body-port` may take more.
+;;
+;; A handler whose client has gone is waited for, unless `#:cancel-on-disconnect`
+;; says to cancel it.
 (: start-server (-bjo-> Router
                         (#:port int) (#:host string) (#:workers int) (#:queue int)
                         (#:quiet bool) (#:static-files bool) (#:static-dir string)
                         (#:trusted-proxies (Vec string)) (#:max-body int)
+                        (#:cancel-on-disconnect bool)
                         Server))
 (defbjo (start-server rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot"
-                      #:trusted-proxies loopback #:max-body 1048576)
+                      #:trusted-proxies loopback #:max-body 1048576 #:cancel-on-disconnect #f)
   (def trusted (trusted-networks trusted-proxies))
   (def requests (make-request-inbox queue))
   (def going-away (latch))
@@ -306,7 +311,8 @@
   (ignore (.Add (app-urls app) url))
   (install-inbox! app requests static-files)
   (watch-host! app going-away)
-  (def serving (Serving (router rt) (going-away going-away) (trusted trusted) (max-body max-body)))
+  (def serving (Serving (router rt) (going-away going-away) (trusted trusted) (max-body max-body)
+                        (cancel-on-disconnect cancel-on-disconnect)))
   (loop (:for i (range 0 workers))
         (:do (spawn (worker serving requests))))
   (app-start app)
@@ -326,15 +332,17 @@
                  (#:port int) (#:host string) (#:workers int) (#:queue int)
                  (#:quiet bool) (#:static-files bool) (#:static-dir string)
                  (#:trusted-proxies (Vec string)) (#:max-body int)
+                 (#:cancel-on-disconnect bool)
                  void))
 (defbjo (serve rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot"
-               #:trusted-proxies loopback #:max-body 1048576)
+               #:trusted-proxies loopback #:max-body 1048576 #:cancel-on-disconnect #f)
   (def trusted (trusted-networks trusted-proxies))
   (def requests (make-request-inbox queue))
   (def going-away (latch))
   (def app (new-app quiet static-dir))
   (install-inbox! app requests static-files)
-  (def serving (Serving (router rt) (going-away going-away) (trusted trusted) (max-body max-body)))
+  (def serving (Serving (router rt) (going-away going-away) (trusted trusted) (max-body max-body)
+                        (cancel-on-disconnect cancel-on-disconnect)))
   (ignore
    (with-scope
      (watch-host! app going-away)
@@ -385,8 +393,7 @@
   (def going-away (record-ref serving going-away))
   (def ctx (call-request c))
   (def req (read-request ctx (record-ref serving trusted) (record-ref serving max-body)))
-  (match (sync (choose (wrap (promise-join (bjo (handle (record-ref serving router) req))) (fun (r) (Some r)))
-                       (wrap (call-abandoned c) (fun (u) None))))
+  (match (handled serving c req)
     ((Some (Ok answer))
      (match (response-body answer)
        ((Upgraded up) (upgrade-or-refuse! ctx req c answer up going-away handed-off))
@@ -395,6 +402,36 @@
      unit)
     ((Some (Err e)) (answer-failure! ctx req c e) unit)
     (None unit)))
+
+;; What the handler answered, or `None` when the client went first.
+;;
+;; The handler runs in a scope of its own, and this does not return until the
+;; scope has closed, which waits for the handler even when its client has gone.
+;; A worker whose client has left is therefore still busy, so that `#:workers`
+;; bounds how many handlers run at once, and the call — and with it Kestrel's
+;; `HttpContext`, which the request's body is read from — is not answered while
+;; the handler may still use it. With `#:cancel-on-disconnect` the scope is
+;; cancelled instead, and the handler stops at its next wait; a `with-shield`
+;; in it finishes first.
+;;
+;; The scope also owns what the handler spawns, so a fiber of the handler's that
+;; fails is the handler's failure, not the server's, and the response waits for
+;; it. The response itself is written after the scope, since a stream or a
+;; websocket handed off from here must not be waited for.
+(: handled (-bjo-> Serving (Call Ctx Unit) Request (Option (Result Exception Response))))
+(defbjo (handled serving c req)
+  (match (try (with-cancel (stop)
+                (def running (bjo (handle (record-ref serving router) req)))
+                (match (sync (choose (wrap (promise-join running) (fun (r) (Some r)))
+                                     (wrap (call-abandoned c) (fun (u) None))))
+                  ((Some r) (Some r))
+                  (None
+                   (when (record-ref serving cancel-on-disconnect)
+                     (stop (Requested "the client has gone")))
+                   None)))
+         #:catch (System.Exception))
+    ((Ok outcome) outcome)
+    ((Err e) (Some (Err e)))))
 
 ;; A handler that raised. Kestrel refusing the body — too large, malformed, cut
 ;; short — is the client's doing, and gets the status Kestrel chose; so is a

@@ -262,6 +262,34 @@
 (defbjo (should-not-run out)
   (ignore (inbox-post! head-probe unit)))
 
+;; --- A client that goes away -------------------------------------------------
+
+;; How far `leave-slowly` has got, posted as it goes.
+(: progress (Inbox string))
+(def progress (make-inbox 64 DropNewest))
+
+;; Slow, with something in the middle that must be done whatever happens.
+(: leave-slowly (-bjo-> Request Response))
+(defbjo (leave-slowly req)
+  (ignore (inbox-post! progress "started"))
+  (with-shield
+    (ignore (sync (timeout 300)))
+    (ignore (inbox-post! progress "saved")))
+  (ignore (sync (timeout 600)))
+  (ignore (inbox-post! progress "finished"))
+  (text "done"))
+
+;; Answers, and leaves behind a fiber that fails.
+(: spawn-and-fail (-bjo-> Request Response))
+(defbjo (spawn-and-fail req)
+  (spawn (fail-soon))
+  (text "answered"))
+
+(: fail-soon (-bjo-> void))
+(defbjo (fail-soon)
+  (ignore (sync (timeout 50)))
+  (raise (cast Exception (Boom. "the handler's fiber exploded"))))
+
 ;; Text, flushed once in the middle.
 (: greeting-text (-bjo-> TextOutputPort void))
 (defbjo (greeting-text t)
@@ -329,6 +357,8 @@
     (route-get    "/environment"  from-the-environment)
     (route-get    "/whoami"       who-asked)
     (route-get    "/boom"         boom)
+    (route-get    "/leave"        leave-slowly)
+    (route-get    "/spawn-fails"  spawn-and-fail)
     ;; An ordinary lambda in a slot declared `(-bjo-> ...)`: the compiler lifts
     ;; it, so a handler that never suspends needs no `defbjo` of its own.
     (route-get    "/elsewhere"    (fun (req) (redirect "/")))
@@ -617,6 +647,23 @@
 (defbjo (probed)
   (sync (choose (wrap (inbox-recv head-probe) (fun (u) "called"))
                 (wrap (timeout 500) (fun (u) "not called")))))
+
+;; Asks for `path` and hangs up `ms` milliseconds later.
+(: ask-and-leave (-bjo-> int string int void))
+(defbjo (ask-and-leave port path ms)
+  (with-scope
+    (match (tcp-connect "127.0.0.1" port)
+      ((Ok (Tuple in out)) (send-get! out path) (ignore (sync (timeout ms))))
+      ((Err e) unit))))
+
+;; Everything posted to `progress` until nothing has been for `ms`.
+(: progress-until-quiet (-bjo-> int string))
+(defbjo (progress-until-quiet ms)
+  (let go ((said (vec-empty)))
+    (match (sync (choose (wrap (inbox-recv progress) (fun (s) (Some s)))
+                         (wrap (timeout ms) (fun (u) None))))
+      ((Some s) (go (vec-add said s)))
+      (None (string-join said ",")))))
 
 ;; ---------------------------------------------------------------------------
 ;; Server-sent events as they arrive
@@ -1135,6 +1182,39 @@
                  (sync (choose (wrap (inbox-recv writer-ended) (fun (u) "stopped"))
                                (wrap (timeout 3000) (fun (u) "still running"))))
                  "stopped")))))
+
+  ;; --- a client that goes away ----------------------------------------------
+  ;;
+  ;; One worker, and five clients that ask for a slow page and hang up, one
+  ;; after another. The worker waits for the handler whose client left, so the
+  ;; four behind it are still queued when their clients leave, and never run.
+  ;; Were it to go back to the queue, five handlers would run at once.
+  (def leave-port (free-port))
+  (def leave-base (str "http://127.0.0.1:" (int->string leave-port)))
+  (with-scope
+    (let ((server (start-server app #:port leave-port #:workers 1)))
+      (try
+          (let ()
+            (loop (:for i (range 0 5)) (:do (ask-and-leave leave-port "/leave" 100)))
+            (expect "a handler whose client has gone is waited for, one at a time, and finishes"
+                    (progress-until-quiet 1500) "started,saved,finished")
+            (expect "a fiber a handler spawned that fails is the handler's failure"
+                    (body-of (str leave-base "/spawn-fails"))
+                    (Tuple 500 "500 Internal Server Error\n"))
+            (expect "and not the server's" (body-of (str leave-base "/")) (Tuple 200 "hello")))
+        #:finally (stop-server! server))))
+
+  ;; The same page, on a server told to cancel: what the handler shielded is
+  ;; done, and the rest is not.
+  (def cancel-port (free-port))
+  (with-scope
+    (let ((server (start-server app #:port cancel-port #:workers 1 #:cancel-on-disconnect #t)))
+      (try
+          (let ()
+            (ask-and-leave cancel-port "/leave" 100)
+            (expect "with #:cancel-on-disconnect it is cancelled, once what it shielded is done"
+                    (progress-until-quiet 1500) "started,saved"))
+        #:finally (stop-server! server))))
 
   ;; --- a queue that overflows ----------------------------------------------
   ;;

@@ -503,7 +503,7 @@ helper.
 #+BEGIN_SRC scheme
 ;; default values. Does not serve static files. 
 (serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot"
-           #:trusted-proxies ["127.0.0.0/8" "::1"] #:max-body 1048576)
+           #:trusted-proxies ["127.0.0.0/8" "::1"] #:max-body 1048576 #:cancel-on-disconnect #f)
 #+END_SRC
 
 ~start-server~ and ~stop-server!~ are the pair for a program that has something
@@ -535,7 +535,23 @@ A refused request returns ~503 Service Unavailable~ with ~Retry-After: 1~. This 
 The framework listens to Kestrel's ~RequestAborted~ token to detect disconnected clients:
 
 - *Still queued:* The request is dropped and never reaches a worker.
-- *Already processing:* The response is discarded and not written to the socket. The handler itself is *not* killed; it is allowed to finish to ensure side effects are safely completed.
+- *Already processing:* The response is discarded and not written to the socket. The handler itself is *not* killed; it is allowed to finish to ensure side effects are safely completed. Its worker waits for it, so ~#:workers~ still bounds how many handlers run at once: a client that asks for an expensive page and hangs up, again and again, gets no more of the server than one that waits.
+
+With ~#:cancel-on-disconnect #t~ the handler is cancelled instead, and stops at its next wait. What must be done either way — a write that has to be finished once it is begun — belongs in a ~with-shield~, which finishes first:
+
+#+BEGIN_SRC scheme
+(defbjo (checkout req)
+  (def order (read-order req))
+  (with-shield (save-order! order))           ;; saved whether or not the client stays
+  (def extras (fetch-recommendations order))  ;; not worth finishing for nobody
+  (page (receipt order extras)))
+#+END_SRC
+
+A handler runs in a scope of its own, and that scope owns what the handler
+starts: a fiber it spawns is waited for before the response goes out, and one
+that fails is the handler's failure, answered 500. Work meant to outlive the
+request belongs to a fiber that does — posted to, as ~examples/chat.bjo~'s
+room is.
 
 *** Serving Static Files
 
@@ -658,7 +674,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 33 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 84 checks, a real socket
+bjo run tests/demo.bjo    ;; 88 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
@@ -667,7 +683,7 @@ escaping in text and in attribute values, that an attribute value never gains a
 newline, computed content through ~,~, ~raw~, fragments, and the document and
 response wrappers.
 
-Eighty-four checks: the routing table on its own, then a real Kestrel on a port
+Eighty-eight checks: the routing table on its own, then a real Kestrel on a port
 the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
 query strings, request headers, a POST body, a suspending handler, a handler
 that raises, the 404 and the 405, a redirect, and twelve requests at once
@@ -706,6 +722,13 @@ that hangs up, which stops the writer; and a ~HEAD~, which never calls it.
 Then a server with one worker, which still serves a plain request while a
 stream is open, and which is stopped with the stream open: the stop does not
 wait for it, the stream is cut off rather than ended, and its writer stops.
+
+Clients that go away: five that ask a one-worker server for a slow page and
+hang up, one after another, get one handler at a time, and it runs to the
+end; a fiber a handler spawned that fails is answered 500, and the server
+serves on. With ~#:cancel-on-disconnect~ the handler stops once what it
+shielded is done. Starting the handler outside its scope, as 0.2.0 did, runs
+five at once — and the failing fiber takes the whole program down.
 
 Server-sent events: the exact text of a stream — the opening comment, the
 retry, an event with a name and an id, data with a line break in it — and its

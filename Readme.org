@@ -349,12 +349,13 @@ It is an ordinary ~bjo~ package. From a project of your own:
 
 #+BEGIN_SRC scheme
 (depends
-  (package (name (bjoweb)) (source (path (dir "../bjoweb")))))
+  (package (name (bjoweb))
+           (version (version-at-least "0.1.0"))
+           (source (git (url "https://github.com/bjoli/bjoweb")))))
 #+END_SRC
 
-bjoweb depends on [[https://github.com/bjoli/websocket][~(net websocket)~]], for now as
-a path source: a checkout of it has to sit beside bjoweb's, at ~../websocket~.
-It needs a Bjolang whose ~(std net)~ has ~stream->ports~.
+~(net websocket)~, from [[https://github.com/bjoli/websocket]], comes along with
+it. bjoweb needs a Bjolang whose ~(std net)~ has ~stream->ports~.
 
 Note that *the ASP.NET runtime has to be installed wherever the program runs*.
 Not just where it is built: a framework-dependent program asks the host for

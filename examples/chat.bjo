@@ -17,6 +17,7 @@
 (import (bjoweb core))
 (import (bjoweb router))
 (import (bjoweb server))
+(import (bjoweb html))
 
 ;; What the room is told.
 (type (: Note (Union (Joined (Inbox string))
@@ -57,31 +58,37 @@
             (Gone unit)))
       #:finally (ignore (inbox-post! notes (Left mine))))))
 
-(def page "<!doctype html>
-<meta charset=\"utf-8\">
-<title>bjoweb chat</title>
-<ul id=\"log\"></ul>
-<input id=\"say\" autofocus placeholder=\"say something\">
-<script>
-  const ws = new WebSocket(\"ws://\" + location.host + \"/chat\");
-  ws.onmessage = e => {
-    const li = document.createElement(\"li\");
-    li.textContent = e.data;
-    log.append(li);
-  };
-  ws.onclose = e => say.placeholder = \"closed: \" + e.code + \" \" + e.reason;
-  say.onkeydown = e => {
-    if (e.key === \"Enter\" && say.value) { ws.send(say.value); say.value = \"\"; }
-  };
-</script>
-")
+;; The browser's half. Script content is not HTML: the browser takes it byte
+;; for byte and decodes no entities, so it goes in as `raw` — escaped as text,
+;; every `=>` would arrive as `=&gt;`.
+(def client-script
+  (raw "const log = document.getElementById('log');
+const say = document.getElementById('say');
+const ws = new WebSocket('ws://' + location.host + '/chat');
+ws.onmessage = e => {
+  const li = document.createElement('li');
+  li.textContent = e.data;
+  log.append(li);
+};
+ws.onclose = e => { say.placeholder = 'closed: ' + e.code + ' ' + e.reason; };
+say.onkeydown = e => {
+  if (e.key === 'Enter' && say.value) { ws.send(say.value); say.value = ''; }
+};"))
+
+(: chat-page (-> Response))
+(defun (chat-page)
+  (page '(html (head (meta (@ (charset "utf-8")))
+                     (title "bjoweb chat"))
+               (body (ul (@ (id "log")))
+                     (input (@ (id "say") (autofocus) (placeholder "say something")))
+                     (script ,client-script)))))
 
 (defbjo (main args)
   (def notes (make-inbox 256 DropNewest))
   ;; A daemon: it never ends on its own, and `main` must not wait for it.
   (spawn/daemon (room notes))
   (serve (router
-           (route-get "/"     (fun (req) (html page)))
+           (route-get "/"     (fun (req) (chat-page)))
            (route-get "/chat" (fun (req) (websocket (chatter notes)))))
          #:port 8080)
   0)

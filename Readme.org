@@ -92,10 +92,11 @@ Each of the last four has an ~-or~ form taking a fallback:
 | ~(html "<p>hi</p>")~           | ~text/html; charset=utf-8~             |
 | ~(json-text "{\"a\":1}")~      | ~application/json; charset=utf-8~      |
 | ~(respond 418 "no" #:content-type "text/plain")~ | anything else        |
+| ~(binary bytes)~               | ~application/octet-stream~, or ~#:content-type~ |
 | ~(redirect "/next")~           | 302, or 301 with ~#:permanent #t~      |
 | ~(not-found)~ ~(bad-request why)~ ~(method-not-allowed allow)~ ~(server-error)~ | |
 
-All of them take ~#:status~ where a status makes sense, and three combinators
+All of them take ~#:status~ where a status makes sense, and four combinators
 build on any of them:
 
 #+BEGIN_SRC scheme
@@ -103,7 +104,22 @@ build on any of them:
 #+END_SRC
 
 ~with-header~ appends rather than replaces, so a response can carry two
-~Set-Cookie~ s.
+~Set-Cookie~ s. ~with-content-type~ and ~with-body~ are the other two.
+
+A response's body is a ~Body~:
+
+| ~Empty~                  | nothing                                    |
+| ~(Text string)~          | sent as UTF-8, with no byte order mark     |
+| ~(Bytes (Array byte))~   | sent as it is                              |
+| ~(Upgraded upgrade)~     | what ~websocket~ answers with; see below   |
+
+~(response-body r)~ is the ~Body~, and ~(response-text r)~ is ~(Some s)~ for a
+~Text~ body and ~None~ otherwise, for a test or a middleware that wants to look.
+
+~Content-Length~ is set from the body, and one put among the headers is
+dropped. A status that cannot have a body — 1xx, 204, 304 — is sent without
+one, whatever the handler gave it. A ~HEAD~ answered by a ~GET~ route gets the
+~GET~'s ~Content-Length~ and no body.
 
 There is no JSON writer here. ~(text json)~ is one import away, and putting one
 in this package would make every program that serves plain text carry it.
@@ -368,7 +384,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 33 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 37 checks, a real socket
+bjo run tests/demo.bjo    ;; 45 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
@@ -377,13 +393,20 @@ escaping in text and in attribute values, that an attribute value never gains a
 newline, computed content through ~,~, ~raw~, fragments, and the document and
 response wrappers.
 
-Thirty-seven checks: the routing table on its own, then a real Kestrel on a port
+Forty-five checks: the routing table on its own, then a real Kestrel on a port
 the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
 query strings, request headers, a POST body, a suspending handler, a handler
 that raises, the 404 and the 405, a redirect, and twelve requests at once
 through four workers, each getting the answer to its own question. Then a second
 server with one worker and one queue slot, to see that six at once come back
 ~200x2 503+retry-after=1x4~ and that it still serves afterwards.
+
+Bodies are checked byte for byte over a plain TCP socket, because ~(std http)~
+drops a byte order mark while it decodes: text goes out as UTF-8 with none,
+bytes go out as they are, and a 204 sends nothing whatever its handler gave it.
+And ~Content-Length~: in bytes rather than characters, 0 for an empty body, the
+~GET~'s for a ~HEAD~, and the body's even when the handler put another one in
+the headers.
 
 It also checks the thing this framework is for: a parameter installed around
 ~start-server~ is readable inside a handler. Kestrel's thread never had it.

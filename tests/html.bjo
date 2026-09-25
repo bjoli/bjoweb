@@ -146,8 +146,8 @@
   (def r (page '(html (body "x"))))
   (expect "a page is html" (response-content-type r) "text/html; charset=utf-8")
   (expect "with the doctype in its body"
-          (response-body r)
-          "<!DOCTYPE html>\n<html>\n  <body>\n    x\n  </body>\n</html>\n")
+          (response-text r)
+          (Some "<!DOCTYPE html>\n<html>\n  <body>\n    x\n  </body>\n</html>\n"))
   (expect "and 200 by default" (response-status r) 200)
   (expect "or whatever you say" (response-status (page '(p "gone") #:status 410)) 410)
 

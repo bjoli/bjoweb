@@ -12,7 +12,7 @@
 
 (export
   ;; Core types. Transparent records for easy testing and manipulation.
-  Request Response Handler Header Middleware
+  Request Response Body Handler Header Middleware
 
   ;; Request construction.
   make-request
@@ -23,15 +23,15 @@
   request-query-or request-header-or request-param-or request-form-or
 
   ;; Making an answer.
-  respond text html json-text redirect
+  respond text html json-text binary redirect
   not-found method-not-allowed bad-request server-error
 
   ;; Reading one, and adding to it.
-  response-status response-content-type response-headers response-body
-  with-status with-content-type with-header
+  response-status response-content-type response-headers response-body response-text
+  with-status with-content-type with-header with-body
 
   ;; Websockets: an upgrade is a kind of answer.
-  Session Upgrade websocket response-upgrade
+  Session Upgrade websocket
 
   ;; Middleware pipeline
   pipeline)
@@ -68,14 +68,21 @@
                          (: max-message int)
                          (: keep-alive int))))
 
-;; Represents an HTTP response. The response is fully constructed in memory
-;; before being written to the client. `upgrade` is `None` for everything but
-;; the answer `websocket` makes.
+;; What a response carries after its headers. `Text` goes out as UTF-8. The
+;; server sets `Content-Length` for `Text` and `Bytes`, and sends no body with a
+;; status that cannot have one (1xx, 204, 304). `Upgraded` is what `websocket`
+;; answers with.
+(type (: Body (Union Empty
+                     (Text string)
+                     (Bytes (Array byte))
+                     (Upgraded Upgrade))))
+
+;; Represents an HTTP response. Nothing is written until the handler has
+;; returned one.
 (type (: Response (Record (: status int)
                           (: content-type string)
                           (: headers (Vec Header))
-                          (: body string)
-                          (: upgrade (Option Upgrade)))))
+                          (: body Body))))
 
 ;; A bjoroutine that processes a request and returns a response.
 (type (: Handler (-bjo-> Request Response)))
@@ -156,8 +163,7 @@
 ;; Creates a base response. Other helpers build on this.
 (: respond (-> int string (#:content-type string) (#:headers (Vec Header)) Response))
 (defun (respond status body #:content-type "text/plain; charset=utf-8" #:headers (vec-empty))
-  (Response (status status) (content-type content-type) (headers headers) (body body)
-            (upgrade None)))
+  (Response (status status) (content-type content-type) (headers headers) (body (Text body))))
 
 ;; Accepts a websocket and runs `session` on it.
 ;;
@@ -172,11 +178,11 @@
 ;; ping, 0 for none.
 (: websocket (-> Session (#:protocol string) (#:max-message int) (#:keep-alive int) Response))
 (defun (websocket session #:protocol "" #:max-message 1048576 #:keep-alive 30000)
-  (Response (status 101) (content-type "") (headers (vec-empty)) (body "")
-            (upgrade (Some (Upgrade (session session)
-                                    (protocol protocol)
-                                    (max-message max-message)
-                                    (keep-alive keep-alive))))))
+  (Response (status 101) (content-type "") (headers (vec-empty))
+            (body (Upgraded (Upgrade (session session)
+                                     (protocol protocol)
+                                     (max-message max-message)
+                                     (keep-alive keep-alive))))))
 
 (: text (-> string (#:status int) Response))
 (defun (text body #:status 200) (respond status body))
@@ -189,6 +195,11 @@
 (: json-text (-> string (#:status int) Response))
 (defun (json-text body #:status 200)
   (respond status body #:content-type "application/json; charset=utf-8"))
+
+;; Bytes as they are: an image, a download, anything that is not text.
+(: binary (-> (Array byte) (#:status int) (#:content-type string) Response))
+(defun (binary data #:status 200 #:content-type "application/octet-stream")
+  (Response (status status) (content-type content-type) (headers (vec-empty)) (body (Bytes data))))
 
 ;; Creates a redirect response. Defaults to 302 (Found) unless `#:permanent #t` is specified.
 (: redirect (-> string (#:permanent bool) Response))
@@ -224,11 +235,15 @@
 (: response-headers (-> Response (Vec Header)))
 (defun (response-headers r) (record-ref r headers))
 
-(: response-body (-> Response string))
+(: response-body (-> Response Body))
 (defun (response-body r) (record-ref r body))
 
-(: response-upgrade (-> Response (Option Upgrade)))
-(defun (response-upgrade r) (record-ref r upgrade))
+;; The body when it is `Text`, for a test or a middleware that looks at it.
+(: response-text (-> Response (Option string)))
+(defun (response-text r)
+  (match (record-ref r body)
+    ((Text s) (Some s))
+    (_ None)))
 
 ;; Helpers for modifying a response in a pipeline style.
 (: with-status (-> Response int Response))
@@ -236,6 +251,9 @@
 
 (: with-content-type (-> Response string Response))
 (defun (with-content-type r ct) (record-set r (content-type ct)))
+
+(: with-body (-> Response Body Response))
+(defun (with-body r b) (record-set r (body b)))
 
 ;; Appends a header to the response, allowing multiple headers with the same name.
 (: with-header (-> Response string string Response))

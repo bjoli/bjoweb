@@ -10,20 +10,27 @@
 ;; `(std http)`, and stops it again. Nothing is faked: the requests go out over
 ;; a socket and come back through the inbox.
 ;;
-;; `(std http)` is imported with its types under a prefix and two defs renamed,
-;; because it and `(bjoweb core)` both have a `Request`, a `Response`, a
-;; `response-status` and a `response-headers`. One set is about the thing being
-;; sent and the other about the thing being served, and they are not the same
-;; types. `prefix-types` for the two types, because `rename` is for defs and
-;; macros only, and it takes the union's constructors along with it — hence
-;; `http/Text` and `http/DELETE` below.
+;; `(std http)` is imported with its types under a prefix and three defs renamed,
+;; because it and `(bjoweb core)` both have a `Request`, a `Response`, a `Body`,
+;; a `response-status`, a `response-headers` and a `response-text`. One set is
+;; about the thing being sent and the other about the thing being served, and
+;; they are not the same types. `prefix-types` for the types, because `rename`
+;; is for defs and macros only, and it takes the unions' constructors along with
+;; it — hence `http/Text` and `http/DELETE` below.
+;;
+;; The checks on the bytes a body goes out as are made over a plain socket,
+;; because `(std http)` tidies away what they are about: it drops a leading
+;; byte order mark while it decodes.
 
 (import (std prelude))
 (import (std simpletest))
 (import (prefix-types (rename (std http)
                               (response-status http-status)
-                              (response-headers http-headers))
+                              (response-headers http-headers)
+                              (response-text http-text))
                       "http/"))
+(import (only (std net) tcp-connect))
+(import (only (std ports) read-some write-bytes! flush! utf8))
 (import (bjoweb core))
 (import (bjoweb router))
 (import (bjoweb server))
@@ -38,7 +45,7 @@
 ;; the same problem and no upper bound on how long it lasts.
 
 (import/class
-  (Listener  (: System.Net.Sockets.TcpListener (-> Address int Listener)))
+  (PortProbe  (: System.Net.Sockets.TcpListener (-> Address int PortProbe)))
   (Address   (: System.Net.IPAddress))
   (Endpoint  (: System.Net.EndPoint))
   (Object    (: System.Object))
@@ -46,14 +53,15 @@
 
 (import/extern
   (loopback  (: System.Net.IPAddress.Loopback Address #:get))
-  (start-it  (: System.Net.Sockets.TcpListener.Start (-> Listener void)))
-  (stop-it   (: System.Net.Sockets.TcpListener.Stop (-> Listener void)))
-  (bound-to  (: System.Net.Sockets.TcpListener.LocalEndpoint (-> Listener Endpoint) #:get))
-  (ip-port   (: System.Net.IPEndPoint.Port (-> System.Net.IPEndPoint int) #:get)))
+  (start-it  (: System.Net.Sockets.TcpListener.Start (-> PortProbe void)))
+  (stop-it   (: System.Net.Sockets.TcpListener.Stop (-> PortProbe void)))
+  (bound-to  (: System.Net.Sockets.TcpListener.LocalEndpoint (-> PortProbe Endpoint) #:get))
+  (ip-port   (: System.Net.IPEndPoint.Port (-> System.Net.IPEndPoint int) #:get))
+  (to-bytes  (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte)))))
 
 (: free-port (-> int))
 (defun (free-port)
-  (def listener (Listener. loopback 0))
+  (def listener (PortProbe. loopback 0))
   (start-it listener)
   ;; `LocalEndpoint` is typed as the base `EndPoint`, and only an `IPEndPoint`
   ;; has a port. A type test is how that is asked in this language.
@@ -168,7 +176,12 @@
     ;; An ordinary lambda in a slot declared `(-bjo-> ...)`: the compiler lifts
     ;; it, so a handler that never suspends needs no `defbjo` of its own.
     (route-get    "/elsewhere"    (fun (req) (redirect "/")))
-    (route-delete "/thing"        (fun (req) (with-status (text "") 204)))))
+    (route-delete "/thing"        (fun (req) (with-status (text "") 204)))
+    ;; --- bodies ---
+    (route-get    "/bytes"        (fun (req) (binary #[0 1 254 255])))
+    (route-get    "/empty"        (fun (req) (with-body (text "") Empty)))
+    (route-get    "/lying"        (fun (req) (with-header (text "abc") "Content-Length" "99")))
+    (route-get    "/nobody"       (fun (req) (with-status (text "dropped") 204)))))
 
 ;; ---------------------------------------------------------------------------
 ;; A client
@@ -179,7 +192,7 @@
   (match (fetch req)
     ((Err e) (Tuple 0 (.-Message e)))
     ((Ok r)
-     (let* ((body (response-text r))
+     (let* ((body (http-text r))
             (code (http-status r)))
        ;; A response owns a connection; `ignore` is what closes it.
        (ignore r)
@@ -235,6 +248,50 @@
         (:acc out (vecing (match (sync (promise-join p))
                             ((Ok (Tuple code body)) body)
                             ((Err e) (.-Message e)))))))
+
+;; The status and the `Content-Length` a request is answered with.
+(: length-of (-bjo-> http/Request string))
+(defbjo (length-of req)
+  (match (fetch req)
+    ((Err e) (.-Message e))
+    ((Ok r)
+     (let* ((code (http-status r))
+            (n (match (response-header r "content-length") ((Some v) v) (None "-"))))
+       (ignore r)
+       (str (int->string code) " " n)))))
+
+;; ---------------------------------------------------------------------------
+;; The bytes on the wire
+;; ---------------------------------------------------------------------------
+
+(: dotted (-> (Array byte) string))
+(defun (dotted bs)
+  (loop (:for i (range 0 (array-length bs)))
+        (:acc acc (folding "" (str acc (byte->string (array-ref bs i)) ".")))))
+
+(: drain-dotted (-bjo-> ByteInputPort string))
+(defbjo (drain-dotted in)
+  (let go ((acc ""))
+    (match (read-some in)
+      ((Some bs) (go (str acc (dotted bs))))
+      (None acc))))
+
+;; The body of a GET exactly as it was sent, one number per byte: everything
+;; after the blank line that ends the head. `Connection: close` is what makes
+;; the server end the stream once the response is out.
+(: body-bytes (-bjo-> int string string))
+(defbjo (body-bytes port path)
+  (with-scope
+    (match (tcp-connect "127.0.0.1" port)
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok (Tuple in out))
+       (write-bytes! out (to-bytes utf8 (str "GET " path " HTTP/1.1\r\n"
+                                              "Host: localhost\r\n"
+                                              "Connection: close\r\n\r\n")))
+       (flush! out)
+       ;; The leading dot anchors the match at a byte boundary.
+       (def parts (string-split (str "." (drain-dotted in)) ".13.10.13.10."))
+       (if (< (vec-length parts) 2) "no blank line" (vec-ref parts 1))))))
 
 ;; ---------------------------------------------------------------------------
 ;; A websocket client
@@ -394,6 +451,31 @@
 
               (expect "a status with no body"
                       (fetched (request http/DELETE (str base "/thing"))) (Tuple 204 ""))
+
+              ;; --- bodies -------------------------------------------------
+              (expect "text goes out as UTF-8 with no byte order mark"
+                      (body-bytes port "/") "104.101.108.108.111.")
+
+              (expect "with its length in bytes, not in characters"
+                      (length-of (get (str base "/hello/Bj%C3%B6rn"))) "200 13")
+
+              (expect "HEAD answers with the length and no body"
+                      (length-of (request http/HEAD (str base "/"))) "200 5")
+
+              (expect "bytes go out as they are"
+                      (body-bytes port "/bytes") "0.1.254.255.")
+
+              (expect "with their length"
+                      (length-of (get (str base "/bytes"))) "200 4")
+
+              (expect "an empty body has length 0"
+                      (length-of (get (str base "/empty"))) "200 0")
+
+              (expect "a Content-Length among the headers is replaced by the body's"
+                      (fetched (get (str base "/lying"))) (Tuple 200 "abc"))
+
+              (expect "a 204 sends no body, whatever the handler gave it"
+                      (body-bytes port "/nobody") "")
 
               ;; Twelve at once through four workers: every answer is the one
               ;; its own request asked for, so no two requests were confused.

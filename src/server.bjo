@@ -98,8 +98,8 @@
   (out-headers   (: Microsoft.AspNetCore.Http.HttpResponse.Headers     (-> Outgoing HeaderDict) #:get))
   (header-add!   (: Microsoft.AspNetCore.Http.HeaderDictionaryExtensions.Append
                     (-> HeaderDict string Values void)))
-  (write-text!   (: Microsoft.AspNetCore.Http.HttpResponseWritingExtensions.WriteAsync
-                    (-> Outgoing string void) #:async))
+  (out-body      (: Microsoft.AspNetCore.Http.HttpResponse.Body (-> Outgoing Stream) #:get))
+  (body-write!   (: System.IO.Stream.WriteAsync (-> Stream (Array byte) int int void) #:async))
 
   ;; --- Stopping ---
   (app-lifetime  (: Microsoft.AspNetCore.Builder.WebApplication.Lifetime (-> App Lifetime) #:get))
@@ -124,6 +124,8 @@
 
   ;; --- Base .NET ---
   (utf8          (: System.Text.Encoding.UTF8 #:get))
+  ;; Never includes a byte order mark, whatever the encoding writes on a stream.
+  (encode        (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
   (unescape      (: System.Uri.UnescapeDataString (-> string string)))
   (from-base64   (: System.Convert.FromBase64String (-> string (Array byte))
                     #:exceptions (System.FormatException)))
@@ -310,9 +312,9 @@
   (match (sync (choose (wrap (promise-join (bjo (handle rt req))) (fun (r) (Some r)))
                        (wrap (call-abandoned c) (fun (u) None))))
     ((Some (Ok answer))
-     (match (response-upgrade answer)
-       (None (write-response! ctx answer))
-       ((Some up) (upgrade-or-refuse! ctx req c answer up going-away handed-off)))
+     (match (response-body answer)
+       ((Upgraded up) (upgrade-or-refuse! ctx req c answer up going-away handed-off))
+       (_ (write-response! ctx answer)))
      unit)
     ;; The handler raised. What it said goes to the log, not to the page.
     ((Some (Err e)) (log (str "bjoweb: " (request-method req) " " (request-path req)
@@ -500,13 +502,37 @@
 ;; Response -> HttpResponse
 ;; ===========================================================================
 
-;; Writes the response status, headers, and body to the client.
+;; Writes the status, the headers and the body. `Content-Length` is the
+;; body's, so one among the headers is dropped when there is a body to send.
 (: write-response! (-bjo-> Ctx Response void))
 (defbjo (write-response! ctx answer)
   (def out (ctx-response ctx))
-  (out-status! out (response-status answer))
+  (def status (response-status answer))
+  (def payload (if (body-allowed? status) (fixed-body (response-body answer)) None))
+  (out-status! out status)
   (out-type! out (response-content-type answer))
   (loop (:for h (response-headers answer))
         (:do (match h
-               ((Tuple name value) (header-add! (out-headers out) name (Values. value))))))
-  (write-text! out (response-body answer)))
+               ((Tuple name value)
+                (unless (and (some? payload) (= (string-downcase name) "content-length"))
+                  (header-add! (out-headers out) name (Values. value)))))))
+  (match payload
+    ((Some bytes)
+     (def n (array-length bytes))
+     (header-add! (out-headers out) "Content-Length" (Values. (int->string n)))
+     (when (> n 0) (body-write! (out-body out) bytes 0 n)))
+    (None unit)))
+
+;; 1xx, 204 and 304 have no body, and Kestrel refuses to write one.
+(: body-allowed? (-> int bool))
+(defun (body-allowed? status)
+  (not (or (< status 200) (= status 204) (= status 304))))
+
+;; The bytes of a body that is known in full.
+(: fixed-body (-> Body (Option (Array byte))))
+(defun (fixed-body b)
+  (match b
+    (Empty (Some (make-array 0)))
+    ((Text s) (Some (encode utf8 s)))
+    ((Bytes data) (Some data))
+    ((Upgraded up) None)))

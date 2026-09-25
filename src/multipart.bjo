@@ -1,0 +1,389 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/src/multipart.bjo — the module (bjoweb multipart).
+;;
+;; A `multipart/form-data` body (RFC 7578), read from a byte port one part
+;; after another, so that a file in it is never held whole. It knows nothing of
+;; ASP.NET, nor of the request the body came with: `(bjoweb core)` builds
+;; `request-parts` and a multipart `request-form` on it, and passes the rest
+;; on.
+;;
+;; A malformed body raises a `System.Net.ProtocolViolationException`, which
+;; the server answers 400.
+
+(export
+  Parts Part
+  read-parts next-part! multipart-boundary
+  part-name part-filename part-content-type part-header
+  part-read-some part-bytes part-text)
+
+(import (std prelude))
+(import (only (std ports) peek-bytes read-bytes utf8))
+
+(import/class
+  (Violation (: System.Net.ProtocolViolationException (-> string Violation)))
+  (Collected (: System.IO.MemoryStream (-> Collected))))
+
+(import/extern
+  (collect!   (: System.IO.MemoryStream.Write (-> Collected (Array byte) int int void)))
+  (collected  (: System.IO.MemoryStream.ToArray (-> Collected (Array byte))))
+  (utf8-bytes (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
+  (utf8-text  (: System.Text.Encoding.GetString (-> Encoding (Array byte) int int string))))
+
+;; ---------------------------------------------------------------------------
+;; The types
+;; ---------------------------------------------------------------------------
+
+;; Where the reading has got to. `Between` is the end of a part's content, with
+;; the delimiter that ends it next in the port and not yet read.
+(type (: Phase (Union Before Inside Between Done)))
+
+;; A multipart body being read. `delimiter` is CRLF, `--` and the boundary,
+;; which is what ends every part. `current` numbers the part handed out last,
+;; so that one handed out before it knows its content is over.
+(type (: Parts #:opaque (Record (: in ByteInputPort)
+                                (: delimiter (Array byte))
+                                (: phase (Box Phase))
+                                (: current (Box int)))))
+
+;; One part: its headers, and its content, which is read from the body with
+;; `part-read-some` until the next part is asked for.
+(type (: Part #:opaque (Record (: parts Parts)
+                               (: number int)
+                               (: headers (Map string string))
+                               (: name string)
+                               (: filename (Option string))
+                               (: content-type string))))
+
+;; How much content is looked through at a time, and how long a part's headers
+;; may be.
+(: window int)
+(def window 16384)
+
+(: header-limit int)
+(def header-limit 16384)
+
+;; The blank line that ends a part's headers.
+(: crlf-crlf (Array byte))
+(def crlf-crlf #[13 10 13 10])
+
+;; ---------------------------------------------------------------------------
+;; Starting
+;; ---------------------------------------------------------------------------
+
+;; The parts of a body read from `in`, separated by `boundary`. Nothing is read
+;; until `next-part!` asks.
+(: read-parts (-> ByteInputPort string Parts))
+(defun (read-parts in boundary)
+  (Parts (in in)
+         (delimiter (utf8-bytes utf8 (str "\r\n--" boundary)))
+         (phase (make-box Before))
+         (current (make-box 0))))
+
+;; The boundary a `Content-Type` names, when it is `multipart/form-data`, or
+;; `None`.
+(: multipart-boundary (-> string (Option string)))
+(defun (multipart-boundary content-type)
+  (match (header-params content-type)
+    ((Tuple kind params)
+     (if (= (string-downcase kind) "multipart/form-data")
+         (match (map-try-ref params "boundary")
+           ((Some b) (if (string-empty? b) None (Some b)))
+           (None None))
+         None))))
+
+;; ---------------------------------------------------------------------------
+;; One part after another
+;; ---------------------------------------------------------------------------
+
+;; The next part, or `None` after the last. What is left of the part before it
+;; is read past and dropped.
+(: next-part! (-bjo-> Parts (Option Part)))
+(defbjo (next-part! parts)
+  (def phase (record-ref parts phase))
+  (match (box-ref phase)
+    (Done None)
+    (Before
+     (if (starts-with-boundary? parts)
+         (ignore (read-bytes (record-ref parts in) (- (array-length (record-ref parts delimiter)) 2)))
+         (let ()
+           ;; A preamble, which is read past as a part's content would be.
+           (box-set! phase Inside)
+           (drain! parts)
+           (read-delimiter! parts)))
+     (after-delimiter! parts))
+    (Inside (drain! parts) (read-delimiter! parts) (after-delimiter! parts))
+    (Between (read-delimiter! parts) (after-delimiter! parts))))
+
+;; The first boundary has no line break before it when there is no preamble.
+(: starts-with-boundary? (-bjo-> Parts bool))
+(defbjo (starts-with-boundary? parts)
+  (def delimiter (record-ref parts delimiter))
+  (def d (array-length delimiter))
+  (match (peek-bytes (record-ref parts in) 0 (- d 2))
+    ((Some head) (and (= (array-length head) (- d 2)) (matches-at? head delimiter 0 2)))
+    (None #f)))
+
+(: drain! (-bjo-> Parts void))
+(defbjo (drain! parts)
+  (let go ()
+    (match (content-some parts)
+      ((Some chunk) (go))
+      (None unit))))
+
+(: read-delimiter! (-bjo-> Parts void))
+(defbjo (read-delimiter! parts)
+  (ignore (read-bytes (record-ref parts in) (array-length (record-ref parts delimiter)))))
+
+;; After a boundary: `--` for the last, or the end of its line and a part's
+;; headers. What follows the last boundary is not read.
+(: after-delimiter! (-bjo-> Parts (Option Part)))
+(defbjo (after-delimiter! parts)
+  (def in (record-ref parts in))
+  (def phase (record-ref parts phase))
+  (match (peek-bytes in 0 2)
+    ((Some two)
+     (cond
+       ((and (= (array-length two) 2) (= (array-ref two 0) 45uy) (= (array-ref two 1) 45uy))
+        (box-set! phase Done)
+        None)
+       (else
+        (skip-padding! in)
+        (expect-line-end! in)
+        (def headers (read-headers! in))
+        (def number (+ (box-ref (record-ref parts current)) 1))
+        (box-set! (record-ref parts current) number)
+        (box-set! phase Inside)
+        (Some (make-part parts number headers)))))
+    (None (malformed "it ends after a boundary"))))
+
+;; Spaces and tabs may follow a boundary before the end of its line.
+(: skip-padding! (-bjo-> ByteInputPort void))
+(defbjo (skip-padding! in)
+  (let go ()
+    (match (peek-bytes in 0 1)
+      ((Some one)
+       (when (or (= (array-ref one 0) 32uy) (= (array-ref one 0) 9uy))
+         (ignore (read-bytes in 1))
+         (go)))
+      (None unit))))
+
+(: expect-line-end! (-bjo-> ByteInputPort void))
+(defbjo (expect-line-end! in)
+  (match (read-bytes in 2)
+    ((Some two)
+     (unless (and (= (array-length two) 2) (= (array-ref two 0) 13uy) (= (array-ref two 1) 10uy))
+       (malformed "a boundary is followed by something other than a line break")))
+    (None (malformed "it ends after a boundary"))))
+
+;; The headers, up to and including the blank line that ends them, with their
+;; names lower-cased. The first of a name given twice is kept.
+(: read-headers! (-bjo-> ByteInputPort (Map string string)))
+(defbjo (read-headers! in)
+  (match (peek-bytes in 0 2)
+    ((Some two)
+     (if (and (= (array-length two) 2) (= (array-ref two 0) 13uy) (= (array-ref two 1) 10uy))
+         ;; No headers at all.
+         (let () (ignore (read-bytes in 2)) (map-empty))
+         (match (peek-bytes in 0 (+ header-limit 4))
+           ((Some block)
+            (match (find-bytes block crlf-crlf 0)
+              ((Some at)
+               (ignore (read-bytes in (+ at 4)))
+               (parse-headers (utf8-text utf8 block 0 at)))
+              (None (malformed "a part's headers are too long, or never end"))))
+           (None (malformed "it ends inside a part's headers")))))
+    (None (malformed "it ends inside a part's headers"))))
+
+(: parse-headers (-> string (Map string string)))
+(defun (parse-headers text)
+  (loop (:for line (string-split text "\r\n"))
+        (:acc all (folding (map-empty) (add-header all line)))))
+
+(: add-header (-> (Map string string) string (Map string string)))
+(defun (add-header all line)
+  (def pieces (string-split line ":"))
+  (if (< (vec-length pieces) 2)
+      all
+      (let ((name (string-downcase (string-trim (vec-ref pieces 0)))))
+        (if (map-contains? all name)
+            all
+            (map-set all name (string-trim (rejoin pieces 1 ":")))))))
+
+(: make-part (-> Parts int (Map string string) Part))
+(defun (make-part parts number headers)
+  (def disposition
+    (match (header-params (map-ref-or headers "content-disposition" ""))
+      ((Tuple kind params) params)))
+  (Part (parts parts)
+        (number number)
+        (headers headers)
+        (name (map-ref-or disposition "name" ""))
+        (filename (map-try-ref disposition "filename"))
+        ;; RFC 7578's default.
+        (content-type (map-ref-or headers "content-type" "text/plain"))))
+
+;; ---------------------------------------------------------------------------
+;; A part
+;; ---------------------------------------------------------------------------
+
+;; The field's name, `""` when it gave none.
+(: part-name (-> Part string))
+(defun (part-name p) (record-ref p name))
+
+;; `(Some name)` for a file, as the browser named it; `(Some "")` for a file
+;; input with no file chosen. `None` for any other field. The name is the
+;; client's to write, so it is no path to write a file to.
+(: part-filename (-> Part (Option string)))
+(defun (part-filename p) (record-ref p filename))
+
+;; `text/plain` when the part says nothing.
+(: part-content-type (-> Part string))
+(defun (part-content-type p) (record-ref p content-type))
+
+;; One of the part's headers, by a name of any case.
+(: part-header (-> Part string (Option string)))
+(defun (part-header p name) (map-try-ref (record-ref p headers) (string-downcase name)))
+
+;; The next piece of the part's content, never an empty array, or `None` at its
+;; end. `None` too once the next part has been asked for.
+(: part-read-some (-bjo-> Part (Option (Array byte))))
+(defbjo (part-read-some p)
+  (def parts (record-ref p parts))
+  (if (and (= (record-ref p number) (box-ref (record-ref parts current)))
+           (match (box-ref (record-ref parts phase)) (Inside #t) (_ #f)))
+      (content-some parts)
+      None))
+
+;; What is left of the content, in memory.
+(: part-bytes (-bjo-> Part (Array byte)))
+(defbjo (part-bytes p)
+  (def all (Collected.))
+  (let go ()
+    (match (part-read-some p)
+      ((Some chunk) (collect! all chunk 0 (array-length chunk)) (go))
+      (None (collected all)))))
+
+;; What is left of the content, as UTF-8 text.
+(: part-text (-bjo-> Part string))
+(defbjo (part-text p)
+  (def bytes (part-bytes p))
+  (utf8-text utf8 bytes 0 (array-length bytes)))
+
+;; ---------------------------------------------------------------------------
+;; Content, up to the delimiter
+;; ---------------------------------------------------------------------------
+
+;; Content before the delimiter, or `None` once the delimiter is next. A
+;; window's last bytes may be the start of a delimiter, so they are kept back
+;; until the window after it shows what they are.
+(: content-some (-bjo-> Parts (Option (Array byte))))
+(defbjo (content-some parts)
+  (def in (record-ref parts in))
+  (def delimiter (record-ref parts delimiter))
+  (def d (array-length delimiter))
+  (match (peek-bytes in 0 (+ window d))
+    ((Some seen)
+     (match (find-bytes seen delimiter 0)
+       ((Some at)
+        (if (= at 0)
+            (let () (box-set! (record-ref parts phase) Between) None)
+            (read-bytes in at)))
+       (None
+        (def safe (- (array-length seen) (- d 1)))
+        (if (> safe 0)
+            (read-bytes in safe)
+            (malformed "it ends before its closing boundary")))))
+    (None (malformed "it ends before its closing boundary"))))
+
+;; Where `needle` first occurs whole in `hay`, from `from` on.
+(: find-bytes (-> (Array byte) (Array byte) int (Option int)))
+(defun (find-bytes hay needle from)
+  (def n (array-length hay))
+  (def m (array-length needle))
+  (if (> (+ from m) n)
+      None
+      (let ((i (index-of hay (array-ref needle 0) from)))
+        (cond ((< i 0) None)
+              ((> (+ i m) n) None)
+              ((matches-at? hay needle (+ i 1) 1) (Some i))
+              (else (find-bytes hay needle (+ i 1)))))))
+
+;; Where `b` first is in `hay`, from `from` on, or -1.
+(: index-of (-> (Array byte) byte int int))
+(defun (index-of hay b from)
+  (let go ((i from))
+    (cond ((>= i (array-length hay)) -1)
+          ((= (array-ref hay i) b) i)
+          (else (go (+ i 1))))))
+
+;; Whether the bytes of `needle` from its `skip`th on are in `hay`, starting at
+;; `at`.
+(: matches-at? (-> (Array byte) (Array byte) int int bool))
+(defun (matches-at? hay needle at skip)
+  (let go ((j skip))
+    (cond ((= j (array-length needle)) #t)
+          ((= (array-ref hay (- (+ at j) skip)) (array-ref needle j)) (go (+ j 1)))
+          (else #f))))
+
+;; ---------------------------------------------------------------------------
+;; Header values with parameters
+;; ---------------------------------------------------------------------------
+
+;; `form-data; name="a;b"; filename="x.txt"` as its first word and its
+;; parameters, the names lower-cased and the values unquoted. A semicolon
+;; inside quotes belongs to the value, and `%22`, `%0D` and `%0A` in a quoted
+;; value are the characters browsers write them for.
+(: header-params (-> string (Tuple string (Map string string))))
+(defun (header-params value)
+  (def fields (quote-aware-split value))
+  (Tuple (string-trim (vec-ref fields 0))
+         (loop (:for i (range 1 (vec-length fields)))
+               (:acc all (folding (map-empty) (add-param all (vec-ref fields i)))))))
+
+(: add-param (-> (Map string string) string (Map string string)))
+(defun (add-param all field)
+  (def pieces (string-split field "="))
+  (if (< (vec-length pieces) 2)
+      all
+      (let ((name (string-downcase (string-trim (vec-ref pieces 0)))))
+        (if (map-contains? all name)
+            all
+            (map-set all name (unquote (string-trim (rejoin pieces 1 "="))))))))
+
+(: unquote (-> string string))
+(defun (unquote s)
+  (if (and (>= (string-count s) 2) (string-starts-with? s "\"") (string-ends-with? s "\""))
+      (string-replace (string-replace (string-replace (string-replace s "\"" "")
+                                                      "%22" "\"")
+                                      "%0D" "\r")
+                      "%0A" "\n")
+      s))
+
+;; Splits on `;`, joining a piece back to the one before while that one has a
+;; quote open.
+(: quote-aware-split (-> string (Vec string)))
+(defun (quote-aware-split s)
+  (loop (:for piece (string-split s ";"))
+        (:acc out (folding (vec-empty)
+                           (if (and (> (vec-length out) 0)
+                                    (odd? (quotes-in (vec-ref out (- (vec-length out) 1)))))
+                               (vec-set out (- (vec-length out) 1)
+                                        (str (vec-ref out (- (vec-length out) 1)) ";" piece))
+                               (vec-add out piece))))))
+
+(: quotes-in (-> string int))
+(defun (quotes-in s) (- (string-count s) (string-count (string-replace s "\"" ""))))
+
+;; The pieces from `from` on, joined with `sep` again.
+(: rejoin (-> (Vec string) int string string))
+(defun (rejoin pieces from sep)
+  (string-join (loop (:for i (range from (vec-length pieces)))
+                     (:acc out (vecing (vec-ref pieces i))))
+               sep))
+
+(: malformed (-> string %a))
+(defun (malformed why)
+  (raise (cast Exception (Violation. (str "malformed multipart body: " why)))))

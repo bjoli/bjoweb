@@ -26,6 +26,12 @@
   ;; Its body, which is read when it is asked for, and so suspends.
   request-body request-bytes request-body-port request-form request-form-or
 
+  ;; A multipart body, one part at a time; the part functions are
+  ;; `(bjoweb multipart)`'s.
+  request-parts next-part!
+  part-name part-filename part-content-type part-header
+  part-read-some part-bytes part-text
+
   ;; What a query string and an urlencoded form are written in.
   parse-query
 
@@ -54,10 +60,15 @@
               read-some byte-pipe write-bytes! close-byte-output-port!))
 (import (only (std inbox) make-inbox inbox-close! inbox-closed))
 (import (net websocket protocol))
+(import (bjoweb multipart))
+
+;; A multipart body's parts, passed on so that one import is enough.
+(re-export Parts Part)
 
 (import/class
   (Refusal   (: System.ArgumentException (-> string Refusal)))
   (Misuse    (: System.InvalidOperationException (-> string Misuse)))
+  (Violation (: System.Net.ProtocolViolationException (-> string Violation)))
   (Collected (: System.IO.MemoryStream (-> Collected))))
 
 (import/extern
@@ -306,8 +317,11 @@
        ((InMemory bytes) (bytes-port bytes))
        ((FromPort open) (open (if (> max-body 0) max-body (record-ref body limit))))))))
 
-;; A form field from an `application/x-www-form-urlencoded` body, or `None`.
-;; The first value, if a field is given more than once. Reads the body, once.
+;; A form field, or `None`: from an `application/x-www-form-urlencoded` body,
+;; or from a `multipart/form-data` one, whose files are left out. The first
+;; value, if a field is given more than once. Reads the body into memory, once,
+;; so the server's `#:max-body` applies; a form with files in it that are too
+;; big for that is read with `request-parts` instead.
 (: request-form (-bjo-> Request string (Option string)))
 (defbjo (request-form r name) (map-try-ref (form-of r) name))
 
@@ -320,12 +334,42 @@
   (match (box-ref kept)
     ((Some fields) fields)
     (None
-     (def fields (if (string-starts-with? (request-header-or r "content-type" "")
-                                          "application/x-www-form-urlencoded")
-                     (parse-query (request-body r))
-                     (map-empty)))
+     (def content-type (request-header-or r "content-type" ""))
+     (def fields
+       (cond
+         ((string-starts-with? content-type "application/x-www-form-urlencoded")
+          (parse-query (request-body r)))
+         (else
+          (match (multipart-boundary content-type)
+            ((Some boundary) (text-fields (read-parts (bytes-port (request-bytes r)) boundary)))
+            (None (map-empty))))))
      (box-set! kept (Some fields))
      fields)))
+
+;; The parts that are not files, as a form.
+(: text-fields (-bjo-> Parts (Map string string)))
+(defbjo (text-fields parts)
+  (let go ((fields (map-empty)))
+    (match (next-part! parts)
+      (None fields)
+      ((Some p)
+       (match (part-filename p)
+         ((Some file) (go fields))
+         (None (go (if (map-contains? fields (part-name p))
+                       fields
+                       (map-set fields (part-name p) (part-text p))))))))))
+
+;; The parts of a `multipart/form-data` body, one at a time as `next-part!`
+;; asks for them, so that a file in it is never held whole. The body is taken
+;; as `request-body-port` takes it, with the same `#:max-body`.
+;;
+;; A body that is not multipart, or is malformed, raises a
+;; `ProtocolViolationException`, and the server answers 400.
+(: request-parts (-> Request (#:max-body int) Parts))
+(defun (request-parts r #:max-body 0)
+  (match (multipart-boundary (request-header-or r "content-type" ""))
+    ((Some boundary) (read-parts (request-body-port r #:max-body max-body) boundary))
+    (None (raise (cast Exception (Violation. "the body is not multipart/form-data"))))))
 
 (: read-to-end (-bjo-> ByteInputPort (Array byte)))
 (defbjo (read-to-end p)

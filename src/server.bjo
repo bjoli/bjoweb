@@ -397,9 +397,10 @@
     (None unit)))
 
 ;; A handler that raised. Kestrel refusing the body — too large, malformed, cut
-;; short — is the client's doing, and gets the status Kestrel chose. Anything
-;; else goes to the log, not to the page, and is a 500. A client that has gone
-;; hears nothing, and a failure it caused by going is not logged.
+;; short — is the client's doing, and gets the status Kestrel chose; so is a
+;; multipart body that breaks its format, which is a 400. Anything else goes to
+;; the log, not to the page, and is a 500. A client that has gone hears
+;; nothing, and a failure it caused by going is not logged.
 (: answer-failure! (-bjo-> Ctx Request (Call Ctx Unit) Exception void))
 (defbjo (answer-failure! ctx req c e)
   (unless (abandoned? c)
@@ -407,6 +408,8 @@
       ((:is Microsoft.AspNetCore.Http.BadHttpRequestException rejected)
        (def code (rejected-status rejected))
        (write-response! ctx (respond code (str (int->string code) " " (.-Message rejected) "\n"))))
+      ((:is System.Net.ProtocolViolationException broken)
+       (write-response! ctx (bad-request (.-Message broken))))
       (_
        (log (str "bjoweb: " (request-method req) " " (request-path req) " raised: " (.-Message e)))
        (write-response! ctx (server-error))))))

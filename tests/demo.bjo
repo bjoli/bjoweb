@@ -137,6 +137,25 @@
       ((Some chunk) (go (+ n (array-length chunk))))
       (None (text (int->string n))))))
 
+;; Every part of a multipart body: its name, its filename or `-`, its content
+;; type and how long its content was, counted as it arrived.
+(: list-parts (-bjo-> Request Response))
+(defbjo (list-parts req)
+  (def parts (request-parts req #:max-body 1000000))
+  (let go ((said (vec-empty)))
+    (match (next-part! parts)
+      (None (text (string-join said "|")))
+      ((Some p)
+       (go (vec-add said (str (part-name p) " " (option-ref-or (part-filename p) "-") " "
+                              (part-content-type p) " " (int->string (content-length p)))))))))
+
+(: content-length (-bjo-> Part int))
+(defbjo (content-length p)
+  (let go ((n 0))
+    (match (part-read-some p)
+      ((Some chunk) (go (+ n (array-length chunk))))
+      (None n))))
+
 (: show-query (-bjo-> Request Response))
 (defbjo (show-query req)
   (text (str (request-query-or req "a" "-") ";" (request-query-or req "b" "-"))))
@@ -303,6 +322,7 @@
     (route-post   "/twice"        said-twice)
     (route-post   "/upload"       count-upload)
     (route-post   "/ignore"       (fun (req) (text "ignored")))
+    (route-post   "/parts"        list-parts)
     (route-get    "/query"        show-query)
     (route-get    "/headers"      show-header)
     (route-get    "/static/*path" show-rest)
@@ -495,6 +515,38 @@
 (defun (chunked-1800)
   (def one (str "258\r\n" (xs 600) "\r\n"))
   (to-bytes utf8 (str one one one "0\r\n\r\n")))
+
+;; --- Multipart bodies, with the boundary XyZ ---------------------------------
+
+;; One part. A file when `filename` is not `""`.
+(: form-part (-> string string string string))
+(defun (form-part name filename content)
+  (str "--XyZ\r\n"
+       "Content-Disposition: form-data; name=\"" name "\""
+       (if (string-empty? filename)
+           ""
+           (str "; filename=\"" filename "\"\r\nContent-Type: application/octet-stream"))
+       "\r\n\r\n" content "\r\n"))
+
+(: repeated (-> string int string))
+(defun (repeated s n)
+  (string-join (loop (:for i (range 0 n)) (:acc out (vecing s))) ""))
+
+;; A multipart POST over a plain socket, `content-type` saying what it is.
+(: post-multipart (-bjo-> int string string string string))
+(defbjo (post-multipart port path content-type body)
+  (def bytes (to-bytes utf8 body))
+  (post-raw port path
+            (str "Content-Type: " content-type "\r\n"
+                 "Content-Length: " (int->string (array-length bytes)) "\r\n")
+            bytes))
+
+;; Two text fields with a file between them.
+(def small-form
+  (str (form-part "a" "" "1")
+       (form-part "upload" "notes.txt" "not a field")
+       (form-part "b" "" "two words")
+       "--XyZ--\r\n"))
 
 ;; ---------------------------------------------------------------------------
 ;; A streamed body as it arrives
@@ -738,6 +790,13 @@
                                  "a=1&b=two+words")))
             (str (request-body r) "|" (request-form-or r "b" "-")))
           "a=1&b=two+words|two words")
+  (expect "a multipart one too, its file left out"
+          (let ((r (make-request "POST" "/" (map-empty)
+                                 (map-set (map-empty) "content-type" "multipart/form-data; boundary=XyZ")
+                                 small-form)))
+            (str (request-form-or r "a" "-") ";" (request-form-or r "b" "-") ";"
+                 (request-form-or r "upload" "no file")))
+          "1;two words;no file")
 
   ;; --- and now a real socket -----------------------------------------------
   (def port (free-port))
@@ -806,6 +865,44 @@
               (expect "a body nobody reads is not refused"
                       (fetched (post (str base "/ignore") (http/Text (xs 5000))))
                       (Tuple 200 "ignored"))
+
+              ;; --- multipart ----------------------------------------------
+              (def multipart "multipart/form-data; boundary=XyZ")
+
+              (expect "a multipart form, its file left out"
+                      (post-multipart port "/form" multipart small-form)
+                      "200 | 1;two words")
+
+              ;; `f` is bigger than #:max-body and than a window, and is full of
+              ;; line breaks and dashes that begin like a boundary. `g` ends
+              ;; where its delimiter straddles the end of the first window: 16384
+              ;; and the delimiter's 7, less 3. The last field has the boundary in
+              ;; it, not on a line of its own.
+              (expect "its parts one at a time, big files among them, past a preamble"
+                      (post-multipart port "/parts" multipart
+                                      (str "a preamble, which is not a part\r\n"
+                                           (form-part "a" "" "1")
+                                           (form-part "f" "big.bin" (repeated "ab\r\n--" 6000))
+                                           (form-part "g" "edge.bin" (xs 16388))
+                                           (form-part "b" "" "1--XyZ2")
+                                           "--XyZ--\r\nan epilogue, which is not either"))
+                      (str "200 | a - text/plain 1"
+                           "|f big.bin application/octet-stream 36000"
+                           "|g edge.bin application/octet-stream 16388"
+                           "|b - text/plain 7"))
+
+              (expect "a multipart body that never closes is answered 400"
+                      (vec-ref (string-split (post-multipart port "/form" multipart (form-part "a" "" "1"))
+                                             " ")
+                               0)
+                      "400")
+
+              (expect "and so are parts asked of a body with no boundary"
+                      (vec-ref (string-split (post-multipart port "/parts" "multipart/form-data"
+                                                             small-form)
+                                             " ")
+                               0)
+                      "400")
 
               (expect "a handler that suspends"
                       (body-of (str base "/slow")) (Tuple 200 "eventually"))

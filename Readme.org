@@ -37,17 +37,18 @@ A worker fiber receives the call with its original environment intact, reads the
 
 For more details, see ~(std inbox)~.
 
-** The four modules
+** The five modules
 
-| Module            | What is in it                                       | ASP.NET? |
-|-------------------+-----------------------------------------------------+----------|
-| ~(bjoweb core)~   | ~Request~, ~Response~, ~websocket~ and the functions over them | no |
-| ~(bjoweb router)~ | routes, patterns, matching                           | no       |
-| ~(bjoweb html)~   | SXML as a literal, escaping, rendering               | no       |
-| ~(bjoweb server)~ | Kestrel, the inbox, the workers, the two conversions, the upgrade | all of it |
+| Module               | What is in it                                       | ASP.NET? |
+|----------------------+-----------------------------------------------------+----------|
+| ~(bjoweb core)~      | ~Request~, ~Response~, ~websocket~ and the functions over them | no |
+| ~(bjoweb router)~    | routes, patterns, matching                           | no       |
+| ~(bjoweb html)~      | SXML as a literal, escaping, rendering               | no       |
+| ~(bjoweb multipart)~ | a ~multipart/form-data~ body, one part at a time; ~(bjoweb core)~ passes it on | no |
+| ~(bjoweb server)~    | Kestrel, the inbox, the workers, the two conversions, the upgrade | all of it |
 
-Two thirds of this package never name an ASP.NET type, which is why two thirds
-of it can be unit-tested with no socket anywhere:
+Four of the five never name an ASP.NET type, which is why most of this package
+can be unit-tested with no socket anywhere:
 
 #+BEGIN_SRC scheme
 (router-match app (make-request "GET" "/hello/ada" (map-empty) (map-empty) ""))
@@ -93,7 +94,7 @@ Behind a proxy.
 
 | ~(request-body req)~                | the whole body as UTF-8 text, or ~""~              |
 | ~(request-bytes req)~               | the whole body as it came, an ~(Array byte)~       |
-| ~(request-form req "email")~        | from an ~application/x-www-form-urlencoded~ body; ~-or~ too |
+| ~(request-form req "email")~        | a form field, urlencoded or multipart; ~-or~ too   |
 | ~(request-body-port req)~           | the body as a ~ByteInputPort~, read as it arrives  |
 
 A body is read when a handler first asks for it, not before, so a request
@@ -128,6 +129,49 @@ An upload too big to hold goes through the port, which has its own limit:
 There is one port. Once it is taken, ~request-body~ and the rest raise; a body
 already read into memory is served from there instead. A request made with
 ~make-request~ has its body in memory already, and no limit applies to it.
+
+*** Forms with files in them
+
+~request-form~ reads a ~multipart/form-data~ body as it reads an urlencoded
+one: into memory, up to ~#:max-body~, with its text fields as the form and its
+files left out. A file too big for that is read part by part:
+
+#+BEGIN_SRC scheme
+(: upload (-bjo-> Request Response))
+(defbjo (upload req)
+  (def parts (request-parts req #:max-body (* 1024 (* 1024 1024))))
+  (let go ((sizes (list)))
+    (match (next-part! parts)
+      (None (text (str (list->str sizes) "\n")))
+      ((Some p) (go (cons (length-of p) sizes))))))
+
+(: length-of (-bjo-> Part int))
+(defbjo (length-of p)
+  (let go ((n 0))
+    (match (part-read-some p)
+      ((Some chunk) (go (+ n (array-length chunk))))
+      (None n))))
+#+END_SRC
+
+| ~(request-parts req #:max-body n)~ | the body's parts; the body is taken as ~request-body-port~ takes it |
+| ~(next-part! parts)~             | ~(Some part)~, or ~None~ after the last                    |
+| ~(part-name p)~                  | the field's name                                          |
+| ~(part-filename p)~              | ~(Some name)~ for a file, ~None~ for any other field      |
+| ~(part-content-type p)~          | ~text/plain~ when the part says nothing                    |
+| ~(part-header p "name")~         | any of the part's headers                                  |
+| ~(part-read-some p)~             | the next piece of its content, ~None~ at its end           |
+| ~(part-bytes p)~, ~(part-text p)~ | what is left of it, in memory                             |
+
+The parts come in the order the client sent them, and a part's content is read
+from the body as it is asked for, so it is over once the next part is: what was
+not read of it is read past. A file's name is the client's to write — never a
+path to save it under.
+
+A body that is not multipart, or breaks the format — a boundary that never
+closes, headers that never end — is answered ~400~. ~(bjoweb multipart)~ is the
+parser on its own, over any ~ByteInputPort~, and knows nothing of requests.
+~examples/upload.bjo~ is a page with a form, which counts the files sent to it
+as they arrive.
 
 *** Writing the response
 
@@ -589,7 +633,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 33 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 79 checks, a real socket
+bjo run tests/demo.bjo    ;; 84 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
@@ -598,7 +642,7 @@ escaping in text and in attribute values, that an attribute value never gains a
 newline, computed content through ~,~, ~raw~, fragments, and the document and
 response wrappers.
 
-Seventy-nine checks: the routing table on its own, then a real Kestrel on a port
+Eighty-four checks: the routing table on its own, then a real Kestrel on a port
 the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
 query strings, request headers, a POST body, a suspending handler, a handler
 that raises, the 404 and the 405, a redirect, and twelve requests at once
@@ -619,6 +663,15 @@ answered 413 whether its length was said or it came chunked, an upload of 5000
 bytes through the port, and 5000 bytes that nobody reads, which are not
 refused. Leaving the limit unset, or answering Kestrel's refusal with a 500,
 makes the 413 checks fail.
+
+Multipart: a form whose file is left out, made by hand and sent; and parts
+read one at a time past a preamble — a file bigger than both ~#:max-body~ and
+the parser's window, full of line breaks and dashes that begin like a
+boundary, one whose closing boundary straddles the end of a window, and a field
+with the boundary inside it. A body that never closes, and one whose
+~Content-Type~ names no boundary, are answered 400. Reading whole windows, with
+nothing kept back for a boundary that might straddle their end, makes the parts
+check fail.
 
 Streamed bodies are read over a plain socket too, to see what arrives when and
 how the body ends: a streamed body and streamed text, with no ~Content-Length~;
@@ -653,4 +706,4 @@ it with 1001 rather than wait for it.
 
 ** Planned features
 
-Multipart forms, and the files in them read as they arrive. See ~todo.org~.
+Cookies, an access log, and a time limit on a handler. See ~todo.org~.

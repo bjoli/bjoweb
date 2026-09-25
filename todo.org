@@ -1,7 +1,7 @@
 * DONE Static file serving
 * DONE Form data (application/x-www-form-urlencoded)
-* TODO Multipart form data
-* TODO Streaming and chunked bodies
+* DONE Multipart form data, and files read part by part
+* DONE Streaming and chunked bodies
 ** DONE The body is a union: Empty, Text, Bytes, Upgraded; Content-Length from it
 ** DONE Streamed response bodies, on a fiber of their own
 ** DONE Server-sent events
@@ -9,3 +9,7 @@
 * DONE Middleware / request pipeline
 * DONE Websockets
 * DONE Behind a proxy: request-scheme/host/client, X-Forwarded-* from #:trusted-proxies
+* TODO Cookies: request-cookie, and with-cookie with Secure, HttpOnly and SameSite
+* TODO An access log, with the client's address
+* TODO A handler time limit, per route
+* TODO An upload holds a worker while it arrives; hand it off as a stream is

@@ -1,0 +1,62 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/examples/upload.bjo — a form with files in it, read part by part.
+;;
+;;     bjo run examples/upload.bjo
+;;     open http://127.0.0.1:8080/
+;;     curl -F note=hello -F file=@some-file http://127.0.0.1:8080/upload
+;;
+;; Each file is counted as it arrives and never held whole, so one far bigger
+;; than the server's `#:max-body` goes through. Nothing is written to disk.
+
+(import (std prelude))
+(import (bjoweb core))
+(import (bjoweb router))
+(import (bjoweb server))
+(import (bjoweb html))
+
+(: form-page (-> Response))
+(defun (form-page)
+  (page '(html (head (meta (@ (charset "utf-8")))
+                     (title "bjoweb upload"))
+               (body (form (@ (method "post") (action "/upload") (enctype "multipart/form-data"))
+                           (p (input (@ (name "note") (placeholder "a note"))))
+                           (p (input (@ (type "file") (name "file") (multiple))))
+                           (p (button "send")))))))
+
+;; One line per part, up to 1 GiB of them.
+(: upload (-bjo-> Request Response))
+(defbjo (upload req)
+  (def parts (request-parts req #:max-body (* 1024 (* 1024 1024))))
+  (let go ((lines (list)))
+    (match (next-part! parts)
+      (None (page '(html (head (meta (@ (charset "utf-8"))))
+                         (body (ul ,@(list-reverse lines))
+                               (p (a (@ (href "/")) "again"))))))
+      ((Some p) (go (cons (part-line p) lines))))))
+
+;; A field's value, or a file's name and size. Its own signature, because a
+;; quoted literal is HTML where a `Node` is wanted, and a `cons` onto an empty
+;; list says nothing about what is wanted.
+(: part-line (-bjo-> Part Node))
+(defbjo (part-line p)
+  (match (part-filename p)
+    ((Some file) '(li ,(str file ": " (int->string (bytes-in p)) " bytes, " (part-content-type p))))
+    (None '(li ,(str (part-name p) " = " (part-text p))))))
+
+;; Counts the part's content without keeping it.
+(: bytes-in (-bjo-> Part int))
+(defbjo (bytes-in p)
+  (let go ((n 0))
+    (match (part-read-some p)
+      ((Some chunk) (go (+ n (array-length chunk))))
+      (None n))))
+
+(defbjo (main args)
+  (serve (router
+           (route-get  "/"       (fun (req) (form-page)))
+           (route-post "/upload" upload))
+         #:port 8080)
+  0)

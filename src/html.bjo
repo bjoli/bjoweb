@@ -59,6 +59,7 @@
   escape escape-attribute)
 
 (import (std prelude))
+(import (only (std set) list->set set-contains?))
 (import (bjoweb core))
 
 ;; ---------------------------------------------------------------------------
@@ -103,42 +104,54 @@
 ;; ---------------------------------------------------------------------------
 ;; Tag tables
 ;; ---------------------------------------------------------------------------
-;;
-;; Both are one delimited string rather than a set: the lookup is a substring
-;; search over a line of text, which beats building a hash of a dozen entries
-;; per process.
 
 ;; Elements with no closing tag.
-;; TODO: make this a SET. stupid. 
-(def void-tags " area base br col embed hr img input link meta param source track wbr ")
+(: void-tags (Set string))
+(def void-tags
+  (list->set (list "area" "base" "br" "col" "embed" "hr" "img" "input" "link" "meta" "param"
+                   "source" "track" "wbr")))
 
 (: void-tag? (-> string bool))
-(defun (void-tag? name) (string-contains? void-tags (str " " name " ")))
+(defun (void-tag? name) (set-contains? void-tags name))
 
 ;; Elements whose content is the content. Every byte between the tags is part
 ;; of the value, so indenting inside one does not tidy it up — it edits it.
 ;; These are therefore printed with no added whitespace whatsoever.
-;; why i chose to do it like this is beyond me.
-;; TODO i guess.
-(def preformatted-tags " pre textarea ")
+(: preformatted-tags (Set string))
+(def preformatted-tags (list->set (list "pre" "textarea")))
 
 (: preformatted-tag? (-> string bool))
-(defun (preformatted-tag? name) (string-contains? preformatted-tags (str " " name " ")))
+(defun (preformatted-tag? name) (set-contains? preformatted-tags name))
+
+;; Elements that sit in a line of text: HTML's phrasing content, less the ones
+;; that render nothing (`script`, `template`). A newline beside one of these is
+;; a space the reader sees.
+(: inline-tags (Set string))
+(def inline-tags
+  (list->set (list "a" "abbr" "audio" "b" "bdi" "bdo" "br" "button" "canvas" "cite" "code"
+                   "data" "datalist" "del" "dfn" "em" "embed" "i" "iframe" "img" "input" "ins"
+                   "kbd" "label" "map" "mark" "math" "meter" "object" "output" "picture"
+                   "progress" "q" "ruby" "s" "samp" "select" "slot" "small" "span" "strong"
+                   "sub" "sup" "svg" "textarea" "time" "u" "var" "video" "wbr")))
+
+(: inline-tag? (-> string bool))
+(defun (inline-tag? name) (set-contains? inline-tags name))
 
 ;; ---------------------------------------------------------------------------
 ;; Rendering
 ;; ---------------------------------------------------------------------------
 ;;
-;; Every node gets its own line, indented by depth. There is no minified mode
-;; and no flag to ask for one: output that has to be read by a person is the
-;; only kind this produces.
+;; An element whose children are all blocks gets them on lines of their own,
+;; indented by depth. Anything else is printed on one line exactly as written:
+;; an inline element, an element with text in it, or with an inline element in
+;; it, and an empty one. There is no minified mode and no flag to ask for one.
 ;;
-;; WHAT THAT COSTS, because it is not free. A newline is whitespace, and HTML
-;; collapses runs of whitespace to a single space in ordinary content. So
-;; `'(p "a" (b "c") "d")` prints across four lines and the browser renders
-;; "a c d" rather than "acd". Indented markup and byte-exact inline text are
-;; not both available; this module picks the first and says so. Where the text
-;; is the point — `pre`, `textarea` — nothing is added at all.
+;; WHY THAT LINE. A newline is whitespace, and in running text a browser shows
+;; it as a space: `(p "see " (a ...) ".")` broken over lines reads "see the
+;; docs ." A newline between two blocks shows as nothing. So lines are added
+;; only between blocks, and text is never touched — which also keeps it
+;; exact under CSS that shows whitespace, `white-space: pre-wrap` on a `div`.
+;; Where the text is the point — `pre`, `textarea` — nothing is added at all.
 
 ;; Two spaces a level. Tabs are a fight nobody needs to have in generated
 ;; output.
@@ -248,6 +261,38 @@
 
 ;; ---- the pretty emitter ----------------------------------------------------
 
+;; Whether a child sits in a line of text: text, a number, raw markup, an
+;; inline element, or a fragment with any of those in it. Raw markup could be
+;; anything, and is left alone as though it were text.
+(: inline-content? (-> Node bool))
+(defun (inline-content? n)
+  (match n
+    ((NSub (Cons (NSym tag) body))
+     (def name (symbol->string tag))
+     (and (not (= name "@")) (inline-tag? name)))
+    ((NSub kids) (any-inline? kids))
+    (_ #t)))
+
+(: any-inline? (-> (List Node) bool))
+(defun (any-inline? kids)
+  (match kids
+    (Nil #f)
+    ((Cons k rest) (or (inline-content? k) (any-inline? rest)))))
+
+;; Only an element with children, all of them blocks, is broken over lines.
+(: on-one-line? (-> string (List Node) bool))
+(defun (on-one-line? name body)
+  (or (inline-tag? name)
+      (not (has-content? body))
+      (any-inline? body)))
+
+;; Whether there is anything but the attributes.
+(: has-content? (-> (List Node) bool))
+(defun (has-content? body)
+  (match body
+    (Nil #f)
+    ((Cons k rest) (or (not (attributes? k)) (has-content? rest)))))
+
 (: emit-line (-> StringBuilder int string void))
 (defun (emit-line sb depth s)
   (indent sb depth)
@@ -288,8 +333,9 @@
        ;; A void element has no children and no closing tag. Children written
        ;; on one anyway are dropped, because emitting `</br>` is worse.
        ((void-tag? name) (stringbuilder-add! sb #\newline))
-       ;; Content that *is* content: opened, filled byte for byte, closed.
-       ((preformatted-tag? name)
+       ;; Content that *is* content, and a line of text: opened, filled byte
+       ;; for byte, closed.
+       ((or (preformatted-tag? name) (on-one-line? name body))
         (emit-compact-children sb body)
         (stringbuilder-add-string! sb "</")
         (stringbuilder-add-string! sb name)
@@ -303,7 +349,15 @@
         (stringbuilder-add-string! sb name)
         (stringbuilder-add! sb #\>)
         (stringbuilder-add! sb #\newline))))
-    (fragment (emit-children sb depth fragment))))
+    ;; A fragment follows the rule an element does, having no tags of its own:
+    ;; one line when there is text in it.
+    (fragment
+     (if (any-inline? fragment)
+         (let ()
+           (indent sb depth)
+           (emit-compact-children sb fragment)
+           (stringbuilder-add! sb #\newline))
+         (emit-children sb depth fragment)))))
 
 (: render (-> Nodes string))
 (defun (render nodes)

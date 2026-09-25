@@ -6,9 +6,11 @@
 ;;
 ;;     bjo run tests/html.bjo
 ;;
-;; Every node is on its own line, indented two spaces a level, and every line
-;; is terminated — including the last. The expectations below are written with
-;; explicit `\n` so that a stray trailing space cannot hide in them.
+;; An element whose children are all blocks gets them on lines of their own,
+;; indented two spaces a level; anything with text in it is one line, exactly
+;; as written. Every line is terminated — including the last. The expectations
+;; below are written with explicit `\n` so that a stray trailing space cannot
+;; hide in them.
 
 (import (std prelude))
 (import (std simpletest))
@@ -25,34 +27,61 @@
 ;; a tree, which is the point of keeping it in a module with no server in it.
 (defun (main args)
   ;; --- the shape ------------------------------------------------------------
-  (expect "an element" (render '(p "hi")) "<p>\n  hi\n</p>\n")
-  (expect "nesting"
+  (expect "an element with text is one line" (render '(p "hi")) "<p>hi</p>\n")
+  (expect "blocks in a block are a line each"
           (render '(div (p "a") (p "b")))
-          "<div>\n  <p>\n    a\n  </p>\n  <p>\n    b\n  </p>\n</div>\n")
-  (expect "an empty element" (render '(div)) "<div>\n</div>\n")
+          "<div>\n  <p>a</p>\n  <p>b</p>\n</div>\n")
+  (expect "an empty element" (render '(div)) "<div></div>\n")
   (expect "a fragment has no wrapper"
           (render '((li "a") (li "b")))
-          "<li>\n  a\n</li>\n<li>\n  b\n</li>\n")
+          "<li>a</li>\n<li>b</li>\n")
+  (expect "a fragment with text in it is one line"
+          (render '("a " (b "b"))) "a <b>b</b>\n")
   (expect "nothing at all" (render '()) "")
+  (expect "a head: its blocks, void ones among them"
+          (render '(head (meta (@ (charset "utf-8"))) (title "t")))
+          "<head>\n  <meta charset=\"utf-8\">\n  <title>t</title>\n</head>\n")
+
+  ;; --- text is never touched ------------------------------------------------
+  ;;
+  ;; A newline in running text is a space the reader sees, so none is added
+  ;; beside text or an inline element.
+  (expect "a link, then a full stop"
+          (render '(p "see " (a (@ (href "/docs")) "the docs") "."))
+          "<p>see <a href=\"/docs\">the docs</a>.</p>\n")
+  (expect "inline elements side by side, with nothing between them"
+          (render '(p (b "bold") (i "italic")))
+          "<p><b>bold</b><i>italic</i></p>\n")
+  (expect "a block holding only an inline element is one line"
+          (render '(ul (li (a (@ (href "/x")) "x"))))
+          "<ul>\n  <li><a href=\"/x\">x</a></li>\n</ul>\n")
+  (expect "text beside a block keeps the whole element on one line"
+          (render '(div "Title" (ul (li "x"))))
+          "<div>Title<ul><li>x</li></ul></div>\n")
+  (expect "an inline element is one line whatever is in it"
+          (render '(span (b "x"))) "<span><b>x</b></span>\n")
 
   ;; --- attributes -----------------------------------------------------------
   (expect "an attribute"
-          (render '(a (@ (href "/next")) "go")) "<a href=\"/next\">\n  go\n</a>\n")
+          (render '(a (@ (href "/next")) "go")) "<a href=\"/next\">go</a>\n")
   (expect "several"
           (render '(div (@ (class "card") (id "main")) "x"))
-          "<div class=\"card\" id=\"main\">\n  x\n</div>\n")
+          "<div class=\"card\" id=\"main\">x</div>\n")
   (expect "a boolean attribute"
           (render '(input (@ (type "checkbox") (checked))))
           "<input type=\"checkbox\" checked>\n")
   (expect "attributes are not also children"
-          (render '(p (@ (class "c")))) "<p class=\"c\">\n</p>\n")
+          (render '(p (@ (class "c")))) "<p class=\"c\"></p>\n")
+  (expect "nor do they make a block's children inline"
+          (render '(ul (@ (class "c")) (li "a")))
+          "<ul class=\"c\">\n  <li>a</li>\n</ul>\n")
 
   ;; --- void elements --------------------------------------------------------
   (expect "a void element has no closing tag" (render '(br)) "<br>\n")
   (expect "and still takes attributes"
           (render '(img (@ (src "/a.png") (alt "a")))) "<img src=\"/a.png\" alt=\"a\">\n")
   (expect "a void element among children"
-          (render '(p "a" (br) "b")) "<p>\n  a\n  <br>\n  b\n</p>\n")
+          (render '(p "a" (br) "b")) "<p>a<br>b</p>\n")
 
   ;; --- whitespace-significant elements are left exactly alone ---------------
   ;;
@@ -69,42 +98,45 @@
 
   ;; --- escaping, which is the whole reason this is typed --------------------
   (expect "text is escaped"
-          (render '(p "a < b & c > d")) "<p>\n  a &lt; b &amp; c &gt; d\n</p>\n")
+          (render '(p "a < b & c > d")) "<p>a &lt; b &amp; c &gt; d</p>\n")
   (expect "an ampersand is not double-escaped"
-          (render '(p "&lt;")) "<p>\n  &amp;lt;\n</p>\n")
+          (render '(p "&lt;")) "<p>&amp;lt;</p>\n")
   (expect "a quote in an attribute"
           (render '(p (@ (title "say \"hi\"")) "x"))
-          "<p title=\"say &quot;hi&quot;\">\n  x\n</p>\n")
+          "<p title=\"say &quot;hi&quot;\">x</p>\n")
   (expect "an angle bracket in an attribute"
-          (render '(p (@ (title "a<b")) "x")) "<p title=\"a&lt;b\">\n  x\n</p>\n")
+          (render '(p (@ (title "a<b")) "x")) "<p title=\"a&lt;b\">x</p>\n")
   ;; An attribute value is a string, not markup, and must not gain a newline
   ;; however the pretty printer feels about it.
   (expect "an attribute value never gets a newline"
-          (render '(p (@ (title "one two")) "x")) "<p title=\"one two\">\n  x\n</p>\n")
+          (render '(div (@ (title "one two")) (p "x")))
+          "<div title=\"one two\">\n  <p>x</p>\n</div>\n")
 
   ;; --- computed content -----------------------------------------------------
   (def who "Bj<o>rn")
   (expect "an unquoted string is text, and is escaped"
-          (render '(p "hi " ,who)) "<p>\n  hi \n  Bj&lt;o&gt;rn\n</p>\n")
-  (expect "an unquoted call" (render '(p ,(shout "abc"))) "<p>\n  ABC\n</p>\n")
-  (expect "a number written in the literal" (render '(p "n=" 41)) "<p>\n  n=\n  41\n</p>\n")
+          (render '(p "hi " ,who)) "<p>hi Bj&lt;o&gt;rn</p>\n")
+  (expect "an unquoted call" (render '(p ,(shout "abc"))) "<p>ABC</p>\n")
+  (expect "a number written in the literal" (render '(p "n=" 41)) "<p>n=41</p>\n")
   (def age 41)
   (expect "a computed number, via int->string"
-          (render '(p ,(int->string age))) "<p>\n  41\n</p>\n")
+          (render '(p ,(int->string age))) "<p>41</p>\n")
   (expect "a computed number, via the constructor"
-          (render '(p ,(NInt age))) "<p>\n  41\n</p>\n")
+          (render '(p ,(NInt age))) "<p>41</p>\n")
 
   ;; --- raw, the escape hatch ------------------------------------------------
   (expect "raw markup is passed through"
-          (render '(p ,(raw "<em>x</em>"))) "<p>\n  <em>x</em>\n</p>\n")
+          (render '(p ,(raw "<em>x</em>"))) "<p><em>x</em></p>\n")
   (expect "and is still distinguishable from text"
-          (render '(p "<em>x</em>")) "<p>\n  &lt;em&gt;x&lt;/em&gt;\n</p>\n")
+          (render '(p "<em>x</em>")) "<p>&lt;em&gt;x&lt;/em&gt;</p>\n")
+  (expect "a script is its raw content, byte for byte"
+          (render '(script ,(raw "a();\n  b();"))) "<script>a();\n  b();</script>\n")
 
   ;; --- built by hand, not from a literal ------------------------------------
   (def rows (list-map item (list "one" "two")))
   (expect "a computed list of children"
           (render '(ul ,@rows))
-          "<ul>\n  <li>\n    one\n  </li>\n  <li>\n    two\n  </li>\n</ul>\n")
+          "<ul>\n  <li>one</li>\n  <li>two</li>\n</ul>\n")
 
   ;; `,@` puts a computed list's elements where it stands. What is written
   ;; beside it is still elaborated the usual way — the two `li` below become
@@ -113,41 +145,41 @@
   (expect "spliced among written children"
           (render '(ul (li "first") ,@rows (li "last")))
           (str "<ul>\n"
-               "  <li>\n    first\n  </li>\n"
-               "  <li>\n    one\n  </li>\n"
-               "  <li>\n    two\n  </li>\n"
-               "  <li>\n    last\n  </li>\n"
+               "  <li>first</li>\n"
+               "  <li>one</li>\n"
+               "  <li>two</li>\n"
+               "  <li>last</li>\n"
                "</ul>\n"))
   (expect "two splices"
           (render '(ul ,@rows ,@rows))
           (str "<ul>\n"
-               "  <li>\n    one\n  </li>\n"
-               "  <li>\n    two\n  </li>\n"
-               "  <li>\n    one\n  </li>\n"
-               "  <li>\n    two\n  </li>\n"
+               "  <li>one</li>\n"
+               "  <li>two</li>\n"
+               "  <li>one</li>\n"
+               "  <li>two</li>\n"
                "</ul>\n"))
   (def (: none Nodes) (list))
   (expect "an empty splice contributes nothing"
           (render '(ul ,@none))
-          "<ul>\n</ul>\n")
+          "<ul></ul>\n")
   (expect "a splice one level down"
           (render '(div (ul ,@rows)))
           (str "<div>\n"
                "  <ul>\n"
-               "    <li>\n      one\n    </li>\n"
-               "    <li>\n      two\n    </li>\n"
+               "    <li>one</li>\n"
+               "    <li>two</li>\n"
                "  </ul>\n"
                "</div>\n"))
 
   ;; --- the document and the response ---------------------------------------
   (expect "a document has a doctype"
           (document '(html (body "x")))
-          "<!DOCTYPE html>\n<html>\n  <body>\n    x\n  </body>\n</html>\n")
+          "<!DOCTYPE html>\n<html>\n  <body>x</body>\n</html>\n")
   (def r (page '(html (body "x"))))
   (expect "a page is html" (response-content-type r) "text/html; charset=utf-8")
   (expect "with the doctype in its body"
           (response-text r)
-          (Some "<!DOCTYPE html>\n<html>\n  <body>\n    x\n  </body>\n</html>\n"))
+          (Some "<!DOCTYPE html>\n<html>\n  <body>x</body>\n</html>\n"))
   (expect "and 200 by default" (response-status r) 200)
   (expect "or whatever you say" (response-status (page '(p "gone") #:status 410)) 410)
 

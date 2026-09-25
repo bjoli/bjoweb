@@ -431,26 +431,29 @@ Which also means the tag vocabulary costs nothing and collides with nothing —
 this rather than string concatenation. ~,(raw "<em>x</em>")~ is the way past,
 spelled as a call so that every place trust is claimed can be grepped for.
 
-*** The output has newlines
+*** The output has newlines, and the text has none added
 
-Every node on its own line, two spaces a level, every line terminated. There is
-no minified mode and no flag asking for one.
+An element whose children are all blocks gets each on a line of its own, two
+spaces a level. Anything else — an element with text in it, or an inline
+element in it, an inline element itself, an empty one — is one line, exactly as
+written. Every line is terminated. There is no minified mode and no flag asking
+for one.
 
 #+BEGIN_SRC html
 <ul>
-  <li>
-    <a href="/page/banana">
-      banana
-    </a>
-  </li>
+  <li><a href="/page/banana">banana</a></li>
+  <li>see <a href="/docs">the docs</a>.</li>
 </ul>
 #+END_SRC
 
-What that costs, because it is not free: a newline is whitespace, and HTML
-collapses runs of whitespace to a single space in ordinary content. So
-~'(p "a" (b "c") "d")~ is printed across four lines and a browser renders
-~a c d~ rather than ~acd~. Indented markup and byte-exact inline text are not
-both available, and this picks the first.
+Why there: a newline is whitespace, and in running text a browser shows it as a
+space, so ~'(p "see " (a ...) ".")~ broken over lines would read "see the docs
+." with a space before the full stop, and ~'(p (b "a") (i "b"))~ would read
+"a b". Between two blocks a newline shows as nothing. So lines are added only
+between blocks, and text is never touched — which also keeps it right under CSS
+that shows whitespace, such as ~white-space: pre-wrap~. What counts as inline
+is HTML's phrasing content: ~a~, ~b~, ~span~, ~code~, ~img~, ~input~, ~button~
+and the rest.
 
 Where the text *is* the content — ~pre~ and ~textarea~ — nothing whatsoever is
 added, child elements included, because indenting inside one of those does not
@@ -673,15 +676,16 @@ not have it; ~dotnet/aspnet~ does.
 ** Running the tests
 
 #+BEGIN_SRC sh
-bjo run tests/html.bjo    ;; 33 checks, no server anywhere
+bjo run tests/html.bjo    ;; 46 checks, no server anywhere
 bjo run tests/demo.bjo    ;; 88 checks, a real socket
 #+END_SRC
 
-~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
-boolean attributes, void elements, ~pre~ and ~textarea~ left byte for byte,
-escaping in text and in attribute values, that an attribute value never gains a
-newline, computed content through ~,~, ~raw~, fragments, and the document and
-response wrappers.
+~tests/html.bjo~ is the renderer on its own: shapes and indentation, text never
+touched — a link and then a full stop, inline elements side by side, text beside
+a block — attributes, boolean attributes, void elements, ~pre~ and ~textarea~
+left byte for byte, escaping in text and in attribute values, that an attribute
+value never gains a newline, computed content through ~,~, ~raw~ and a script,
+fragments, and the document and response wrappers.
 
 Eighty-eight checks: the routing table on its own, then a real Kestrel on a port
 the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,

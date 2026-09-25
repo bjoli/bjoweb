@@ -614,7 +614,7 @@ It is an ordinary ~bjo~ package. From a project of your own:
 #+BEGIN_SRC scheme
 (depends
   (package (name (bjoweb))
-           (version (version-at-least "0.1.1"))
+           (version (version-at-least "0.2.0"))
            (source (git (url "https://github.com/bjoli/bjoweb")))))
 #+END_SRC
 
@@ -623,6 +623,31 @@ it. bjoweb needs a Bjolang whose ~(std net)~ has ~stream->ports~, and from
 0.1.1 on one where closing a byte output port writes only what is pending. From
 0.2.0 on it also needs one where ~utf8~ writes no byte order mark and a call
 handed to a waiting receiver is taken. See Bjolang's changelog for all three.
+
+*** From 0.1 to 0.2
+
+What a program written for 0.1 has to change:
+
+- A response's body is a ~Body~. ~response-body~ answers one, ~response-text~
+  is ~(Some s)~ for text, and ~response-upgrade~ is gone: a websocket answer is
+  an ~Upgraded~ body.
+- The request body is read when it is asked for. ~request-body~ and
+  ~request-form~ suspend, so a ~(fun (req) ...)~ that calls them has to be a
+  ~bjoroutine~; the compiler says which.
+- ~make-request~ takes no form argument: the form is read from the body.
+- A body over 1 MiB is answered 413 unless ~#:max-body~ says more, or the
+  handler takes it with ~request-body-port~ or ~request-parts~.
+- From loopback, ~X-Forwarded-*~ are believed: ~request-client~ and the other
+  two say what a proxy on the same machine says. ~#:trusted-proxies []~ turns
+  that off.
+- ~Request~ has more fields, so a program that builds one as a record, rather
+  than with ~make-request~, has to name them.
+
+And what is new: ~binary~ and ~with-body~; ~stream~, ~stream-text~ and
+~event-stream~; ~request-bytes~, ~request-body-port~ and ~request-parts~ with
+the part functions; ~request-scheme~, ~request-host~ and ~request-client~;
+~parse-query~; and ~#:max-body~ and ~#:trusted-proxies~ on ~serve~ and
+~start-server~.
 
 Note that *the ASP.NET runtime has to be installed wherever the program runs*.
 Not just where it is built: a framework-dependent program asks the host for

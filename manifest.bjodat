@@ -1,6 +1,6 @@
 (package
   (name (bjoweb))
-  (version "0.1.0")
+  (version "0.1.1")
   (description "A small web framework: Kestrel on one side, fibers on the other, an inbox between them.")
   (license "MPL-2.0")
 

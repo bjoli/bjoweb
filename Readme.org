@@ -350,12 +350,14 @@ It is an ordinary ~bjo~ package. From a project of your own:
 #+BEGIN_SRC scheme
 (depends
   (package (name (bjoweb))
-           (version (version-at-least "0.1.0"))
+           (version (version-at-least "0.1.1"))
            (source (git (url "https://github.com/bjoli/bjoweb")))))
 #+END_SRC
 
 ~(net websocket)~, from [[https://github.com/bjoli/websocket]], comes along with
-it. bjoweb needs a Bjolang whose ~(std net)~ has ~stream->ports~.
+it. bjoweb needs a Bjolang whose ~(std net)~ has ~stream->ports~, and from
+0.1.1 on one where closing a byte output port writes only what is pending (see
+Bjolang's changelog).
 
 Note that *the ASP.NET runtime has to be installed wherever the program runs*.
 Not just where it is built: a framework-dependent program asks the host for

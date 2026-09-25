@@ -50,7 +50,7 @@ Two thirds of this package never name an ASP.NET type, which is why two thirds
 of it can be unit-tested with no socket anywhere:
 
 #+BEGIN_SRC scheme
-(router-match app (make-request "GET" "/hello/ada" (map-empty) (map-empty) "" (map-empty)))
+(router-match app (make-request "GET" "/hello/ada" (map-empty) (map-empty) ""))
 ;; => (Matched <request with params {"name" "ada"}> <handler>)
 #+END_SRC
 
@@ -77,19 +77,57 @@ Because handlers return a complete ~Response~ value, nothing is written to the c
 
 | ~(request-method req)~              | ~"GET"~, ~"POST"~ — upper case, as it arrived      |
 | ~(request-path req)~                | ~"/hello/ada"~, already percent-decoded            |
-| ~(request-body req)~                | the whole body as UTF-8 text, or ~""~              |
 | ~(request-param req "id")~          | what ~/users/:id~ bound — an ~Option~              |
 | ~(request-query req "page")~        | ~?page=2~, decoded, ~+~ counted as a space         |
-| ~(request-form req "email")~        | from an ~application/x-www-form-urlencoded~ body   |
 | ~(request-header req "Accept")~     | case-insensitive                                   |
 | ~(request-scheme req)~              | ~"http"~ or ~"https"~, as the client asked         |
 | ~(request-host req)~                | ~"example.com"~, with the port if there was one    |
 | ~(request-client req)~              | the client's address, ~"203.0.113.7"~, no port     |
 
-~request-param~, ~-query~, ~-form~ and ~-header~ each have an ~-or~ form
-taking a fallback: ~(request-query-or req "page" "1")~. The last three are what
-the client used, which behind a reverse proxy is not what the connection says;
-see Behind a proxy.
+~request-param~, ~-query~ and ~-header~ each have an ~-or~ form taking a
+fallback: ~(request-query-or req "page" "1")~. The last three are what the
+client used, which behind a reverse proxy is not what the connection says; see
+Behind a proxy.
+
+*** Reading the body
+
+| ~(request-body req)~                | the whole body as UTF-8 text, or ~""~              |
+| ~(request-bytes req)~               | the whole body as it came, an ~(Array byte)~       |
+| ~(request-form req "email")~        | from an ~application/x-www-form-urlencoded~ body; ~-or~ too |
+| ~(request-body-port req)~           | the body as a ~ByteInputPort~, read as it arrives  |
+
+A body is read when a handler first asks for it, not before, so a request
+answered 401 or 404 is never read at all. That is why these four suspend,
+where the rest of a request's accessors do not: a handler that reads the body
+is a ~defbjo~ or a ~bjoroutine~, and a ~(fun (req) ...)~ that tries is a
+compile error. What is read is kept, so a middleware and the handler after it
+can both ask.
+
+How much may be read into memory is ~#:max-body~ on ~serve~ and
+~start-server~, 1 MiB unless told otherwise. A body over it is answered ~413~
+once a handler asks for it: at once when ~Content-Length~ says it will be, and
+as soon as it has gone over when it is chunked. A body that is malformed, or
+cut short, is answered ~400~. Kestrel is what refuses it, and the status is
+Kestrel's.
+
+An upload too big to hold goes through the port, which has its own limit:
+
+#+BEGIN_SRC scheme
+(: save-upload (-bjo-> Request Response))
+(defbjo (save-upload req)
+  (def in (request-body-port req #:max-body (* 200 (* 1024 1024))))
+  (match (open-byte-output-file "upload.bin")
+    ((Err e) (server-error))
+    ((Ok out)
+     (let copy ()
+       (match (read-some in)
+         ((Some chunk) (write-bytes! out chunk) (copy))
+         (None (close-byte-output-port! out) (text "saved\n")))))))
+#+END_SRC
+
+There is one port. Once it is taken, ~request-body~ and the rest raise; a body
+already read into memory is served from there instead. A request made with
+~make-request~ has its body in memory already, and no limit applies to it.
 
 *** Writing the response
 
@@ -421,7 +459,7 @@ helper.
 #+BEGIN_SRC scheme
 ;; default values. Does not serve static files. 
 (serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot"
-           #:trusted-proxies ["127.0.0.0/8" "::1"])
+           #:trusted-proxies ["127.0.0.0/8" "::1"] #:max-body 1048576)
 #+END_SRC
 
 ~start-server~ and ~stop-server!~ are the pair for a program that has something
@@ -517,10 +555,10 @@ reconnect.
 ** What this is not
 
 No dependency injection, no configuration system, no authentication, no content
-negotiation, no TLS, no HTTP/2, no streamed request bodies. Kestrel can do all
-of those and none of them is here; a reverse proxy in front does TLS and HTTP/2
-(see Behind a proxy). Websockets are here, without the compression extension,
-and so are streamed response bodies and server-sent events.
+negotiation, no TLS, no HTTP/2. Kestrel can do all of those and none of them is
+here; a reverse proxy in front does TLS and HTTP/2 (see Behind a proxy).
+Websockets are here, without the compression extension, and so are streamed
+bodies both ways and server-sent events.
 
 ~(bjoweb server)~ exports ~Ctx~ — the ~HttpContext~ type itself — so a program
 that needs one of them can reach for it, and so that reaching for it is visible.
@@ -551,7 +589,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 33 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 71 checks, a real socket
+bjo run tests/demo.bjo    ;; 79 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
@@ -560,7 +598,7 @@ escaping in text and in attribute values, that an attribute value never gains a
 newline, computed content through ~,~, ~raw~, fragments, and the document and
 response wrappers.
 
-Seventy-one checks: the routing table on its own, then a real Kestrel on a port
+Seventy-nine checks: the routing table on its own, then a real Kestrel on a port
 the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
 query strings, request headers, a POST body, a suspending handler, a handler
 that raises, the 404 and the 405, a redirect, and twelve requests at once
@@ -574,6 +612,13 @@ bytes go out as they are, and a 204 sends nothing whatever its handler gave it.
 And ~Content-Length~: in bytes rather than characters, 0 for an empty body, the
 ~GET~'s for a ~HEAD~, and the body's even when the handler put another one in
 the headers.
+
+Request bodies, with the server's ~#:max-body~ set to 1000: a form, a body
+asked for twice and read once, bytes read as they came, a body over the limit
+answered 413 whether its length was said or it came chunked, an upload of 5000
+bytes through the port, and 5000 bytes that nobody reads, which are not
+refused. Leaving the limit unset, or answering Kestrel's refusal with a 500,
+makes the 413 checks fail.
 
 Streamed bodies are read over a plain socket too, to see what arrives when and
 how the body ends: a streamed body and streamed text, with no ~Content-Length~;
@@ -608,5 +653,4 @@ it with 1001 rather than wait for it.
 
 ** Planned features
 
-The request body as bytes, with a limit on its size, and uploads streamed to
-the handler; multipart forms. See ~todo.org~.
+Multipart forms, and the files in them read as they arrive. See ~todo.org~.

@@ -36,7 +36,8 @@
      (route-get  "/"            (fun (req) (html "<h1>bjoweb</h1>\n")))
      (route-get  "/hello/:name" hello)
      (route-get  "/slow"        slowly)
-     (route-post "/echo"        (fun (req) (text (str (request-body req) "\n"))))
+     ;; Reading the body suspends, so this one is a `bjoroutine`, not a `fun`.
+     (route-post "/echo"        (bjoroutine (req) (text (str (request-body req) "\n"))))
      (route-get  "/headers"     (fun (req) (text (str (request-header-or req "user-agent" "?")
                                                       "\n")))))
    #:port 8080)

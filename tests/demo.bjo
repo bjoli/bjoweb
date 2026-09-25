@@ -111,6 +111,32 @@
 (defbjo (echo req)
   (json-text (str "{\"said\":\"" (request-body req) "\"}")))
 
+;; --- Request bodies ----------------------------------------------------------
+
+(: show-form (-bjo-> Request Response))
+(defbjo (show-form req)
+  (text (str (request-form-or req "a" "-") ";" (request-form-or req "b" "-"))))
+
+;; What arrived, one number per byte.
+(: show-bytes (-bjo-> Request Response))
+(defbjo (show-bytes req)
+  (text (dotted (request-bytes req))))
+
+;; Asked for twice, read once.
+(: said-twice (-bjo-> Request Response))
+(defbjo (said-twice req)
+  (text (str (request-body req) "|" (request-body req))))
+
+;; Counts an upload as it arrives, holding none of it: more than the server's
+;; `#:max-body` may come this way.
+(: count-upload (-bjo-> Request Response))
+(defbjo (count-upload req)
+  (def in (request-body-port req #:max-body 1000000))
+  (let go ((n 0))
+    (match (read-some in)
+      ((Some chunk) (go (+ n (array-length chunk))))
+      (None (text (int->string n))))))
+
 (: show-query (-bjo-> Request Response))
 (defbjo (show-query req)
   (text (str (request-query-or req "a" "-") ";" (request-query-or req "b" "-"))))
@@ -272,6 +298,11 @@
     (route-get    "/hello/:name"  greet)
     (route-get    "/slow"         slow)
     (route-post   "/echo"         echo)
+    (route-post   "/form"         show-form)
+    (route-post   "/dotted"       show-bytes)
+    (route-post   "/twice"        said-twice)
+    (route-post   "/upload"       count-upload)
+    (route-post   "/ignore"       (fun (req) (text "ignored")))
     (route-get    "/query"        show-query)
     (route-get    "/headers"      show-header)
     (route-get    "/static/*path" show-rest)
@@ -421,6 +452,49 @@
                                          "Host: localhost\r\n"
                                          "Connection: close\r\n\r\n")))
   (flush! out))
+
+;; `n` of the letter x.
+(: xs (-> int string))
+(defun (xs n)
+  (loop (:for i (range 0 n))
+        (:acc out (stringing #\x))))
+
+;; Everything that arrives on `in` until it ends, or nothing has for three
+;; seconds.
+(: all-that-arrives (-bjo-> ByteInputPort string))
+(defbjo (all-that-arrives in)
+  (let go ((acc ""))
+    (match (sync (choose (wrap (read-some-evt in) (fun (r) (Some r)))
+                         (wrap (timeout 3000) (fun (u) None))))
+      ((Some (Ok (Some bs))) (go (str acc (from-bytes utf8 bs))))
+      (_ acc))))
+
+;; A POST over a plain socket, with `framing` saying how long its body is and
+;; `body` sent as it is: the status code of the answer, and its body.
+(: post-raw (-bjo-> int string string (Array byte) string))
+(defbjo (post-raw port path framing body)
+  (with-scope
+    (match (tcp-connect "127.0.0.1" port)
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok (Tuple in out))
+       (write-bytes! out (to-bytes utf8 (str "POST " path " HTTP/1.1\r\n"
+                                              "Host: localhost\r\n"
+                                              "Connection: close\r\n"
+                                              framing "\r\n")))
+       (write-bytes! out body)
+       (flush! out)
+       (def all (all-that-arrives in))
+       (def status-line (vec-ref (string-split all "\r\n") 0))
+       (def code (let ((words (string-split status-line " ")))
+                   (if (< (vec-length words) 2) status-line (vec-ref words 1))))
+       (def halves (string-split all "\r\n\r\n"))
+       (str code " | " (if (< (vec-length halves) 2) "" (vec-ref halves 1)))))))
+
+;; 1800 bytes in three chunks of 600, which is 258 in hex.
+(: chunked-1800 (-> (Array byte)))
+(defun (chunked-1800)
+  (def one (str "258\r\n" (xs 600) "\r\n"))
+  (to-bytes utf8 (str one one one "0\r\n\r\n")))
 
 ;; ---------------------------------------------------------------------------
 ;; A streamed body as it arrives
@@ -633,7 +707,7 @@
 
 (: what-happens (-> string string string))
 (defun (what-happens method path)
-  (match (router-match app (make-request method path (map-empty) (map-empty) "" (map-empty)))
+  (match (router-match app (make-request method path (map-empty) (map-empty) ""))
     ((Matched bound handler)
      (str "matched " (request-param-or bound "name" (request-param-or bound "path" ""))))
     ((WrongMethod allow) (str "405 " allow))
@@ -656,8 +730,14 @@
   (expect "HEAD is served by GET"  (what-happens "HEAD" "/") "matched ")
   (expect "a request made by hand is for the host in its headers"
           (request-host (make-request "GET" "/" (map-empty) (map-set (map-empty) "host" "example.com")
-                                      "" (map-empty)))
+                                      ""))
           "example.com")
+  (expect "and its body, and the form in it"
+          (let ((r (make-request "POST" "/" (map-empty)
+                                 (map-set (map-empty) "content-type" "application/x-www-form-urlencoded")
+                                 "a=1&b=two+words")))
+            (str (request-body r) "|" (request-form-or r "b" "-")))
+          "a=1&b=two+words|two words")
 
   ;; --- and now a real socket -----------------------------------------------
   (def port (free-port))
@@ -667,7 +747,8 @@
     (with-scope
       ;; The workers are spawned into this scope. `stop-server!` in the
       ;; `#:finally` is what lets it end.
-      (let ((server (start-server app #:port port #:workers 4 #:queue 32)))
+      ;; A small `#:max-body`, so that going over it is cheap.
+      (let ((server (start-server app #:port port #:workers 4 #:queue 32 #:max-body 1000)))
         (try
             (let ()
               (expect "the url it is listening on" (server-url server) base)
@@ -691,6 +772,40 @@
               (expect "a body sent and read back"
                       (fetched (post (str base "/echo") (http/Text "ping")))
                       (Tuple 200 "{\"said\":\"ping\"}"))
+
+              ;; --- request bodies -----------------------------------------
+              (expect "a form"
+                      (fetched (post (str base "/form")
+                                     (http/Form [(Tuple "a" "1") (Tuple "b" "two words")])))
+                      (Tuple 200 "1;two words"))
+
+              (expect "a body asked for twice is read once"
+                      (fetched (post (str base "/twice") (http/Text "ping")))
+                      (Tuple 200 "ping|ping"))
+
+              (expect "bytes, as they came"
+                      (post-raw port "/dotted" "Content-Length: 4\r\n" #[0 1 254 255])
+                      "200 | 0.1.254.255.")
+
+              (expect "a body over #:max-body is refused with 413"
+                      (match (fetched (post (str base "/echo") (http/Text (xs 2000))))
+                        ((Tuple code body) code))
+                      413)
+
+              (expect "and so is a chunked one, once it has gone over"
+                      (vec-ref (string-split (post-raw port "/echo" "Transfer-Encoding: chunked\r\n"
+                                                       (chunked-1800))
+                                             " ")
+                               0)
+                      "413")
+
+              (expect "a handler that takes the body as a port may take more"
+                      (fetched (post (str base "/upload") (http/Text (xs 5000))))
+                      (Tuple 200 "5000"))
+
+              (expect "a body nobody reads is not refused"
+                      (fetched (post (str base "/ignore") (http/Text (xs 5000))))
+                      (Tuple 200 "ignored"))
 
               (expect "a handler that suspends"
                       (body-of (str base "/slow")) (Tuple 200 "eventually"))

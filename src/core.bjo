@@ -15,13 +15,19 @@
   Request Response Body BodyWriter Handler Header Middleware
 
   ;; Request construction.
-  make-request
+  make-request make-request/streamed RequestBody
 
   ;; Reading one.
-  request-method request-path request-body
+  request-method request-path
   request-scheme request-host request-client
-  request-query request-header request-param request-form
-  request-query-or request-header-or request-param-or request-form-or
+  request-query request-header request-param
+  request-query-or request-header-or request-param-or
+
+  ;; Its body, which is read when it is asked for, and so suspends.
+  request-body request-bytes request-body-port request-form request-form-or
+
+  ;; What a query string and an urlencoded form are written in.
+  parse-query
 
   ;; Making an answer.
   respond text html json-text binary redirect
@@ -44,12 +50,22 @@
   pipeline)
 
 (import (std prelude))
-(import (only (std ports) byte->text-output-port utf8))
+(import (only (std ports) byte->text-output-port utf8
+              read-some byte-pipe write-bytes! close-byte-output-port!))
 (import (only (std inbox) make-inbox inbox-close! inbox-closed))
 (import (net websocket protocol))
 
 (import/class
-  (Refusal (: System.ArgumentException (-> string Refusal))))
+  (Refusal   (: System.ArgumentException (-> string Refusal)))
+  (Misuse    (: System.InvalidOperationException (-> string Misuse)))
+  (Collected (: System.IO.MemoryStream (-> Collected))))
+
+(import/extern
+  (collect!     (: System.IO.MemoryStream.Write (-> Collected (Array byte) int int void)))
+  (collected    (: System.IO.MemoryStream.ToArray (-> Collected (Array byte))))
+  (utf8-bytes   (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
+  (utf8-text    (: System.Text.Encoding.GetString (-> Encoding (Array byte) int int string)))
+  (unescape     (: System.Uri.UnescapeDataString (-> string string))))
 
 ;; ---------------------------------------------------------------------------
 ;; A header, and the two records
@@ -59,18 +75,34 @@
 ;; with the same name (e.g., `Set-Cookie`).
 (type (: Header (Alias (Tuple string string))))
 
+;; Where a body comes from: bytes already in memory, or a function that opens
+;; it as a port that fails once more than the limit it is given has been read.
+(type (: BodySource (Union (InMemory (Array byte))
+                           (FromPort (-> int ByteInputPort)))))
+
+;; How far a body has got. It is read once, into memory, or taken once as a
+;; port, and not both.
+(type (: BodyState (Union Unread (Buffered (Array byte)) Taken)))
+
+;; A request's body. `limit` is how much of it may be read into memory. The
+;; router copies the request to bind its parameters, and the copies share the
+;; two boxes, so a body read by a middleware is read for the handler too.
+;; Defined before `Request`, which names it.
+(type (: RequestBody #:opaque (Record (: source BodySource)
+                                      (: limit int)
+                                      (: state (Box BodyState))
+                                      (: form (Box (Option (Map string string)))))))
+
 ;; Represents an HTTP request.
-;; Note: `headers` keys are lower-cased. `body` contains the fully read and
-;; UTF-8 decoded request body. `scheme`, `host` and `client` are what the
-;; client used, which behind a proxy is not what the connection says: see
-;; `request-client`.
+;; Note: `headers` keys are lower-cased. `body` is read when it is first asked
+;; for, not before. `scheme`, `host` and `client` are what the client used,
+;; which behind a proxy is not what the connection says: see `request-client`.
 (type (: Request (Record (: method string)
                          (: path string)
                          (: query (Map string string))
                          (: headers (Map string string))
                          (: params (Map string string))
-                         (: form (Map string string))
-                         (: body string)
+                         (: body RequestBody)
                          (: scheme string)
                          (: host string)
                          (: client string))))
@@ -118,20 +150,43 @@
 ;; Making a request
 ;; ---------------------------------------------------------------------------
 
-;; Creates a new request. Route `params` are populated later by the router.
-;; With no `#:host`, the host is the one in `headers`, as it is for a request
-;; that came straight from a client.
-(: make-request (-> string string (Map string string) (Map string string) string (Map string string)
+;; Creates a new request, with `body` as its body, written as UTF-8. Route
+;; `params` are populated later by the router. With no `#:host`, the host is
+;; the one in `headers`, as it is for a request that came straight from a
+;; client.
+;;
+;; The body is in memory already, so no limit applies to reading it.
+(: make-request (-> string string (Map string string) (Map string string) string
                     (#:scheme string) (#:host string) (#:client string)
                     Request))
-(defun (make-request method path query headers body form #:scheme "http" #:host "" #:client "")
+(defun (make-request method path query headers body #:scheme "http" #:host "" #:client "")
+  (new-request method path query headers (InMemory (utf8-bytes utf8 body)) 0 scheme host client))
+
+;; The same, with a body that is read from a port when it is asked for: the
+;; server's kind. `open` is given a limit and answers the body as a port that
+;; fails once more than that has been read. `max-body` is the limit on reading
+;; it into memory; `request-body-port` may ask for another.
+(: make-request/streamed (-> string string (Map string string) (Map string string)
+                             (-> int ByteInputPort) int
+                             (#:scheme string) (#:host string) (#:client string)
+                             Request))
+(defun (make-request/streamed method path query headers open max-body
+                              #:scheme "http" #:host "" #:client "")
+  (new-request method path query headers (FromPort open) max-body scheme host client))
+
+(: new-request (-> string string (Map string string) (Map string string) BodySource int
+                   string string string
+                   Request))
+(defun (new-request method path query headers source limit scheme host client)
   (Request (method method)
            (path path)
            (query query)
            (headers headers)
            (params (map-empty))
-           (form form)
-           (body body)
+           (body (RequestBody (source source)
+                              (limit limit)
+                              (state (make-box Unread))
+                              (form (make-box None))))
            (scheme scheme)
            (host (if (string-empty? host) (map-ref-or headers "host" "") host))
            (client client)))
@@ -147,10 +202,6 @@
 ;; The request path, excluding the query string. Always starts with `/`.
 (: request-path (-> Request string))
 (defun (request-path r) (record-ref r path))
-
-;; The body, or `""` when there was none.
-(: request-body (-> Request string))
-(defun (request-body r) (record-ref r body))
 
 ;; `"http"` or `"https"`, as the client asked. A websocket handshake is one or
 ;; the other too.
@@ -187,10 +238,6 @@
 (: request-param (-> Request string (Option string)))
 (defun (request-param r name) (map-try-ref (record-ref r params) name))
 
-;; Gets a parsed form field, or `None` if absent.
-(: request-form (-> Request string (Option string)))
-(defun (request-form r name) (map-try-ref (record-ref r form) name))
-
 ;; Accessors with fallback values for when the key is not present.
 (: request-query-or (-> Request string string string))
 (defun (request-query-or r name fallback)
@@ -204,9 +251,134 @@
 (defun (request-param-or r name fallback)
   (map-ref-or (record-ref r params) name fallback))
 
-(: request-form-or (-> Request string string string))
-(defun (request-form-or r name fallback)
-  (map-ref-or (record-ref r form) name fallback))
+;; ---------------------------------------------------------------------------
+;; Reading its body
+;; ---------------------------------------------------------------------------
+;;
+;; Nothing reads a body until something asks for it, so a request answered 401
+;; or 404 is never read at all. What is read into memory is kept, for the
+;; next thing that asks.
+
+;; The whole body, as it came. Past the server's `#:max-body` it raises, and
+;; the server answers 413.
+(: request-bytes (-bjo-> Request (Array byte)))
+(defbjo (request-bytes r)
+  (def body (record-ref r body))
+  (def state (record-ref body state))
+  (match (box-ref state)
+    ((Buffered bytes) bytes)
+    (Taken (raise (cast Exception (Misuse. "the request body was taken as a port"))))
+    (Unread
+     (def bytes (match (record-ref body source)
+                  ((InMemory bytes) bytes)
+                  ((FromPort open) (read-to-end (open (record-ref body limit))))))
+     (box-set! state (Buffered bytes))
+     bytes)))
+
+;; The body as UTF-8 text, `""` when there was none. A byte order mark at the
+;; start is left out, as a text port leaves it out.
+(: request-body (-bjo-> Request string))
+(defbjo (request-body r)
+  (def bytes (request-bytes r))
+  (def n (array-length bytes))
+  (if (and (>= n 3)
+           (= (array-ref bytes 0) 239uy) (= (array-ref bytes 1) 187uy) (= (array-ref bytes 2) 191uy))
+      (utf8-text utf8 bytes 3 (- n 3))
+      (utf8-text utf8 bytes 0 n)))
+
+;; The body as a port, for one that should not be held in memory: an upload,
+;; read and written somewhere as it arrives. `#:max-body` is how much of it may
+;; be read, the server's `#:max-body` when it is 0; a read past it raises, and
+;; the server answers 413.
+;;
+;; It is the one port there is. Once it is taken, `request-body` and the rest
+;; raise; a body already read into memory is served from there instead.
+(: request-body-port (-> Request (#:max-body int) ByteInputPort))
+(defun (request-body-port r #:max-body 0)
+  (def body (record-ref r body))
+  (def state (record-ref body state))
+  (match (box-ref state)
+    ((Buffered bytes) (bytes-port bytes))
+    (Taken (raise (cast Exception (Misuse. "the request body was taken as a port already"))))
+    (Unread
+     (box-set! state Taken)
+     (match (record-ref body source)
+       ((InMemory bytes) (bytes-port bytes))
+       ((FromPort open) (open (if (> max-body 0) max-body (record-ref body limit))))))))
+
+;; A form field from an `application/x-www-form-urlencoded` body, or `None`.
+;; The first value, if a field is given more than once. Reads the body, once.
+(: request-form (-bjo-> Request string (Option string)))
+(defbjo (request-form r name) (map-try-ref (form-of r) name))
+
+(: request-form-or (-bjo-> Request string string string))
+(defbjo (request-form-or r name fallback) (map-ref-or (form-of r) name fallback))
+
+(: form-of (-bjo-> Request (Map string string)))
+(defbjo (form-of r)
+  (def kept (record-ref (record-ref r body) form))
+  (match (box-ref kept)
+    ((Some fields) fields)
+    (None
+     (def fields (if (string-starts-with? (request-header-or r "content-type" "")
+                                          "application/x-www-form-urlencoded")
+                     (parse-query (request-body r))
+                     (map-empty)))
+     (box-set! kept (Some fields))
+     fields)))
+
+(: read-to-end (-bjo-> ByteInputPort (Array byte)))
+(defbjo (read-to-end p)
+  (def all (Collected.))
+  (let go ()
+    (match (read-some p)
+      ((Some chunk) (collect! all chunk 0 (array-length chunk)) (go))
+      (None (collected all)))))
+
+;; A pipe is in memory, so writing all of it at once never waits.
+(: bytes-port (-> (Array byte) ByteInputPort))
+(defun (bytes-port bytes)
+  (match (byte-pipe)
+    ((Tuple in out)
+     (write-bytes! out bytes)
+     (close-byte-output-port! out)
+     in)))
+
+;; ---------------------------------------------------------------------------
+;; Query strings and urlencoded forms
+;; ---------------------------------------------------------------------------
+
+;; `a=1&b=two+words` as a map, decoded, with `+` read as a space. A leading `?`
+;; is skipped, and the first value is kept for a name given more than once.
+(: parse-query (-> string (Map string string)))
+(defun (parse-query raw)
+  (def text (if (string-starts-with? raw "?") (drop-first raw) raw))
+  (loop (:for pair (string-split text "&"))
+        (:when (not (string-empty? pair)))
+        (:acc all (folding (map-empty) (add-parameter all pair)))))
+
+(: add-parameter (-> (Map string string) string (Map string string)))
+(defun (add-parameter all pair)
+  (def parts (string-split pair "="))
+  (def name (url-decode (vec-ref parts 0)))
+  ;; Splits on the first '=' to separate key and value.
+  (def value (if (< (vec-length parts) 2) "" (url-decode (join-rest parts))))
+  (if (map-contains? all name) all (map-set all name value)))
+
+(: join-rest (-> (Vec string) string))
+(defun (join-rest parts)
+  (string-join (loop (:for i (range 1 (vec-length parts)))
+                     (:acc out (vecing (vec-ref parts i))))
+               "="))
+
+(: url-decode (-> string string))
+(defun (url-decode s) (unescape (string-replace s "+" " ")))
+
+(: drop-first (-> string string))
+(defun (drop-first s)
+  (substring/cursors s
+                     (string-cursor-next s (string-cursor-start s))
+                     (string-cursor-end s)))
 
 ;; ---------------------------------------------------------------------------
 ;; Making an answer

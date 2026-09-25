@@ -7,16 +7,25 @@
 ;; Provides a web server integrating ASP.NET Kestrel with Bjolang fibers.
 ;; Requests are bridged from Kestrel threads into an inbox, where worker
 ;; fibers process them using the provided `Router`.
+;;
+;; A websocket is Kestrel's raw upgraded stream with `(net websocket protocol)`
+;; over it.
+;; Its call is handed from the worker to a session fiber of its own, because
+;; answering the call is what gives the connection back to Kestrel, and a
+;; socket may stay open for hours.
 
 (export
   ;; Server lifecycle and info.
   Server serve start-server stop-server!
   server-url server-port server-dropped-count
 
-  ;; The raw `HttpContext`, exposed for advanced use cases (e.g., streaming, websockets).
+  ;; The raw `HttpContext`, exposed for advanced use cases (e.g., streaming).
   Ctx)
 
 (import (std inbox))
+(import (only (std net) stream->ports))
+(import (only (net websocket protocol)
+              ports->websocket websocket-accept-key websocket-close! websocket-closed))
 (import (bjoweb core))
 (import (bjoweb router))
 
@@ -44,7 +53,11 @@
   (Buffered    (: Bjolang.Runtime.BjoPort (-> TextInputPort Buffered)))
   (Encoding    (: System.Text.Encoding))
   (Object      (: System.Object))
-  ((Pairing %k %v) (: System.Collections.Generic.KeyValuePair)))
+  ((Pairing %k %v) (: System.Collections.Generic.KeyValuePair))
+  (Lifetime    (: Microsoft.Extensions.Hosting.IHostApplicationLifetime))
+  (Features    (: Microsoft.AspNetCore.Http.Features.IFeatureCollection))
+  (UpgradeFeature (: Microsoft.AspNetCore.Http.Features.IHttpUpgradeFeature))
+  (ConnInfo    (: Microsoft.AspNetCore.Http.ConnectionInfo)))
 
 (import/extern
   ;; --- Building and running the host ---
@@ -88,9 +101,32 @@
   (write-text!   (: Microsoft.AspNetCore.Http.HttpResponseWritingExtensions.WriteAsync
                     (-> Outgoing string void) #:async))
 
+  ;; --- Stopping ---
+  (app-lifetime  (: Microsoft.AspNetCore.Builder.WebApplication.Lifetime (-> App Lifetime) #:get))
+  (stopping      (: Microsoft.Extensions.Hosting.IHostApplicationLifetime.ApplicationStopping
+                    (-> Lifetime CancellationToken) #:get))
+
+  ;; --- Upgrading a connection ---
+  ;;
+  ;; `UpgradeAsync` has no overload taking a token. It sends the `101` with
+  ;; whatever response headers are set, and answers the raw connection.
+  (ctx-features  (: Microsoft.AspNetCore.Http.HttpContext.Features (-> Ctx Features) #:get))
+  (upgrade-feature (: Microsoft.AspNetCore.Http.Features.IFeatureCollection.Get
+                      (-> Features UpgradeFeature)))
+  (upgradable?   (: Microsoft.AspNetCore.Http.Features.IHttpUpgradeFeature.IsUpgradableRequest
+                    (-> UpgradeFeature bool) #:get))
+  (upgrade!      (: Microsoft.AspNetCore.Http.Features.IHttpUpgradeFeature.UpgradeAsync
+                    (-> UpgradeFeature Stream) #:async #:uncancellable))
+  (ctx-connection (: Microsoft.AspNetCore.Http.HttpContext.Connection (-> Ctx ConnInfo) #:get))
+  (remote-ip     (: Microsoft.AspNetCore.Http.ConnectionInfo.RemoteIpAddress
+                    (-> ConnInfo System.Net.IPAddress) #:get))
+  (remote-port   (: Microsoft.AspNetCore.Http.ConnectionInfo.RemotePort (-> ConnInfo int) #:get))
+
   ;; --- Base .NET ---
   (utf8          (: System.Text.Encoding.UTF8 #:get))
   (unescape      (: System.Uri.UnescapeDataString (-> string string)))
+  (from-base64   (: System.Convert.FromBase64String (-> string (Array byte))
+                    #:exceptions (System.FormatException)))
   ;; A completed task.
   (nothing-to-do (: System.Threading.Tasks.Task.CompletedTask Task #:get)))
 
@@ -106,10 +142,14 @@
 ;; ===========================================================================
 
 ;; An opaque record representing a running server instance.
+;;
+;; `going-away` is a latch, closed and never posted to: once the server begins
+;; to stop, every open websocket is closed with 1001.
 (type
   (: Server #:opaque
      (Record (: app App)
              (: requests (Inbox (Call Ctx Unit)))
+             (: going-away (Inbox Unit))
              (: url string)
              (: port int))))
 
@@ -144,6 +184,36 @@
   (header-add! (out-headers out) "Retry-After" (Values. "1"))
   nothing-to-do)
 
+(: latch (-> (Inbox Unit)))
+(defun (latch) (make-inbox 1 DropNewest))
+
+;; Starts a fiber that closes `going-away` when the host begins to stop.
+;;
+;; Kestrel's shutdown waits for every request still in flight, and an open
+;; websocket is one, so without this Ctrl-C under `serve` would wait out the
+;; host's shutdown timeout before the sockets were dropped.
+;;
+;; A fiber cannot wait on a .NET `CancellationToken` directly, but an inbox call
+;; made with one can be: once the call is taken, the token firing is what makes
+;; `call-abandoned` fire.
+(: watch-host! (-> App (Inbox Unit) void))
+(defun (watch-host! app going-away)
+  (def watch (make-inbox 1 DropNewest))
+  (ignore (inbox-call/token watch unit (stopping (app-lifetime app))))
+  (spawn (watch-stopping watch going-away)))
+
+(: watch-stopping (-bjo-> (Inbox (Call Unit Unit)) (Inbox Unit) Unit))
+(defbjo (watch-stopping watch going-away)
+  (match (sync (choose (wrap (inbox-recv watch) (fun (c) (Some c)))
+                       (wrap (inbox-closed going-away) (fun (e) None))))
+    (None unit)
+    ((Some c)
+     (sync (choose (wrap (call-abandoned c) (fun (u) unit))
+                   (wrap (inbox-closed going-away) (fun (e) unit))))
+     (inbox-close! going-away)
+     (ignore (call-reply! c unit))
+     unit)))
+
 (: install-inbox! (-> App (Inbox (Call Ctx Unit)) bool void))
 (defun (install-inbox! app requests static-files?)
   (when static-files?
@@ -158,18 +228,23 @@
                         Server))
 (defbjo (start-server rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot")
   (def requests (make-request-inbox queue))
+  (def going-away (latch))
   (def app (new-app quiet static-dir))
   (def url (str "http://" host ":" (int->string port)))
   (ignore (.Add (app-urls app) url))
   (install-inbox! app requests static-files)
+  (watch-host! app going-away)
   (loop (:for i (range 0 workers))
-        (:do (spawn (worker rt requests))))
+        (:do (spawn (worker rt going-away requests))))
   (app-start app)
-  (Server (app app) (requests requests) (url url) (port port)))
+  (Server (app app) (requests requests) (going-away going-away) (url url) (port port)))
 
 ;; Stops accepting requests, finishes pending ones, and shuts down the workers.
+;; Open websockets are closed with 1001 first, since Kestrel's stop waits for
+;; them.
 (: stop-server! (-bjo-> Server void))
 (defbjo (stop-server! s)
+  (inbox-close! (record-ref s going-away))
   (app-stop (record-ref s app))
   (inbox-close! (record-ref s requests)))
 
@@ -180,15 +255,19 @@
                  void))
 (defbjo (serve rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot")
   (def requests (make-request-inbox queue))
+  (def going-away (latch))
   (def app (new-app quiet static-dir))
   (install-inbox! app requests static-files)
   (ignore
    (with-scope
+     (watch-host! app going-away)
      (loop (:for i (range 0 workers))
-           (:do (spawn (worker rt requests))))
+           (:do (spawn (worker rt going-away requests))))
      (try
          (app-run app (str "http://" host ":" (int->string port)))
-       #:finally (inbox-close! requests)))))
+       #:finally (let ()
+                   (inbox-close! going-away)
+                   (inbox-close! requests))))))
 
 (: server-url (-> Server string))
 (defun (server-url s) (record-ref s url))
@@ -205,36 +284,148 @@
 ;; ===========================================================================
 
 ;; A worker fiber processing requests until the inbox is closed.
-(: worker (-bjo-> Router (Inbox (Call Ctx Unit)) Unit))
-(defbjo (worker rt requests)
+(: worker (-bjo-> Router (Inbox Unit) (Inbox (Call Ctx Unit)) Unit))
+(defbjo (worker rt going-away requests)
   (let go ()
     (match (sync (choose (wrap (inbox-recv requests) (fun (c) (Some c)))
                          (wrap (inbox-closed requests) (fun (e) None))))
       (None unit)
-      ((Some c) (answer rt c) (go)))))
+      ((Some c) (answer rt going-away c) (go)))))
 
-;; Processes a single request call, ensuring a response is always sent.
-(: answer (-bjo-> Router (Call Ctx Unit) void))
-(defbjo (answer rt c)
+;; Processes a single request call, ensuring it is always answered: here, or by
+;; the websocket session it was handed to.
+(: answer (-bjo-> Router (Inbox Unit) (Call Ctx Unit) void))
+(defbjo (answer rt going-away c)
+  (def handed-off (make-box #f))
   (try
-      (ignore (try (answer-now rt c) #:catch (System.Exception)))
-    #:finally (ignore (call-reply! c unit))))
+      (ignore (try (answer-now rt going-away c handed-off) #:catch (System.Exception)))
+    #:finally (unless (box-ref handed-off) (ignore (call-reply! c unit)))))
 
 ;; Executes the handler and writes the response.
 ;; Handles exceptions and client disconnections appropriately.
-(: answer-now (-bjo-> Router (Call Ctx Unit) Unit))
-(defbjo (answer-now rt c)
+(: answer-now (-bjo-> Router (Inbox Unit) (Call Ctx Unit) (Box bool) Unit))
+(defbjo (answer-now rt going-away c handed-off)
   (def ctx (call-request c))
   (def req (read-request ctx))
   (match (sync (choose (wrap (promise-join (bjo (handle rt req))) (fun (r) (Some r)))
                        (wrap (call-abandoned c) (fun (u) None))))
-    ((Some (Ok answer)) (write-response! ctx answer) unit)
+    ((Some (Ok answer))
+     (match (response-upgrade answer)
+       (None (write-response! ctx answer))
+       ((Some up) (upgrade-or-refuse! ctx req c answer up going-away handed-off)))
+     unit)
     ;; The handler raised. What it said goes to the log, not to the page.
     ((Some (Err e)) (log (str "bjoweb: " (request-method req) " " (request-path req)
                               " raised: " (.-Message e)))
                     (write-response! ctx (server-error))
                     unit)
     (None unit)))
+
+;; ===========================================================================
+;; A websocket
+;; ===========================================================================
+
+;; Hands the call to a session fiber, or answers why it cannot be upgraded.
+;;
+;; `handed-off` is set only once the session fiber is running. A scope that has
+;; begun closing refuses a new fiber, and then the call is still this worker's
+;; to answer.
+(: upgrade-or-refuse! (-bjo-> Ctx Request (Call Ctx Unit) Response Upgrade (Inbox Unit) (Box bool)
+                              void))
+(defbjo (upgrade-or-refuse! ctx req c answer up going-away handed-off)
+  (match (handshake-refusal ctx req)
+    ((Some refusal) (write-response! ctx refusal))
+    (None
+     (def started (latch))
+     (def session (bjo (run-session ctx c req answer up going-away started)))
+     (when (sync (choose (wrap (inbox-closed started) (fun (e) #t))
+                         (wrap (promise-join session) (fun (r) #f))))
+       (box-set! handed-off #t)))))
+
+;; Why a request that reached a websocket route cannot be upgraded, as the
+;; answer to send instead, or `None` when it can.
+(: handshake-refusal (-> Ctx Request (Option Response)))
+(defun (handshake-refusal ctx req)
+  (cond
+    ((not (and (= (request-method req) "GET")
+               (string-contains? (string-downcase (request-header-or req "connection" "")) "upgrade")
+               (= (string-downcase (request-header-or req "upgrade" "")) "websocket")
+               (upgradable? (upgrade-feature (ctx-features ctx)))))
+     (Some (upgrade-required)))
+    ((not (= (request-header-or req "sec-websocket-version" "") "13"))
+     (Some (with-header (upgrade-required) "Sec-WebSocket-Version" "13")))
+    ((not (key-ok? (request-header-or req "sec-websocket-key" "")))
+     (Some (bad-request "Sec-WebSocket-Key is not 16 bytes of base64")))
+    (else None)))
+
+(: upgrade-required (-> Response))
+(defun (upgrade-required)
+  (respond 426 "426 Upgrade Required\n" #:headers [(Tuple "Upgrade" "websocket")]))
+
+(: key-ok? (-> string bool))
+(defun (key-ok? key)
+  (match (from-base64 key)
+    ((Ok bytes) (= (array-length bytes) 16))
+    ((Err e) #f)))
+
+;; For `peer-address`: the client's address and port, or `""`.
+(: peer-of (-> Ctx string))
+(defun (peer-of ctx)
+  (def info (ctx-connection ctx))
+  (match (cast Object (remote-ip info))
+    ((:is System.Net.IPAddress ip) (str (.ToString ip) ":" (int->string (remote-port info))))
+    (_ "")))
+
+;; Answers the call once the socket is over, which is what hands the connection
+;; back to Kestrel.
+(: run-session (-bjo-> Ctx (Call Ctx Unit) Request Response Upgrade (Inbox Unit) (Inbox Unit) void))
+(defbjo (run-session ctx c req answer up going-away started)
+  (inbox-close! started)
+  (try
+      (match (try (session-now ctx c req answer up going-away) #:catch (System.Exception))
+        ((Ok u) unit)
+        ((Err e) (log (str "bjoweb: websocket " (request-path req) " failed: " (.-Message e)))))
+    #:finally (ignore (call-reply! c unit))))
+
+;; What ended a session first.
+(type (: Ending (Union (SessionReturned (Result Exception Unit))
+                       SocketClosed
+                       ServerStopping)))
+
+;; Sends the `101`, runs the session on the socket, and closes it: with 1000
+;; when the session returns, 1011 when it raises, and 1001 when the server is
+;; stopping. A session still running once the socket has closed is cancelled.
+(: session-now (-bjo-> Ctx (Call Ctx Unit) Request Response Upgrade (Inbox Unit) void))
+(defbjo (session-now ctx c req answer up going-away)
+  (def protocol (record-ref up protocol))
+  (def session (record-ref up session))
+  (def headers (out-headers (ctx-response ctx)))
+  (loop (:for h (response-headers answer))
+        (:do (match h
+               ((Tuple name value) (header-add! headers name (Values. value))))))
+  (header-add! headers "Upgrade" (Values. "websocket"))
+  (header-add! headers "Sec-WebSocket-Accept"
+               (Values. (websocket-accept-key (request-header-or req "sec-websocket-key" ""))))
+  (unless (string-empty? protocol)
+    (header-add! headers "Sec-WebSocket-Protocol" (Values. protocol)))
+  (with-cancel (stop)
+    (def ws (match (stream->ports (upgrade! (upgrade-feature (ctx-features ctx))) #:peer (peer-of ctx))
+              ((Tuple in out)
+               (ports->websocket in out #:protocol protocol
+                                 #:max-message (record-ref up max-message)
+                                 #:keep-alive (record-ref up keep-alive)))))
+    (def running (bjo (session ws)))
+    (match (sync (choose (wrap (promise-join running) (fun (r) (SessionReturned r)))
+                         (wrap (websocket-closed ws) (fun (s) SocketClosed))
+                         (wrap (call-abandoned c) (fun (u) SocketClosed))
+                         (wrap (inbox-closed going-away) (fun (e) ServerStopping))))
+      ((SessionReturned (Ok u)) (websocket-close! ws))
+      ((SessionReturned (Err e))
+       (log (str "bjoweb: websocket " (request-path req) " raised: " (.-Message e)))
+       (websocket-close! ws #:code 1011 #:reason "internal error"))
+      (ServerStopping (websocket-close! ws #:code 1001 #:reason "the server is stopping"))
+      (SocketClosed unit))
+    (stop (Requested "the websocket is closed"))))
 
 ;; ===========================================================================
 ;; HttpContext -> Request

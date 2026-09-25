@@ -2,4 +2,4 @@
 * DONE Form data and multipart parsing
 * TODO Streaming and chunked bodies
 * DONE Middleware / request pipeline
-* TODO Websockets
+* DONE Websockets

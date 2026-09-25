@@ -41,10 +41,10 @@ For more details, see ~(std inbox)~.
 
 | Module            | What is in it                                       | ASP.NET? |
 |-------------------+-----------------------------------------------------+----------|
-| ~(bjoweb core)~   | ~Request~, ~Response~ and the functions over them    | no       |
+| ~(bjoweb core)~   | ~Request~, ~Response~, ~websocket~ and the functions over them | no |
 | ~(bjoweb router)~ | routes, patterns, matching                           | no       |
 | ~(bjoweb html)~   | SXML as a literal, escaping, rendering               | no       |
-| ~(bjoweb server)~ | Kestrel, the inbox, the workers, the two conversions | all of it |
+| ~(bjoweb server)~ | Kestrel, the inbox, the workers, the two conversions, the upgrade | all of it |
 
 Two thirds of this package never name an ASP.NET type, which is why two thirds
 of it can be unit-tested with no socket anywhere:
@@ -122,6 +122,71 @@ Because `pipeline` takes a target handler followed by a variable number of middl
 #+END_SRC
 
 Here, `logger` wraps `auth`, which wraps `home`. The request flows through `logger`, then `auth`, then `home`.
+
+** Websockets
+
+A websocket is a kind of answer. A handler that returns ~(websocket session)~
+has decided to accept, and ~session~ runs on the socket:
+
+#+BEGIN_SRC scheme
+(import (net websocket protocol))
+
+(: echo (-bjo-> WebSocket void))
+(defbjo (echo ws)
+  (let go ()
+    (match (websocket-next ws)
+      ((Some m) (ignore (websocket-send! ws m)) (go))
+      (None unit))))
+
+(router
+  (route-get "/echo" (fun (req) (websocket echo)))
+  (route-get "/chat" (pipeline (fun (req) (websocket chat #:protocol "chat")) require-login)))
+#+END_SRC
+
+The socket itself is ~(net websocket protocol)~'s — the [[https://github.com/bjoli/websocket][~(net websocket)~]]
+package, which bjoweb depends on — and the same one ~websocket-connect~ in
+~(net websocket client)~ gives a client:
+
+| ~(websocket-next ws)~          | the next message, or ~None~ once the socket has closed |
+| ~(websocket-recv ws)~          | the same as an event, for a ~choose~               |
+| ~(websocket-send! ws m)~       | ~(TextMessage s)~ or ~(BinaryMessage bytes)~; ~#f~ once closed |
+| ~(websocket-close! ws #:code 1000 #:reason "")~ | the close handshake, waited for |
+| ~(websocket-closed ws)~        | an event that fires with the ~CloseStatus~ once it is over |
+
+Because the upgrade is a ~Response~, whatever runs before it works as it does
+for any route: a middleware that answers 401 refuses the socket before it is
+opened, and ~with-header~ adds a header to the ~101~. Check ~Origin~ there —
+browsers apply no CORS to a websocket, so any page can open one to your server
+with your user's cookies.
+
+A request to a websocket route that is not a websocket handshake gets ~426~,
+or ~400~ for a malformed key, and the session is never called.
+
+*** Where a session runs
+
+Not on a worker. The worker hands the request to a fiber of its own and goes
+back to the queue, so a thousand open sockets hold no workers, and the request
+is answered — which is what hands the connection back to Kestrel — when the
+socket is over. The session has the environment of the fiber that started the
+server, as a handler has.
+
+- *The session returns:* the socket is closed with 1000.
+- *The session raises:* it is logged, and the socket is closed with 1011.
+- *The client closes, or goes away:* the session is cancelled. Leaving a room
+  belongs in ~#:finally~, and anything there that waits in a ~with-shield~.
+- *The server stops* — ~stop-server!~, or Ctrl-C under ~serve~: every socket is
+  closed with 1001. Kestrel's stop waits for the requests in flight, and an
+  open socket is one, so without this it would wait out the host's shutdown
+  timeout.
+
+~websocket~ takes ~#:protocol~, the ~Sec-WebSocket-Protocol~ to answer with;
+~#:max-message~, the largest message after reassembly, 1 MiB unless told
+otherwise, above which the socket is closed with 1009; and ~#:keep-alive~, how
+many idle milliseconds before a ping, 30 seconds unless told otherwise.
+
+A session is ordinary Bjolang over ~(net websocket protocol)~, so it can be tested with
+no server: ~ports->websocket~ over two ~byte-pipe~ s is a socket with nothing
+underneath. ~examples/chat.bjo~ is a chat room, page included.
 
 ** HTML
 
@@ -272,8 +337,8 @@ You can opt into serving static files using Kestrel's highly optimized built-in 
 ** What this is not
 
 No dependency injection, no configuration system, no authentication, no content
-negotiation, no TLS, no HTTP/2, no websockets, no streaming bodies. Kestrel can
-do all of those and none of them is here.
+negotiation, no TLS, no HTTP/2, no streaming bodies. Kestrel can do all of those
+and none of them is here. Websockets are, without the compression extension.
 
 ~(bjoweb server)~ exports ~Ctx~ — the ~HttpContext~ type itself — so a program
 that needs one of them can reach for it, and so that reaching for it is visible.
@@ -287,6 +352,10 @@ It is an ordinary ~bjo~ package. From a project of your own:
   (package (name (bjoweb)) (source (path (dir "../bjoweb")))))
 #+END_SRC
 
+bjoweb depends on [[https://github.com/bjoli/websocket][~(net websocket)~]], for now as
+a path source: a checkout of it has to sit beside bjoweb's, at ~../websocket~.
+It needs a Bjolang whose ~(std net)~ has ~stream->ports~.
+
 Note that *the ASP.NET runtime has to be installed wherever the program runs*.
 Not just where it is built: a framework-dependent program asks the host for
 ~Microsoft.AspNetCore.App~ at startup. The Docker image ~dotnet/runtime~ does
@@ -296,7 +365,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 33 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 27 checks, a real socket
+bjo run tests/demo.bjo    ;; 37 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
@@ -305,7 +374,7 @@ escaping in text and in attribute values, that an attribute value never gains a
 newline, computed content through ~,~, ~raw~, fragments, and the document and
 response wrappers.
 
-Twenty-seven checks: the routing table on its own, then a real Kestrel on a port
+Thirty-seven checks: the routing table on its own, then a real Kestrel on a port
 the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
 query strings, request headers, a POST body, a suspending handler, a handler
 that raises, the 404 and the 405, a redirect, and twelve requests at once
@@ -316,6 +385,13 @@ server with one worker and one queue slot, to see that six at once come back
 It also checks the thing this framework is for: a parameter installed around
 ~start-server~ is readable inside a handler. Kestrel's thread never had it.
 
+Then websockets, with ~websocket-connect~ as the client: an echo of text and
+binary, a session that returns and one that raises, a subprotocol, a middleware
+refusing before the upgrade and letting the right request through, ~426~ for a
+plain GET, six sockets held open through four workers while a plain request is
+still served — and a third server stopped with a socket open, which has to close
+it with 1001 rather than wait for it.
+
 ** Planned features
 
-Websockets. 
+Streaming and chunked bodies.

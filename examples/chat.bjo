@@ -1,0 +1,87 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/examples/chat.bjo — a chat room over websockets.
+;;
+;;     bjo run examples/chat.bjo
+;;     open http://127.0.0.1:8080/ in two browser tabs
+;;
+;; Everything one client says, every client hears. The room is a fiber of its
+;; own, and each session tells it when a client comes and goes. Ctrl-C closes
+;; every open socket with 1001 and stops.
+
+(import (std prelude))
+(import (std inbox))
+(import (net websocket protocol))
+(import (bjoweb core))
+(import (bjoweb router))
+(import (bjoweb server))
+
+;; What the room is told.
+(type (: Note (Union (Joined (Inbox string))
+                     (Left (Inbox string))
+                     (Said string))))
+
+;; The room keeps one inbox per client and posts every line to each of them.
+;; A post never waits, so a client that has stopped reading loses its oldest
+;; lines instead of holding up everyone else.
+(: room (-bjo-> (Inbox Note) Unit))
+(defbjo (room notes)
+  (let go ((members (list)))
+    (match (sync (inbox-recv notes))
+      ((Joined m) (go (cons m members)))
+      ((Left m) (go (list-filter (fun (x) (not (eq? x m))) members)))
+      ((Said line)
+       (list-for-each (fun (m) (ignore (inbox-post! m line))) members)
+       (go members)))))
+
+;; What woke a session.
+(type (: Turn (Union (FromClient Message) (FromRoom string) Gone)))
+
+;; One client. The session is cancelled once its socket has closed, so leaving
+;; the room is in `#:finally`, and is a post, which does not wait.
+(: chatter (-> (Inbox Note) Session))
+(defun (chatter notes)
+  (bjoroutine (ws)
+    (def mine (make-inbox 32 DropOldest))
+    (ignore (inbox-post! notes (Joined mine)))
+    (try
+        (let go ()
+          (match (sync (choose (wrap (websocket-recv ws) (fun (m) (FromClient m)))
+                               (wrap (inbox-recv mine) (fun (line) (FromRoom line)))
+                               (wrap (websocket-closed ws) (fun (s) Gone))))
+            ((FromClient (TextMessage line)) (ignore (inbox-post! notes (Said line))) (go))
+            ((FromClient (BinaryMessage bytes)) (go))
+            ((FromRoom line) (ignore (websocket-send! ws (TextMessage line))) (go))
+            (Gone unit)))
+      #:finally (ignore (inbox-post! notes (Left mine))))))
+
+(def page "<!doctype html>
+<meta charset=\"utf-8\">
+<title>bjoweb chat</title>
+<ul id=\"log\"></ul>
+<input id=\"say\" autofocus placeholder=\"say something\">
+<script>
+  const ws = new WebSocket(\"ws://\" + location.host + \"/chat\");
+  ws.onmessage = e => {
+    const li = document.createElement(\"li\");
+    li.textContent = e.data;
+    log.append(li);
+  };
+  ws.onclose = e => say.placeholder = \"closed: \" + e.code + \" \" + e.reason;
+  say.onkeydown = e => {
+    if (e.key === \"Enter\" && say.value) { ws.send(say.value); say.value = \"\"; }
+  };
+</script>
+")
+
+(defbjo (main args)
+  (def notes (make-inbox 256 DropNewest))
+  ;; A daemon: it never ends on its own, and `main` must not wait for it.
+  (spawn/daemon (room notes))
+  (serve (router
+           (route-get "/"     (fun (req) (html page)))
+           (route-get "/chat" (fun (req) (websocket (chatter notes)))))
+         #:port 8080)
+  0)

@@ -27,6 +27,8 @@
 (import (bjoweb core))
 (import (bjoweb router))
 (import (bjoweb server))
+(import (net websocket protocol))
+(import (net websocket client))
 
 ;; ---------------------------------------------------------------------------
 ;; A free port, chosen here
@@ -120,8 +122,40 @@
 (defbjo (boom req)
   (raise (cast Exception (Boom. "the handler exploded"))))
 
+;; --- Websocket sessions ------------------------------------------------------
+
+(: echo-session (-bjo-> WebSocket void))
+(defbjo (echo-session ws)
+  (let go ()
+    (match (websocket-next ws)
+      ((Some m) (ignore (websocket-send! ws m)) (go))
+      (None unit))))
+
+;; Says one thing and returns, which closes the socket. What it says comes from
+;; the environment of the fiber that started the server, as a handler's would.
+(: greet-session (-bjo-> WebSocket void))
+(defbjo (greet-session ws)
+  (ignore (websocket-send! ws (TextMessage (str "hello " (parameter-ref greeting))))))
+
+(: failing-session (-bjo-> WebSocket void))
+(defbjo (failing-session ws)
+  (raise (cast Exception (Boom. "the session exploded"))))
+
+;; A middleware in front of a websocket route, deciding before the upgrade.
+(: require-token (-> Handler Handler))
+(defun (require-token next)
+  (bjoroutine (req)
+    (if (= (request-header-or req "x-token" "") "secret")
+        (next req)
+        (respond 401 "401 Unauthorized\n"))))
+
 (def app
   (router
+    (route-get    "/ws/echo"      (fun (req) (websocket echo-session)))
+    (route-get    "/ws/greet"     (fun (req) (websocket greet-session)))
+    (route-get    "/ws/boom"      (fun (req) (websocket failing-session)))
+    (route-get    "/ws/chat"      (fun (req) (websocket echo-session #:protocol "chat")))
+    (route-get    "/ws/private"   (pipeline (fun (req) (websocket echo-session)) require-token))
     (route-get    "/"             home)
     (route-get    "/hello/:name"  greet)
     (route-get    "/slow"         slow)
@@ -201,6 +235,82 @@
         (:acc out (vecing (match (sync (promise-join p))
                             ((Ok (Tuple code body)) body)
                             ((Err e) (.-Message e)))))))
+
+;; ---------------------------------------------------------------------------
+;; A websocket client
+;; ---------------------------------------------------------------------------
+
+(: bytes->text (-> (Array byte) string))
+(defun (bytes->text bs)
+  (loop (:for i (range 0 (array-length bs)))
+        (:acc acc (folding "" (str acc (byte->string (array-ref bs i)) ".")))))
+
+(: shown (-> (Option Message) string))
+(defun (shown m)
+  (match m
+    ((Some (TextMessage t)) (str "text:" t))
+    ((Some (BinaryMessage b)) (str "binary:" (bytes->text b)))
+    (None "none")))
+
+(: status-text (-> CloseStatus string))
+(defun (status-text s) (str (int->string (close-code s)) ":" (close-reason s)))
+
+;; Text and binary out and back, then an orderly close.
+(: ws-echo (-bjo-> string (Vec (Tuple string string)) string))
+(defbjo (ws-echo url headers)
+  (with-scope
+    (match (websocket-connect url #:headers headers)
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok ws)
+       (ignore (websocket-send! ws (TextMessage "hi")))
+       (ignore (websocket-send! ws (BinaryMessage #[1 2 3])))
+       (def a (shown (websocket-next ws)))
+       (def b (shown (websocket-next ws)))
+       (websocket-close! ws)
+       (str a "|" b "|" (status-text (sync (websocket-closed ws))))))))
+
+;; Everything the server says until it closes, and how it closed.
+(: ws-listen (-bjo-> string string))
+(defbjo (ws-listen url)
+  (with-scope
+    (match (websocket-connect url)
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok ws)
+       (let go ((said ""))
+         (match (websocket-next ws)
+           ((Some m) (go (str said (shown (Some m)) "|")))
+           (None (str said (status-text (sync (websocket-closed ws)))))))))))
+
+(: ws-protocol (-bjo-> string string))
+(defbjo (ws-protocol url)
+  (with-scope
+    (match (websocket-connect url #:protocols ["superchat" "chat"])
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok ws)
+       (websocket-close! ws)
+       (websocket-protocol ws)))))
+
+;; `n` sockets held open at once — more than there are workers — then a plain
+;; request, then one message on each. A session that held a worker would leave
+;; none for the rest.
+(: many-sockets (-bjo-> string string int string))
+(defbjo (many-sockets ws-url http-url n)
+  (with-scope
+    (def sockets (loop (:for i (range 0 n))
+                       (:acc out (vecing (websocket-connect ws-url)))))
+    (def plain (match (body-of http-url) ((Tuple code body) (int->string code))))
+    (def answers
+      (loop (:for i (range 0 n))
+            (:acc out (vecing (match (vec-ref sockets i)
+                                ((Ok ws)
+                                 (ignore (websocket-send! ws (TextMessage (int->string i))))
+                                 (shown (websocket-next ws)))
+                                ((Err e) (.-Message e)))))))
+    (loop (:for s sockets)
+          (:do (match s
+                 ((Ok ws) (websocket-close! ws))
+                 ((Err e) unit))))
+    (str (string-join answers ",") "|" plain)))
 
 ;; ---------------------------------------------------------------------------
 ;; The routing table on its own, with no server anywhere
@@ -293,8 +403,62 @@
                                          (:acc out (vecing (str "hello, " (int->string i)))))
                                    "|"))
 
+              ;; --- websockets ---------------------------------------------
+              (def ws-base (str "ws://127.0.0.1:" (int->string port)))
+
+              (expect "a websocket echoes text and binary, and closes with 1000"
+                      (ws-echo (str ws-base "/ws/echo") (vec-empty))
+                      "text:hi|binary:1.2.3.|1000:")
+
+              (expect "a session that returns closes its socket, with the server's environment"
+                      (ws-listen (str ws-base "/ws/greet"))
+                      "text:hello from the fiber that started the server|1000:")
+
+              (expect "a session that raises closes its socket with 1011"
+                      (ws-listen (str ws-base "/ws/boom"))
+                      "1011:internal error")
+
+              (expect "the subprotocol the route chose"
+                      (ws-protocol (str ws-base "/ws/chat"))
+                      "chat")
+
+              (expect "a middleware refuses before the upgrade"
+                      (let ((said (ws-echo (str ws-base "/ws/private") (vec-empty))))
+                        (if (string-contains? said "401 Unauthorized") "401" said))
+                      "401")
+
+              (expect "and lets the right request through"
+                      (ws-echo (str ws-base "/ws/private") [(Tuple "X-Token" "secret")])
+                      "text:hi|binary:1.2.3.|1000:")
+
+              (expect "a plain GET to a websocket route is told to upgrade"
+                      (body-of (str base "/ws/echo"))
+                      (Tuple 426 "426 Upgrade Required\n"))
+
+              (expect "six open sockets through four workers, and plain requests still served"
+                      (many-sockets (str ws-base "/ws/echo") (str base "/") 6)
+                      "text:0,text:1,text:2,text:3,text:4,text:5|200")
+
               (expect "nothing was dropped" (server-dropped-count server) 0))
           #:finally (stop-server! server)))))
+
+  ;; --- stopping with a websocket open -------------------------------------
+  ;;
+  ;; Kestrel's stop waits for every request in flight, and an open socket is
+  ;; one. The server closes it with 1001 instead of waiting it out.
+  (def ws-port (free-port))
+  (with-scope
+    (let ((server (start-server app #:port ws-port #:workers 2)))
+      (def opened (websocket-connect (str "ws://127.0.0.1:" (int->string ws-port) "/ws/echo")))
+      (def before (now))
+      (stop-server! server)
+      (def took (- (now) before))
+      (expect "stopping the server closes an open websocket with 1001"
+              (match opened
+                ((Ok ws) (status-text (sync (websocket-closed ws))))
+                ((Err e) (str "refused: " (.-Message e))))
+              "1001:the server is stopping")
+      (expect-true "and does not wait for it to close on its own" (< took 3000))))
 
   ;; --- a queue that overflows ----------------------------------------------
   ;;

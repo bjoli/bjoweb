@@ -14,6 +14,13 @@
   ;; have it; `dotnet/aspnet` does.
   (frameworks "Microsoft.AspNetCore.App")
 
+  ;; The websocket protocol runs over the upgraded connection. A path source
+  ;; while both are worked on; a git source with a version once it is tagged,
+  ;; since a package fetched from git may not name a path.
+  (depends
+    (package (name (net websocket))
+             (source (path (dir "../websocket")))))
+
   ;; A library: there is no src/main.bjo, so `bjo build` builds every module
   ;; under src/ rather than a program.
   )

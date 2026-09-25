@@ -6,7 +6,9 @@
 ;;
 ;; Defines the core types `Request` and `Response`, and the `Handler` type
 ;; (-bjo-> Request Response). This module is independent of ASP.NET and can
-;; be used for testing without a web server.
+;; be used for testing without a web server. A websocket session is too: it is
+;; written against `(net websocket protocol)`, which runs as well over two byte
+;; pipes.
 
 (export
   ;; Core types. Transparent records for easy testing and manipulation.
@@ -27,11 +29,15 @@
   ;; Reading one, and adding to it.
   response-status response-content-type response-headers response-body
   with-status with-content-type with-header
-  
+
+  ;; Websockets: an upgrade is a kind of answer.
+  Session Upgrade websocket response-upgrade
+
   ;; Middleware pipeline
   pipeline)
 
 (import (std prelude))
+(import (net websocket protocol))
 
 ;; ---------------------------------------------------------------------------
 ;; A header, and the two records
@@ -52,12 +58,24 @@
                          (: form (Map string string))
                          (: body string))))
 
+;; What runs on an accepted websocket. The socket is closed when it returns.
+(type (: Session (-bjo-> WebSocket void)))
+
+;; A request to switch to the websocket protocol, made by `websocket`.
+;; `protocol` is sent back as `Sec-WebSocket-Protocol`, `""` for none.
+(type (: Upgrade (Record (: session Session)
+                         (: protocol string)
+                         (: max-message int)
+                         (: keep-alive int))))
+
 ;; Represents an HTTP response. The response is fully constructed in memory
-;; before being written to the client.
+;; before being written to the client. `upgrade` is `None` for everything but
+;; the answer `websocket` makes.
 (type (: Response (Record (: status int)
                           (: content-type string)
                           (: headers (Vec Header))
-                          (: body string))))
+                          (: body string)
+                          (: upgrade (Option Upgrade)))))
 
 ;; A bjoroutine that processes a request and returns a response.
 (type (: Handler (-bjo-> Request Response)))
@@ -138,7 +156,27 @@
 ;; Creates a base response. Other helpers build on this.
 (: respond (-> int string (#:content-type string) (#:headers (Vec Header)) Response))
 (defun (respond status body #:content-type "text/plain; charset=utf-8" #:headers (vec-empty))
-  (Response (status status) (content-type content-type) (headers headers) (body body)))
+  (Response (status status) (content-type content-type) (headers headers) (body body)
+            (upgrade None)))
+
+;; Accepts a websocket and runs `session` on it.
+;;
+;; A handler that returns this has decided to accept, so the checks a handler
+;; makes — authentication, `Origin`, which subprotocol — come first, and a
+;; middleware that answers 401 instead works as it does for any other route.
+;; A request that is not a websocket handshake is answered 426 or 400 without
+;; calling `session`. Headers added with `with-header` go out with the `101`.
+;;
+;; `#:max-message` bounds one message after reassembly; a bigger one closes the
+;; socket with 1009. `#:keep-alive` is how many idle milliseconds pass before a
+;; ping, 0 for none.
+(: websocket (-> Session (#:protocol string) (#:max-message int) (#:keep-alive int) Response))
+(defun (websocket session #:protocol "" #:max-message 1048576 #:keep-alive 30000)
+  (Response (status 101) (content-type "") (headers (vec-empty)) (body "")
+            (upgrade (Some (Upgrade (session session)
+                                    (protocol protocol)
+                                    (max-message max-message)
+                                    (keep-alive keep-alive))))))
 
 (: text (-> string (#:status int) Response))
 (defun (text body #:status 200) (respond status body))
@@ -188,6 +226,9 @@
 
 (: response-body (-> Response string))
 (defun (response-body r) (record-ref r body))
+
+(: response-upgrade (-> Response (Option Upgrade)))
+(defun (response-upgrade r) (record-ref r upgrade))
 
 ;; Helpers for modifying a response in a pipeline style.
 (: with-status (-> Response int Response))

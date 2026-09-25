@@ -19,6 +19,7 @@
 
   ;; Reading one.
   request-method request-path request-body
+  request-scheme request-host request-client
   request-query request-header request-param request-form
   request-query-or request-header-or request-param-or request-form-or
 
@@ -53,14 +54,19 @@
 
 ;; Represents an HTTP request.
 ;; Note: `headers` keys are lower-cased. `body` contains the fully read and
-;; UTF-8 decoded request body.
+;; UTF-8 decoded request body. `scheme`, `host` and `client` are what the
+;; client used, which behind a proxy is not what the connection says: see
+;; `request-client`.
 (type (: Request (Record (: method string)
                          (: path string)
                          (: query (Map string string))
                          (: headers (Map string string))
                          (: params (Map string string))
                          (: form (Map string string))
-                         (: body string))))
+                         (: body string)
+                         (: scheme string)
+                         (: host string)
+                         (: client string))))
 
 ;; What runs on an accepted websocket. The socket is closed when it returns.
 (type (: Session (-bjo-> WebSocket void)))
@@ -106,15 +112,22 @@
 ;; ---------------------------------------------------------------------------
 
 ;; Creates a new request. Route `params` are populated later by the router.
-(: make-request (-> string string (Map string string) (Map string string) string (Map string string) Request))
-(defun (make-request method path query headers body form)
+;; With no `#:host`, the host is the one in `headers`, as it is for a request
+;; that came straight from a client.
+(: make-request (-> string string (Map string string) (Map string string) string (Map string string)
+                    (#:scheme string) (#:host string) (#:client string)
+                    Request))
+(defun (make-request method path query headers body form #:scheme "http" #:host "" #:client "")
   (Request (method method)
            (path path)
            (query query)
            (headers headers)
            (params (map-empty))
            (form form)
-           (body body)))
+           (body body)
+           (scheme scheme)
+           (host (if (string-empty? host) (map-ref-or headers "host" "") host))
+           (client client)))
 
 ;; ---------------------------------------------------------------------------
 ;; Reading one
@@ -131,6 +144,27 @@
 ;; The body, or `""` when there was none.
 (: request-body (-> Request string))
 (defun (request-body r) (record-ref r body))
+
+;; `"http"` or `"https"`, as the client asked. A websocket handshake is one or
+;; the other too.
+(: request-scheme (-> Request string))
+(defun (request-scheme r) (record-ref r scheme))
+
+;; The host the client asked for, with its port if it gave one:
+;; `"example.com"`, `"127.0.0.1:8080"`. `""` when it named none.
+(: request-host (-> Request string))
+(defun (request-host r) (record-ref r host))
+
+;; The client's address, `"203.0.113.7"` or `"2001:db8::1"`, with no port.
+;; `""` when the connection has none.
+;;
+;; Behind a reverse proxy the connection is the proxy's, and what the client
+;; used — its address, `https`, the host it asked for — comes in
+;; `X-Forwarded-For`, `-Proto` and `-Host`. Anybody can send those, so the
+;; server believes them only from an address it was told is a proxy: see
+;; `#:trusted-proxies`. `request-header` still shows them as they came.
+(: request-client (-> Request string))
+(defun (request-client r) (record-ref r client))
 
 ;; Gets a decoded query parameter, or `None` if absent. Keeps the first value
 ;; if a parameter is provided multiple times.

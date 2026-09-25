@@ -82,9 +82,14 @@ Because handlers return a complete ~Response~ value, nothing is written to the c
 | ~(request-query req "page")~        | ~?page=2~, decoded, ~+~ counted as a space         |
 | ~(request-form req "email")~        | from an ~application/x-www-form-urlencoded~ body   |
 | ~(request-header req "Accept")~     | case-insensitive                                   |
+| ~(request-scheme req)~              | ~"http"~ or ~"https"~, as the client asked         |
+| ~(request-host req)~                | ~"example.com"~, with the port if there was one    |
+| ~(request-client req)~              | the client's address, ~"203.0.113.7"~, no port     |
 
-Each of the last four has an ~-or~ form taking a fallback:
-~(request-query-or req "page" "1")~.
+~request-param~, ~-query~, ~-form~ and ~-header~ each have an ~-or~ form
+taking a fallback: ~(request-query-or req "page" "1")~. The last three are what
+the client used, which behind a reverse proxy is not what the connection says;
+see Behind a proxy.
 
 *** Writing the response
 
@@ -224,7 +229,8 @@ Because the upgrade is a ~Response~, whatever runs before it works as it does
 for any route: a middleware that answers 401 refuses the socket before it is
 opened, and ~with-header~ adds a header to the ~101~. Check ~Origin~ there —
 browsers apply no CORS to a websocket, so any page can open one to your server
-with your user's cookies.
+with your user's cookies. ~examples/chat.bjo~ compares it with ~request-scheme~
+and ~request-host~, which are what the browser used, behind a proxy too.
 
 A request to a websocket route that is not a websocket handshake gets ~426~,
 or ~400~ for a malformed key, and the session is never called.
@@ -363,7 +369,8 @@ helper.
 
 #+BEGIN_SRC scheme
 ;; default values. Does not serve static files. 
-(serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot")
+(serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot"
+           #:trusted-proxies ["127.0.0.0/8" "::1"])
 #+END_SRC
 
 ~start-server~ and ~stop-server!~ are the pair for a program that has something
@@ -401,12 +408,68 @@ The framework listens to Kestrel's ~RequestAborted~ token to detect disconnected
 
 You can opt into serving static files using Kestrel's highly optimized built-in static file server. Pass `#:static-files #t` to `serve` or `start-server`. By default, Kestrel will serve files out of a `wwwroot` directory in the current working directory, but you can override this by passing a different folder name to `#:static-dir`.
 
+*** Behind a proxy
+
+bjoweb speaks plain HTTP/1.1: no TLS, no HTTP/2. Facing the public, it belongs
+behind a reverse proxy that does both. Caddy, for one, gets its certificates
+itself and speaks HTTP/2 and HTTP/3 to the browser.
+
+#+BEGIN_SRC
+chat.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+#+END_SRC
+
+With the proxy on the same machine, keep the default ~#:host "127.0.0.1"~, so
+that nothing reaches the server except through it.
+
+The connection is then the proxy's, and what the client used arrives in
+~X-Forwarded-For~, ~X-Forwarded-Proto~ and ~X-Forwarded-Host~ — which anybody
+can send. So the server believes them only from a *trusted proxy*: loopback
+unless told otherwise, which is right for a proxy on the same machine. A proxy
+elsewhere has to be named:
+
+#+BEGIN_SRC scheme
+(serve app #:host "0.0.0.0" #:trusted-proxies ["10.0.0.0/8" "fd00::/8"])
+#+END_SRC
+
+Each is an address or a network with a prefix length; a host name, or anything
+else that is neither, stops ~serve~ or ~start-server~ with an
+~ArgumentException~. ~[]~ trusts nobody.
+
+- ~(request-client req)~ :: ~X-Forwarded-For~, read from the right. Every proxy
+  on the way appends the address it was reached from, so the first address
+  from the right that is not a trusted proxy is the client, and whatever is
+  left of it the client may have written itself.
+- ~(request-scheme req)~ and ~(request-host req)~ :: ~X-Forwarded-Proto~ and
+  ~X-Forwarded-Host~, or the connection and the ~Host~ header when the proxy
+  sends none.
+
+From anywhere else, the three headers are ignored, and the three functions say
+what the connection says. ~request-header~ shows the headers as they came
+either way, so the client is ~request-client~'s answer, not the header's. The
+~Forwarded~ header of RFC 7239 is not read.
+
+Trusting a proxy means trusting it to set all three, rather than pass on what
+the client sent. Caddy does. nginx sets only the ones its configuration tells
+it to, and passes the others on as they came.
+
+The host is the client's to choose, behind a proxy or not, as the ~Host~
+header always was. A link that goes out by email is better built from a name
+the program knows.
+
+Through Caddy, a streamed body goes out as it is written, because Caddy flushes
+a response of unknown length at once. A websocket is proxied too, and closed
+when Caddy reloads its configuration, so a page that keeps one open should
+reconnect.
+
 ** What this is not
 
 No dependency injection, no configuration system, no authentication, no content
 negotiation, no TLS, no HTTP/2, no streamed request bodies. Kestrel can do all
-of those and none of them is here. Websockets are, without the compression
-extension, and so are streamed response bodies.
+of those and none of them is here; a reverse proxy in front does TLS and HTTP/2
+(see Behind a proxy). Websockets are here, without the compression extension,
+and so are streamed response bodies.
 
 ~(bjoweb server)~ exports ~Ctx~ — the ~HttpContext~ type itself — so a program
 that needs one of them can reach for it, and so that reaching for it is visible.
@@ -437,7 +500,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 33 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 58 checks, a real socket
+bjo run tests/demo.bjo    ;; 66 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
@@ -446,7 +509,7 @@ escaping in text and in attribute values, that an attribute value never gains a
 newline, computed content through ~,~, ~raw~, fragments, and the document and
 response wrappers.
 
-Fifty-eight checks: the routing table on its own, then a real Kestrel on a port
+Sixty-six checks: the routing table on its own, then a real Kestrel on a port
 the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
 query strings, request headers, a POST body, a suspending handler, a handler
 that raises, the 404 and the 405, a redirect, and twelve requests at once
@@ -472,6 +535,12 @@ wait for it, the stream is cut off rather than ended, and its writer stops.
 
 It also checks the thing this framework is for: a parameter installed around
 ~start-server~ is readable inside a handler. Kestrel's thread never had it.
+
+The test's client is on loopback, so to the first server it is a trusted proxy:
+its ~X-Forwarded-*~ are believed, but not an address written left of the one
+it added, and a trusted proxy further out is looked past. A server told to
+trust only other networks ignores the same headers, and one told to trust a
+host name does not start.
 
 Then websockets, with ~websocket-connect~ as the client: an echo of text and
 binary, a session that returns and one that raises, a subprotocol, a middleware

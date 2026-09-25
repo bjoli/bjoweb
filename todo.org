@@ -8,3 +8,4 @@
 ** TODO The request body as bytes, #:max-body, streamed uploads
 * DONE Middleware / request pipeline
 * DONE Websockets
+* DONE Behind a proxy: request-scheme/host/client, X-Forwarded-* from #:trusted-proxies

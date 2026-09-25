@@ -127,6 +127,10 @@
 (defbjo (from-the-environment req)
   (text (parameter-ref greeting)))
 
+(: who-asked (-bjo-> Request Response))
+(defbjo (who-asked req)
+  (text (str (request-scheme req) " " (request-host req) " " (request-client req))))
+
 ;; Raises. The framework turns it into a 500 whose body says nothing about it.
 (: boom (-bjo-> Request Response))
 (defbjo (boom req)
@@ -243,6 +247,7 @@
     (route-get    "/headers"      show-header)
     (route-get    "/static/*path" show-rest)
     (route-get    "/environment"  from-the-environment)
+    (route-get    "/whoami"       who-asked)
     (route-get    "/boom"         boom)
     ;; An ordinary lambda in a slot declared `(-bjo-> ...)`: the compiler lifts
     ;; it, so a handler that never suspends needs no `defbjo` of its own.
@@ -338,6 +343,13 @@
             (n (match (response-header r "content-length") ((Some v) v) (None "-"))))
        (ignore r)
        (str (int->string code) " " n)))))
+
+;; What `/whoami` says to a request with these headers: the scheme, the host
+;; and the client.
+(: who (-bjo-> string (Vec (Tuple string string)) string))
+(defbjo (who base headers)
+  (match (fetched (get (str base "/whoami") #:headers headers))
+    ((Tuple code body) body)))
 
 ;; ---------------------------------------------------------------------------
 ;; The bytes on the wire
@@ -549,6 +561,10 @@
   (expect "nothing claims it"      (what-happens "GET" "/nowhere") "404")
   (expect "the wrong verb"         (what-happens "PUT" "/") "405 GET")
   (expect "HEAD is served by GET"  (what-happens "HEAD" "/") "matched ")
+  (expect "a request made by hand is for the host in its headers"
+          (request-host (make-request "GET" "/" (map-empty) (map-set (map-empty) "host" "example.com")
+                                      "" (map-empty)))
+          "example.com")
 
   ;; --- and now a real socket -----------------------------------------------
   (def port (free-port))
@@ -604,6 +620,34 @@
 
               (expect "a status with no body"
                       (fetched (request http/DELETE (str base "/thing"))) (Tuple 204 ""))
+
+              ;; --- who asked ----------------------------------------------
+              ;; This client is on loopback, which is a trusted proxy unless
+              ;; the server is told otherwise.
+              (def here (str "127.0.0.1:" (int->string port)))
+
+              (expect "with no proxy, what the connection says"
+                      (who base (vec-empty)) (str "http " here " 127.0.0.1"))
+
+              (expect "a proxy on loopback is believed"
+                      (who base [(Tuple "X-Forwarded-For" "203.0.113.7")
+                                 (Tuple "X-Forwarded-Proto" "https")
+                                 (Tuple "X-Forwarded-Host" "example.com")])
+                      "https example.com 203.0.113.7")
+
+              (expect "but not about what the client wrote left of the proxy's entry"
+                      (who base [(Tuple "X-Forwarded-For" "198.51.100.1, 203.0.113.7")])
+                      (str "http " here " 203.0.113.7"))
+
+              (expect "a trusted proxy further out is looked past, and its word taken"
+                      (who base [(Tuple "X-Forwarded-For" "203.0.113.7, 127.0.0.2")
+                                 (Tuple "X-Forwarded-Proto" "https, http")
+                                 (Tuple "X-Forwarded-Host" "example.com, inner.local")])
+                      "https example.com 203.0.113.7")
+
+              (expect "an address written with a port, and IPv6"
+                      (who base [(Tuple "X-Forwarded-For" "[2001:db8::1]:4711")])
+                      (str "http " here " 2001:db8::1"))
 
               ;; --- bodies -------------------------------------------------
               (expect "text goes out as UTF-8 with no byte order mark"
@@ -781,6 +825,33 @@
             (expect "it serves normally once the queue has drained"
                     (body-of busy-base) (Tuple 200 "done")))
         #:finally (stop-server! server))))
+
+  ;; --- a proxy that is not trusted -------------------------------------------
+  ;;
+  ;; A server told to trust other networks, and not loopback, ignores what this
+  ;; client says it is forwarding.
+  (def wary-port (free-port))
+  (with-scope
+    (let ((server (start-server app #:port wary-port #:workers 1
+                                #:trusted-proxies ["10.0.0.0/8" "2001:db8::/32"])))
+      (try
+          (expect "from anywhere else, X-Forwarded-* is ignored"
+                  (who (str "http://127.0.0.1:" (int->string wary-port))
+                       [(Tuple "X-Forwarded-For" "203.0.113.7")
+                        (Tuple "X-Forwarded-Proto" "https")
+                        (Tuple "X-Forwarded-Host" "example.com")])
+                  (str "http 127.0.0.1:" (int->string wary-port) " 127.0.0.1"))
+        #:finally (stop-server! server))))
+
+  ;; A name is not looked up: what it stands for may change once the server
+  ;; has started.
+  (expect "a trusted proxy given by name stops the start"
+          (with-scope
+            (match (try (start-server app #:port (free-port) #:trusted-proxies ["localhost"])
+                     #:catch (System.ArgumentException))
+              ((Ok server) (stop-server! server) "started")
+              ((Err e) "refused")))
+          "refused")
 
   (println "bjoweb ok")
   0)

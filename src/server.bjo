@@ -60,6 +60,12 @@
   (Features    (: Microsoft.AspNetCore.Http.Features.IFeatureCollection))
   (UpgradeFeature (: Microsoft.AspNetCore.Http.Features.IHttpUpgradeFeature))
   (ConnInfo    (: Microsoft.AspNetCore.Http.ConnectionInfo))
+  (Address     (: System.Net.IPAddress))
+  (Endpoint    (: System.Net.IPEndPoint))
+  ;; An address with a prefix length. Made with the whole length, it is the
+  ;; one address.
+  (Network     (: System.Net.IPNetwork (-> Address int Network)))
+  (Refusal     (: System.ArgumentException (-> string Refusal)))
   ;; A byte port over a stream it does not own, for the response body: nothing
   ;; registers it on a scope, so no scope's release writes to it with a
   ;; blocking call, and closing it leaves the stream to Kestrel.
@@ -130,8 +136,24 @@
                     (-> UpgradeFeature Stream) #:async #:uncancellable))
   (ctx-connection (: Microsoft.AspNetCore.Http.HttpContext.Connection (-> Ctx ConnInfo) #:get))
   (remote-ip     (: Microsoft.AspNetCore.Http.ConnectionInfo.RemoteIpAddress
-                    (-> ConnInfo System.Net.IPAddress) #:get))
+                    (-> ConnInfo Address) #:get))
   (remote-port   (: Microsoft.AspNetCore.Http.ConnectionInfo.RemotePort (-> ConnInfo int) #:get))
+
+  ;; --- Who asked ---
+  (in-scheme     (: Microsoft.AspNetCore.Http.HttpRequest.Scheme (-> Incoming string) #:get))
+  (try-address   (: System.Net.IPAddress.TryParse (-> string (out Address) (Option Address))))
+  ;; An address as `X-Forwarded-For` has it, which some proxies write with a
+  ;; port: `203.0.113.7:4711`, `[2001:db8::1]:4711`.
+  (try-endpoint  (: System.Net.IPEndPoint.TryParse (-> string (out Endpoint) (Option Endpoint))))
+  (endpoint-address (: System.Net.IPEndPoint.Address (-> Endpoint Address) #:get))
+  ;; Clears the bits past the prefix: `10.0.0.1/8` is `10.0.0.0/8`.
+  (try-network   (: System.Net.IPNetwork.TryParse (-> string (out Network) (Option Network))))
+  (in-network?   (: System.Net.IPNetwork.Contains (-> Network Address bool)))
+  ;; A server listening on IPv6 sees an IPv4 client as `::ffff:203.0.113.7`,
+  ;; which is in no IPv4 network.
+  (mapped?       (: System.Net.IPAddress.IsIPv4MappedToIPv6 (-> Address bool) #:get))
+  (to-ipv4       (: System.Net.IPAddress.MapToIPv4 (-> Address Address)))
+  (address-bytes (: System.Net.IPAddress.GetAddressBytes (-> Address (Array byte))))
 
   ;; --- Base .NET ---
   (utf8          (: System.Text.Encoding.UTF8 #:get))
@@ -166,6 +188,12 @@
              (: url string)
              (: port int))))
 
+;; What every worker serves with. `going-away` is the server's latch.
+(type
+  (: Serving (Record (: router Router)
+                     (: going-away (Inbox Unit))
+                     (: trusted (Vec Network)))))
+
 ;; The queue between Kestrel and the workers.
 ;;
 ;; Creates an inbox that drops the newest request if full (resulting in a 503).
@@ -199,6 +227,11 @@
 
 (: latch (-> (Inbox Unit)))
 (defun (latch) (make-inbox 1 DropNewest))
+
+;; What `#:trusted-proxies` is unless told otherwise: a proxy on the same
+;; machine.
+(: loopback (Vec string))
+(def loopback ["127.0.0.0/8" "::1"])
 
 ;; Starts a fiber that closes `going-away` when the host begins to stop.
 ;;
@@ -235,11 +268,19 @@
                 (fun (ctx next) (knock requests ctx next)))))
 
 ;; Starts the server asynchronously. Workers are spawned in the caller's scope.
+;;
+;; `#:trusted-proxies` are the addresses, and the networks as `10.0.0.0/8`,
+;; whose `X-Forwarded-*` headers are believed. Loopback unless told otherwise,
+;; for a proxy on the same machine. One that is neither is refused here, with
+;; an `ArgumentException`.
 (: start-server (-bjo-> Router
                         (#:port int) (#:host string) (#:workers int) (#:queue int)
                         (#:quiet bool) (#:static-files bool) (#:static-dir string)
+                        (#:trusted-proxies (Vec string))
                         Server))
-(defbjo (start-server rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot")
+(defbjo (start-server rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot"
+                      #:trusted-proxies loopback)
+  (def trusted (trusted-networks trusted-proxies))
   (def requests (make-request-inbox queue))
   (def going-away (latch))
   (def app (new-app quiet static-dir))
@@ -247,8 +288,9 @@
   (ignore (.Add (app-urls app) url))
   (install-inbox! app requests static-files)
   (watch-host! app going-away)
+  (def serving (Serving (router rt) (going-away going-away) (trusted trusted)))
   (loop (:for i (range 0 workers))
-        (:do (spawn (worker rt going-away requests))))
+        (:do (spawn (worker serving requests))))
   (app-start app)
   (Server (app app) (requests requests) (going-away going-away) (url url) (port port)))
 
@@ -265,17 +307,21 @@
 (: serve (-bjo-> Router
                  (#:port int) (#:host string) (#:workers int) (#:queue int)
                  (#:quiet bool) (#:static-files bool) (#:static-dir string)
+                 (#:trusted-proxies (Vec string))
                  void))
-(defbjo (serve rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot")
+(defbjo (serve rt #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot"
+               #:trusted-proxies loopback)
+  (def trusted (trusted-networks trusted-proxies))
   (def requests (make-request-inbox queue))
   (def going-away (latch))
   (def app (new-app quiet static-dir))
   (install-inbox! app requests static-files)
+  (def serving (Serving (router rt) (going-away going-away) (trusted trusted)))
   (ignore
    (with-scope
      (watch-host! app going-away)
      (loop (:for i (range 0 workers))
-           (:do (spawn (worker rt going-away requests))))
+           (:do (spawn (worker serving requests))))
      (try
          (app-run app (str "http://" host ":" (int->string port)))
        #:finally (let ()
@@ -297,30 +343,31 @@
 ;; ===========================================================================
 
 ;; A worker fiber processing requests until the inbox is closed.
-(: worker (-bjo-> Router (Inbox Unit) (Inbox (Call Ctx Unit)) Unit))
-(defbjo (worker rt going-away requests)
+(: worker (-bjo-> Serving (Inbox (Call Ctx Unit)) Unit))
+(defbjo (worker serving requests)
   (let go ()
     (match (sync (choose (wrap (inbox-recv requests) (fun (c) (Some c)))
                          (wrap (inbox-closed requests) (fun (e) None))))
       (None unit)
-      ((Some c) (answer rt going-away c) (go)))))
+      ((Some c) (answer serving c) (go)))))
 
 ;; Processes a single request call, ensuring it is always answered: here, or by
 ;; the websocket session it was handed to.
-(: answer (-bjo-> Router (Inbox Unit) (Call Ctx Unit) void))
-(defbjo (answer rt going-away c)
+(: answer (-bjo-> Serving (Call Ctx Unit) void))
+(defbjo (answer serving c)
   (def handed-off (make-box #f))
   (try
-      (ignore (try (answer-now rt going-away c handed-off) #:catch (System.Exception)))
+      (ignore (try (answer-now serving c handed-off) #:catch (System.Exception)))
     #:finally (unless (box-ref handed-off) (ignore (call-reply! c unit)))))
 
 ;; Executes the handler and writes the response.
 ;; Handles exceptions and client disconnections appropriately.
-(: answer-now (-bjo-> Router (Inbox Unit) (Call Ctx Unit) (Box bool) Unit))
-(defbjo (answer-now rt going-away c handed-off)
+(: answer-now (-bjo-> Serving (Call Ctx Unit) (Box bool) Unit))
+(defbjo (answer-now serving c handed-off)
+  (def going-away (record-ref serving going-away))
   (def ctx (call-request c))
-  (def req (read-request ctx))
-  (match (sync (choose (wrap (promise-join (bjo (handle rt req))) (fun (r) (Some r)))
+  (def req (read-request ctx (record-ref serving trusted)))
+  (match (sync (choose (wrap (promise-join (bjo (handle (record-ref serving router) req))) (fun (r) (Some r)))
                        (wrap (call-abandoned c) (fun (u) None))))
     ((Some (Ok answer))
      (match (response-body answer)
@@ -402,10 +449,9 @@
 ;; For `peer-address`: the client's address and port, or `""`.
 (: peer-of (-> Ctx string))
 (defun (peer-of ctx)
-  (def info (ctx-connection ctx))
-  (match (cast Object (remote-ip info))
-    ((:is System.Net.IPAddress ip) (str (.ToString ip) ":" (int->string (remote-port info))))
-    (_ "")))
+  (match (peer-ip ctx)
+    ((Some ip) (str (.ToString ip) ":" (int->string (remote-port (ctx-connection ctx)))))
+    (None "")))
 
 ;; Answers the call once the socket is over, which is what hands the connection
 ;; back to Kestrel.
@@ -526,8 +572,8 @@
 ;; HttpContext -> Request
 ;; ===========================================================================
 
-(: read-request (-bjo-> Ctx Request))
-(defbjo (read-request ctx)
+(: read-request (-bjo-> Ctx (Vec Network) Request))
+(defbjo (read-request ctx trusted)
   (def in (ctx-request ctx))
   (def body-text (read-body in))
   (def headers (collect-headers (cast (Seq (Pairing string Values)) (in-headers in))))
@@ -539,13 +585,16 @@
            (parse-query body-text)
            (map-empty)))
       (None (map-empty))))
-  (make-request (in-method in)
-                ;; The path text is already percent-decoded.
-                (text-or-empty (path-text (in-path in)))
-                (parse-query (text-or-empty (query-text (in-query in))))
-                headers
-                body-text
-                form-map))
+  (match (reached-as trusted ctx headers)
+    ((Tuple scheme host client)
+     (make-request (in-method in)
+                   ;; The path text is already percent-decoded.
+                   (text-or-empty (path-text (in-path in)))
+                   (parse-query (text-or-empty (query-text (in-query in))))
+                   headers
+                   body-text
+                   form-map
+                   #:scheme scheme #:host host #:client client))))
 
 ;; Reads the entire request body as a UTF-8 string.
 (: read-body (-bjo-> Incoming string))
@@ -590,6 +639,122 @@
   (substring/cursors s
                      (string-cursor-next s (string-cursor-start s))
                      (string-cursor-end s)))
+
+;; ===========================================================================
+;; Who asked, and how
+;; ===========================================================================
+;;
+;; Behind a reverse proxy the connection is the proxy's: its address, and the
+;; scheme it reached this server with. What the client used arrives in
+;; `X-Forwarded-For`, `-Proto` and `-Host`, which anybody can send, so they are
+;; believed only from a connection whose address is a trusted proxy's.
+
+;; `#:trusted-proxies`, parsed before the server starts: a typo there would
+;; otherwise trust nobody, or the wrong network, in silence.
+(: trusted-networks (-> (Vec string) (Vec Network)))
+(defun (trusted-networks names)
+  (loop (:for name names)
+        (:acc out (vecing (match (network-of (string-trim name))
+                            ((Some n) n)
+                            (None (raise (cast Exception
+                                               (Refusal. (str "bjoweb: #:trusted-proxies: \"" name
+                                                              "\" is neither an address nor a"
+                                                              " network such as 10.0.0.0/8"))))))))))
+
+;; An address stands for the network of that one address.
+(: network-of (-> string (Option Network)))
+(defun (network-of text)
+  (if (string-contains? text "/")
+      (try-network text)
+      (match (try-address text)
+        ((Some ip) (let ((plain (unmapped ip)))
+                     (Some (Network. plain (* 8 (array-length (address-bytes plain)))))))
+        (None None))))
+
+(: unmapped (-> Address Address))
+(defun (unmapped ip) (if (mapped? ip) (to-ipv4 ip) ip))
+
+(: trusted? (-> (Vec Network) Address bool))
+(defun (trusted? trusted ip)
+  (let go ((i 0))
+    (cond ((= i (vec-length trusted)) #f)
+          ((in-network? (vec-ref trusted i) ip) #t)
+          (else (go (+ i 1))))))
+
+(: peer-ip (-> Ctx (Option Address)))
+(defun (peer-ip ctx)
+  (match (cast Object (remote-ip (ctx-connection ctx)))
+    ((:is System.Net.IPAddress ip) (Some (unmapped ip)))
+    (_ None)))
+
+;; The scheme, the host and the client's address, in that order. A connection
+;; that is not a trusted proxy's speaks for itself, and `X-Forwarded-*` is
+;; ignored.
+(: reached-as (-> (Vec Network) Ctx (Map string string) (Tuple string string string)))
+(defun (reached-as trusted ctx headers)
+  (def scheme (in-scheme (ctx-request ctx)))
+  (def host (map-ref-or headers "host" ""))
+  (match (peer-ip ctx)
+    ((Some ip) (if (trusted? trusted ip)
+                   (forwarded trusted headers scheme host (.ToString ip))
+                   (Tuple scheme host (.ToString ip))))
+    (None (Tuple scheme host ""))))
+
+;; What a trusted proxy says. Every proxy on the way appends the address it was
+;; reached from to `X-Forwarded-For`, so read from the right the list can be
+;; believed for as long as its addresses are trusted proxies. The first that is
+;; not, or is not an address at all, is the client; anything left of it the
+;; client may have written itself.
+;;
+;; `-Proto` and `-Host` are read as many entries from the right, or as far as
+;; they go, since most proxies set them rather than append to them. A header
+;; that is missing leaves what the connection says: with no `X-Forwarded-For`,
+;; the proxy is the client.
+(: forwarded (-> (Vec Network) (Map string string) string string string (Tuple string string string)))
+(defun (forwarded trusted headers scheme host peer)
+  (match (client-in trusted (header-list headers "x-forwarded-for"))
+    ((Tuple client hops)
+     (Tuple (string-downcase (from-right (header-list headers "x-forwarded-proto") hops scheme))
+            (from-right (header-list headers "x-forwarded-host") hops host)
+            (if (string-empty? client) peer client)))))
+
+;; The client in a forwarded-for chain, and how many entries from the right it
+;; is. When every entry is a trusted proxy, the leftmost is as far as the chain
+;; can be believed. `""` for an empty chain.
+(: client-in (-> (Vec Network) (Vec string) (Tuple string int)))
+(defun (client-in trusted chain)
+  (def last (- (vec-length chain) 1))
+  (let go ((i last))
+    (if (< i 0)
+        (Tuple "" 0)
+        (let ((entry (vec-ref chain i)))
+          (match (hop-address entry)
+            ((Some ip) (if (and (> i 0) (trusted? trusted ip))
+                           (go (- i 1))
+                           (Tuple (.ToString ip) (- last i))))
+            (None (Tuple entry (- last i))))))))
+
+(: hop-address (-> string (Option Address)))
+(defun (hop-address entry)
+  (match (try-endpoint entry)
+    ((Some at) (Some (unmapped (endpoint-address at))))
+    (None None)))
+
+;; The entries of a header that is a comma-separated list. Two lines of one
+;; header arrive joined with a comma already.
+(: header-list (-> (Map string string) string (Vec string)))
+(defun (header-list headers name)
+  (vec-filter (fun (s) (not (string-empty? s)))
+              (vec-map string-trim (string-split (map-ref-or headers name "") ","))))
+
+;; The entry `n` from the right, the leftmost when there are fewer, and
+;; `fallback` when there are none.
+(: from-right (-> (Vec string) int string string))
+(defun (from-right entries n fallback)
+  (def at (- (- (vec-length entries) 1) n))
+  (cond ((= (vec-length entries) 0) fallback)
+        ((< at 0) (vec-ref entries 0))
+        (else (vec-ref entries at))))
 
 ;; ===========================================================================
 ;; Response -> HttpResponse

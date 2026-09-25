@@ -19,7 +19,7 @@
   ;; manifest's source wins.
   (depends
     (package (name (net websocket))
-             (version (version-at-least "0.1.0"))
+             (version (version-at-least "0.1.1"))
              (source (git (url "https://github.com/bjoli/websocket")))))
 
   ;; A library: there is no src/main.bjo, so `bjo build` builds every module

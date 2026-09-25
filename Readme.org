@@ -195,6 +195,57 @@ client sees the status at once.
 - *A ~HEAD~*, or a status that cannot have a body: the head goes out alone, and
   the writer is never called.
 
+*** Server-sent events
+
+For a browser's ~EventSource~: a stream of events, each of them sent whole.
+
+#+BEGIN_SRC scheme
+(: count-from (-> int (-bjo-> EventSink void)))
+(defun (count-from from)
+  (bjoroutine (es)
+    (let go ((n from))
+      (ignore (send-event! es (int->string n) #:id (int->string n)))
+      (ignore (sync (timeout 1000)))
+      (go (+ n 1)))))
+
+(router (route-get "/count" (fun (req) (event-stream (count-from 0)))))
+#+END_SRC
+
+| ~(event-stream writer)~                      | ~writer~ gets an ~EventSink~; ~text/event-stream~ |
+| ~(send-event! sink data #:event "" #:id "")~ | one event; ~#f~ once the stream is over          |
+
+~event-stream~ is a ~stream~ underneath, so its writer runs where a stream's
+does, and a writer that raises, a client that goes and a server that stops are
+dealt with as they are there. On top of that:
+
+- ~data~ with line breaks in it goes out as several ~data:~ lines, and arrives
+  as one string. A line break in ~#:event~ or ~#:id~ would begin a field of its
+  own, so ~send-event!~ refuses it with an ~ArgumentException~.
+- A comment goes out at once, so that the stream is seen to be open before
+  there is anything to say, even through a proxy that holds the head back
+  until some body arrives. Another goes out after every ~#:keep-alive~
+  milliseconds without an event, 15 seconds unless told otherwise and 0 for
+  none, so that nothing on the way closes a quiet stream as idle.
+- ~#:retry~ is how many milliseconds the browser waits before reconnecting.
+- ~Cache-Control: no-cache~ goes with it, and ~X-Accel-Buffering: no~ for nginx,
+  which otherwise buffers.
+- ~send-event!~ returns once the event has been handed to the loop that owns
+  the port, which writes one thing at a time, keep-alives included. A slow
+  client slows the writer, as it does any stream's.
+
+A browser reconnects by itself whenever the stream ends, the writer returning
+included, and sends the last ~#:id~ it saw as ~Last-Event-ID~:
+~(request-header req "Last-Event-ID")~ is where to carry on from. Like any
+header it is the client's to write. Answering anything but 200 — ~204~, say —
+is what tells a browser to stop reconnecting.
+
+Over HTTP/1.1 a browser opens at most six connections to one host, and every
+open ~EventSource~ holds one of them. Over HTTP/2, which a proxy in front
+speaks to the browser, that limit does not bite.
+
+~examples/ticker.bjo~ is a page that counts and carries on from
+~Last-Event-ID~ when the stream comes back.
+
 ** Websockets
 
 A websocket is a kind of answer. A handler that returns ~(websocket session)~
@@ -469,7 +520,7 @@ No dependency injection, no configuration system, no authentication, no content
 negotiation, no TLS, no HTTP/2, no streamed request bodies. Kestrel can do all
 of those and none of them is here; a reverse proxy in front does TLS and HTTP/2
 (see Behind a proxy). Websockets are here, without the compression extension,
-and so are streamed response bodies.
+and so are streamed response bodies and server-sent events.
 
 ~(bjoweb server)~ exports ~Ctx~ — the ~HttpContext~ type itself — so a program
 that needs one of them can reach for it, and so that reaching for it is visible.
@@ -500,7 +551,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 33 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 66 checks, a real socket
+bjo run tests/demo.bjo    ;; 71 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
@@ -509,7 +560,7 @@ escaping in text and in attribute values, that an attribute value never gains a
 newline, computed content through ~,~, ~raw~, fragments, and the document and
 response wrappers.
 
-Sixty-six checks: the routing table on its own, then a real Kestrel on a port
+Seventy-one checks: the routing table on its own, then a real Kestrel on a port
 the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
 query strings, request headers, a POST body, a suspending handler, a handler
 that raises, the 404 and the 405, a redirect, and twelve requests at once
@@ -533,6 +584,12 @@ Then a server with one worker, which still serves a plain request while a
 stream is open, and which is stopped with the stream open: the stop does not
 wait for it, the stream is cut off rather than ended, and its writer stops.
 
+Server-sent events: the exact text of a stream — the opening comment, the
+retry, an event with a name and an id, data with a line break in it — and its
+headers; a keep-alive on a quiet stream; a line break in an event name
+refused, with nothing of it sent and the stream cut off; and a sink kept past
+its stream, which answers ~#f~ rather than waiting.
+
 It also checks the thing this framework is for: a parameter installed around
 ~start-server~ is readable inside a handler. Kestrel's thread never had it.
 
@@ -551,4 +608,5 @@ it with 1001 rather than wait for it.
 
 ** Planned features
 
-Streaming and chunked bodies.
+The request body as bytes, with a limit on its size, and uploads streamed to
+the handler; multipart forms. See ~todo.org~.

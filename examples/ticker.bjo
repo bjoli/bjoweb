@@ -1,0 +1,66 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/examples/ticker.bjo — server-sent events.
+;;
+;;     bjo run examples/ticker.bjo
+;;     open http://127.0.0.1:8080/
+;;
+;; The page counts, one event a second. Every event has an id, so a browser
+;; that loses the stream reconnects with `Last-Event-ID`, and the count carries
+;; on from there rather than starting over. Stop the server and start it again
+;; to see it.
+
+(import (std prelude))
+(import (bjoweb core))
+(import (bjoweb router))
+(import (bjoweb server))
+(import (bjoweb html))
+
+(import/extern
+  (parse-int (: System.Int32.TryParse (-> string (out int) (Option int)))))
+
+;; Counts from `from`, one a second, for as long as the page is open: the
+;; writer is cancelled when the browser goes.
+(: count-from (-> int (-bjo-> EventSink void)))
+(defun (count-from from)
+  (bjoroutine (es)
+    (let go ((n from))
+      (ignore (send-event! es (int->string n) #:id (int->string n)))
+      (ignore (sync (timeout 1000)))
+      (go (+ n 1)))))
+
+;; One past the last id the browser saw, or 0 for a first visit. The header is
+;; the client's to write, so one that is not a number starts over.
+(: resumed-at (-> Request int))
+(defun (resumed-at req)
+  (match (request-header req "Last-Event-ID")
+    ((Some id) (match (parse-int id)
+                 ((Some n) (+ n 1))
+                 (None 0)))
+    (None 0)))
+
+;; Script is not HTML, so it goes in as `raw`; see examples/chat.bjo.
+(def client-script
+  (raw "const count = document.getElementById('count');
+const events = new EventSource('/count');
+events.onmessage = e => { count.textContent = e.data; };
+events.onerror = () => { count.textContent += ' (reconnecting)'; };"))
+
+(: ticker-page (-> Response))
+(defun (ticker-page)
+  (page '(html (head (meta (@ (charset "utf-8")))
+                     (title "bjoweb ticker"))
+               (body (p (@ (id "count")) "waiting")
+                     (script ,client-script)))))
+
+(defbjo (main args)
+  (serve (router
+           (route-get "/"      (fun (req) (ticker-page)))
+           ;; A second, rather than the browser's three or so, since the point
+           ;; is to watch it come back.
+           (route-get "/count" (fun (req) (event-stream (count-from (resumed-at req))
+                                                        #:retry 1000))))
+         #:port 8080)
+  0)

@@ -224,6 +224,35 @@
   (flush-port t)
   (write-string t "welt"))
 
+;; --- Server-sent events ------------------------------------------------------
+
+(: some-events (-bjo-> EventSink void))
+(defbjo (some-events es)
+  (ignore (send-event! es "hello" #:event "greeting" #:id "1"))
+  (ignore (send-event! es "two\r\nlines")))
+
+;; One event, and then nothing until it is stopped, so that all that goes out
+;; after it is keep-alives.
+(: one-then-quiet (-bjo-> EventSink void))
+(defbjo (one-then-quiet es)
+  (ignore (send-event! es "first"))
+  (ignore (sync (timeout 600000))))
+
+;; A line break in an event name would let whoever chose the name write fields
+;; of their own.
+(: badly-named (-bjo-> EventSink void))
+(defbjo (badly-named es)
+  (ignore (send-event! es "partial"))
+  (ignore (send-event! es "x" #:event "tick\ndata: injected")))
+
+;; Where `escaping` keeps its sink, for a check to use once the stream is over.
+(: kept-sinks (Inbox EventSink))
+(def kept-sinks (make-inbox 1 DropNewest))
+
+(: escaping (-bjo-> EventSink void))
+(defbjo (escaping es)
+  (ignore (inbox-post! kept-sinks es)))
+
 ;; A middleware in front of a websocket route, deciding before the upgrade.
 (: require-token (-> Handler Handler))
 (defun (require-token next)
@@ -265,7 +294,12 @@
     (route-get    "/stream/boom"    (fun (req) (stream half-then-boom)))
     (route-get    "/stream/forever" (fun (req) (stream forever)))
     (route-get    "/stream/waiting" (fun (req) (stream say-then-wait)))
-    (route-get    "/stream/head"    (fun (req) (stream should-not-run)))))
+    (route-get    "/stream/head"    (fun (req) (stream should-not-run)))
+    ;; --- server-sent events ---
+    (route-get    "/events/some"    (fun (req) (event-stream some-events #:retry 2500)))
+    (route-get    "/events/quiet"   (fun (req) (event-stream one-then-quiet #:keep-alive 50)))
+    (route-get    "/events/bad"     (fun (req) (event-stream badly-named)))
+    (route-get    "/events/escape"  (fun (req) (event-stream escaping)))))
 
 ;; ---------------------------------------------------------------------------
 ;; A client
@@ -457,6 +491,65 @@
 (defbjo (probed)
   (sync (choose (wrap (inbox-recv head-probe) (fun (u) "called"))
                 (wrap (timeout 500) (fun (u) "not called")))))
+
+;; ---------------------------------------------------------------------------
+;; Server-sent events as they arrive
+;; ---------------------------------------------------------------------------
+
+;; The values of some response headers, `-` for one that is missing.
+(: header-values (-bjo-> string (Vec string) string))
+(defbjo (header-values url names)
+  (match (fetch (get url))
+    ((Err e) (.-Message e))
+    ((Ok r)
+     (let ((values (loop (:for n names)
+                         (:acc out (vecing (match (response-header r n)
+                                             ((Some v) v)
+                                             (None "-")))))))
+       (ignore r)
+       (string-join values "|")))))
+
+;; The first event, and then what a quiet stream sends.
+(: kept-alive (-bjo-> int string))
+(defbjo (kept-alive port)
+  (with-scope
+    (match (tcp-connect "127.0.0.1" port)
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok (Tuple in out))
+       (send-get! out "/events/quiet")
+       (def first (read-until in "data: first\n\n" 3000 ""))
+       ;; Read afresh: the keep-alive looked for comes after the event.
+       (def after (read-until in ":\n" 3000 ""))
+       (str (if (string-contains? first "data: first\n\n") "first" "no first")
+            (if (string-contains? after ":\n") ", then a keep-alive" ", then silence"))))))
+
+;; What a GET's stream sent, until it ended or stopped for three seconds.
+(: everything (-bjo-> int string string))
+(defbjo (everything port path)
+  (with-scope
+    (match (tcp-connect "127.0.0.1" port)
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok (Tuple in out))
+       (send-get! out path)
+       (read-until in the-end 3000 "")))))
+
+;; What sending on a sink kept past the end of its stream does. A send that
+;; waited would wait for good, so it is given three seconds and then stopped.
+(: late-send (-bjo-> string string))
+(defbjo (late-send base)
+  (ignore (fetched (get (str base "/events/escape"))))
+  (match (sync (choose (wrap (inbox-recv kept-sinks) (fun (s) (Some s)))
+                       (wrap (timeout 3000) (fun (u) None))))
+    (None "no sink was kept")
+    ((Some es)
+     (with-cancel (stop)
+       (def said (sync (choose (wrap (promise-join (bjo (send-event! es "late")))
+                                     (fun (r) (match r
+                                                ((Ok sent) (if sent "sent" "#f"))
+                                                ((Err e) (.-Message e)))))
+                               (wrap (timeout 3000) (fun (u) "still waiting")))))
+       (stop (Requested "checked"))
+       said))))
 
 ;; ---------------------------------------------------------------------------
 ;; A websocket client
@@ -703,6 +796,32 @@
                       (let ((answer (length-of (get (str base "/stream/head")))))
                         (str (vec-ref (string-split answer " ") 0) " " (probed)))
                       "200 called")
+
+              ;; --- server-sent events -------------------------------------
+              (expect "an event stream: an opening comment, the retry, and each event whole"
+                      (fetched (get (str base "/events/some")))
+                      (Tuple 200 (str ":\n"
+                                      "retry: 2500\n\n"
+                                      "event: greeting\nid: 1\ndata: hello\n\n"
+                                      "data: two\ndata: lines\n\n")))
+
+              (expect "says it is one, and is neither cached nor buffered"
+                      (header-values (str base "/events/some")
+                                     ["content-type" "cache-control" "x-accel-buffering"])
+                      "text/event-stream|no-cache|no")
+
+              (expect "a quiet stream is kept alive"
+                      (kept-alive port) "first, then a keep-alive")
+
+              (expect "a line break in an event name is refused, and cuts the stream off"
+                      (let ((all (everything port "/events/bad")))
+                        (str (if (string-contains? all "data: partial") "partial" "nothing")
+                             (if (string-contains? all "injected") ", injected" "")
+                             (if (string-contains? all the-end) ", then the end" ", cut off")))
+                      "partial, cut off")
+
+              (expect "a sink kept past the end of its stream answers #f"
+                      (late-send base) "#f")
 
               ;; Twelve at once through four workers: every answer is the one
               ;; its own request asked for, so no two requests were confused.

@@ -30,6 +30,9 @@
   ;; Answers written as they are produced.
   stream stream-text
 
+  ;; Server-sent events.
+  EventSink event-stream send-event!
+
   ;; Reading one, and adding to it.
   response-status response-content-type response-headers response-body response-text
   with-status with-content-type with-header with-body
@@ -42,7 +45,11 @@
 
 (import (std prelude))
 (import (only (std ports) byte->text-output-port utf8))
+(import (only (std inbox) make-inbox inbox-close! inbox-closed))
 (import (net websocket protocol))
+
+(import/class
+  (Refusal (: System.ArgumentException (-> string Refusal))))
 
 ;; ---------------------------------------------------------------------------
 ;; A header, and the two records
@@ -272,6 +279,115 @@
 (defbjo (write-text-through writer out)
   (def port (byte->text-output-port out utf8))
   (writer port)
+  (flush-port port))
+
+;; ---------------------------------------------------------------------------
+;; Server-sent events
+;; ---------------------------------------------------------------------------
+
+;; Where an event stream's writer sends its events. The port belongs to a loop
+;; that also writes the keep-alives, and an event reaches it over `texts`
+;; whole, so that nothing is ever written into the middle of one. `over` is
+;; closed once the stream is.
+(type (: EventSink #:opaque (Record (: texts (Chan string))
+                                    (: over (Inbox Unit)))))
+
+;; A stream of server-sent events, for a browser's `EventSource`. `writer` runs
+;; as a `stream` writer does, and sends with `send-event!`; the stream ends
+;; when it returns.
+;;
+;; A comment goes out at once, so that the stream is seen to be open before
+;; there is anything to say, and another after every `#:keep-alive`
+;; milliseconds without an event, 0 for none, so that no proxy on the way
+;; takes a quiet stream for a dead one. `#:retry`, when it is not 0, tells the
+;; browser how many milliseconds to wait before it reconnects.
+;;
+;; A browser reconnects on its own, with the last `#:id` it saw as the
+;; `Last-Event-ID` request header, for the handler to carry on from.
+(: event-stream (-> (-bjo-> EventSink void) (#:keep-alive int) (#:retry int) Response))
+(defun (event-stream writer #:keep-alive 15000 #:retry 0)
+  (with-header (with-header (stream (bjoroutine (out) (run-events writer keep-alive retry out))
+                                    #:content-type "text/event-stream")
+                            "Cache-Control" "no-cache")
+               ;; nginx buffers a response unless it is told not to.
+               "X-Accel-Buffering" "no"))
+
+;; Sends one event: `data`, which may have line breaks in it, with an event
+;; name when `#:event` is not `""`, and an id when `#:id` is not. `#f` once the
+;; stream is over.
+;;
+;; A line break in the name or the id would begin a field of its own, so it is
+;; refused with an `ArgumentException`.
+(: send-event! (-bjo-> EventSink string (#:event string) (#:id string) bool))
+(defbjo (send-event! sink data #:event "" #:id "")
+  (def text (event-text data event id))
+  (sync (choose (wrap (chan-send (record-ref sink texts) text) (fun (u) #t))
+                (wrap (inbox-closed (record-ref sink over)) (fun (e) #f)))))
+
+(: event-text (-> string string string string))
+(defun (event-text data event id)
+  (one-line "#:event" event)
+  (one-line "#:id" id)
+  (str (if (string-empty? event) "" (str "event: " event "\n"))
+       (if (string-empty? id) "" (str "id: " id "\n"))
+       (string-join (vec-map (fun (l) (str "data: " l "\n"))
+                             (string-split (string-replace (string-replace data "\r\n" "\n") "\r" "\n")
+                                           "\n"))
+                    "")
+       "\n"))
+
+;; The message shows the line breaks escaped, since it may well end up in a
+;; log, one line per entry.
+(: one-line (-> string string void))
+(defun (one-line what s)
+  (when (or (string-contains? s "\n") (string-contains? s "\r"))
+    (raise (cast Exception
+                 (Refusal. (str what " has a line break in it: "
+                                (string-replace (string-replace s "\r" "\\r") "\n" "\\n")))))))
+
+;; What woke the loop that owns an event stream's port.
+(type (: Relayed (Union (Finished (Result Exception Unit))
+                        (Said string)
+                        Quiet)))
+
+;; Once the writer has returned, anything it started is stopped, and a sink
+;; that has outlived the stream answers `#f`.
+(: run-events (-bjo-> (-bjo-> EventSink void) int int ByteOutputPort void))
+(defbjo (run-events writer keep-alive retry out)
+  (def port (byte->text-output-port out utf8))
+  (def texts (make-chan))
+  (def over (make-inbox 1 DropNewest))
+  (say! port (str ":\n" (if (> retry 0) (str "retry: " (int->string retry) "\n\n") "")))
+  (def ending
+    (try
+        (with-cancel (stop)
+          (def running (bjo (writer (EventSink (texts texts) (over over)))))
+          (def finished (relay port texts running keep-alive))
+          (stop (Requested "the event stream is over"))
+          finished)
+      #:finally (inbox-close! over)))
+  (match ending
+    ((Ok u) unit)
+    ((Err e) (raise e))))
+
+;; Writes what the writer sends, and a comment whenever it has been quiet for
+;; `keep-alive` milliseconds, until it returns.
+(: relay (-bjo-> TextOutputPort (Chan string) (Promise Unit) int (Result Exception Unit)))
+(defbjo (relay port texts running keep-alive)
+  (let go ()
+    (match (sync (choose (wrap (chan-recv texts) (fun (t) (Said t)))
+                         (wrap (promise-join running) (fun (r) (Finished r)))
+                         (wrap (quiet-for keep-alive) (fun (u) Quiet))))
+      ((Said t) (say! port t) (go))
+      (Quiet (say! port ":\n") (go))
+      ((Finished r) r))))
+
+(: quiet-for (-> int (Event Unit)))
+(defun (quiet-for ms) (if (> ms 0) (timeout ms) (never)))
+
+(: say! (-bjo-> TextOutputPort string void))
+(defbjo (say! port text)
+  (write-string port text)
   (flush-port port))
 
 ;; Creates a redirect response. Defaults to 302 (Found) unless `#:permanent #t` is specified.

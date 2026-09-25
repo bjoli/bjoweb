@@ -12,7 +12,7 @@
 
 (export
   ;; Core types. Transparent records for easy testing and manipulation.
-  Request Response Body Handler Header Middleware
+  Request Response Body BodyWriter Handler Header Middleware
 
   ;; Request construction.
   make-request
@@ -26,6 +26,9 @@
   respond text html json-text binary redirect
   not-found method-not-allowed bad-request server-error
 
+  ;; Answers written as they are produced.
+  stream stream-text
+
   ;; Reading one, and adding to it.
   response-status response-content-type response-headers response-body response-text
   with-status with-content-type with-header with-body
@@ -37,6 +40,7 @@
   pipeline)
 
 (import (std prelude))
+(import (only (std ports) byte->text-output-port utf8))
 (import (net websocket protocol))
 
 ;; ---------------------------------------------------------------------------
@@ -49,7 +53,7 @@
 
 ;; Represents an HTTP request.
 ;; Note: `headers` keys are lower-cased. `body` contains the fully read and
-;; UTF-8 decoded request body. For streaming, access the raw `HttpContext`.
+;; UTF-8 decoded request body.
 (type (: Request (Record (: method string)
                          (: path string)
                          (: query (Map string string))
@@ -68,13 +72,20 @@
                          (: max-message int)
                          (: keep-alive int))))
 
+;; What writes a streamed body, on a fiber of its own. The port is the response
+;; body: what is written goes out when the writer flushes it or its buffer
+;; fills. The server closes it once the writer returns.
+(type (: BodyWriter (-bjo-> ByteOutputPort void)))
+
 ;; What a response carries after its headers. `Text` goes out as UTF-8. The
 ;; server sets `Content-Length` for `Text` and `Bytes`, and sends no body with a
-;; status that cannot have one (1xx, 204, 304). `Upgraded` is what `websocket`
+;; status that cannot have one (1xx, 204, 304). A `Streamed` body has no length
+;; known in advance, so it goes out chunked. `Upgraded` is what `websocket`
 ;; answers with.
 (type (: Body (Union Empty
                      (Text string)
                      (Bytes (Array byte))
+                     (Streamed BodyWriter)
                      (Upgraded Upgrade))))
 
 ;; Represents an HTTP response. Nothing is written until the handler has
@@ -200,6 +211,34 @@
 (: binary (-> (Array byte) (#:status int) (#:content-type string) Response))
 (defun (binary data #:status 200 #:content-type "application/octet-stream")
   (Response (status status) (content-type content-type) (headers (vec-empty)) (body (Bytes data))))
+
+;; A body written as it is produced: a large download, or the output of a long
+;; computation. `writer` runs on a fiber of its own once the head has gone out,
+;; and gets the response body as a byte port. `flush!` sends what has been
+;; written so far.
+;;
+;; The body ends cleanly when `writer` returns. When it raises, when the client
+;; goes away or when the server stops, the connection is aborted instead, so
+;; that a client sees an incomplete response rather than a short one that looks
+;; whole. A `HEAD` gets the head alone, and `writer` is not called.
+(: stream (-> BodyWriter (#:status int) (#:content-type string) Response))
+(defun (stream writer #:status 200 #:content-type "application/octet-stream")
+  (Response (status status) (content-type content-type) (headers (vec-empty)) (body (Streamed writer))))
+
+;; `stream` for text. `writer` gets a text port over the body that writes
+;; UTF-8, and `flush-port` on it sends what has been written so far.
+(: stream-text (-> (-bjo-> TextOutputPort void) (#:status int) (#:content-type string) Response))
+(defun (stream-text writer #:status 200 #:content-type "text/plain; charset=utf-8")
+  (stream (bjoroutine (out) (write-text-through writer out))
+          #:status status #:content-type content-type))
+
+;; The text port needs no closing: flushing it at the end pushes what it holds
+;; into the byte port, and the server closes that.
+(: write-text-through (-bjo-> (-bjo-> TextOutputPort void) ByteOutputPort void))
+(defbjo (write-text-through writer out)
+  (def port (byte->text-output-port out utf8))
+  (writer port)
+  (flush-port port))
 
 ;; Creates a redirect response. Defaults to 302 (Found) unless `#:permanent #t` is specified.
 (: redirect (-> string (#:permanent bool) Response))

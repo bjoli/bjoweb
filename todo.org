@@ -3,7 +3,7 @@
 * TODO Multipart form data
 * TODO Streaming and chunked bodies
 ** DONE The body is a union: Empty, Text, Bytes, Upgraded; Content-Length from it
-** TODO Streamed response bodies, on a fiber of their own
+** DONE Streamed response bodies, on a fiber of their own
 ** TODO Server-sent events
 ** TODO The request body as bytes, #:max-body, streamed uploads
 * DONE Middleware / request pipeline

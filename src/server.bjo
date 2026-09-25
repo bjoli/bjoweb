@@ -19,11 +19,13 @@
   Server serve start-server stop-server!
   server-url server-port server-dropped-count
 
-  ;; The raw `HttpContext`, exposed for advanced use cases (e.g., streaming).
+  ;; The raw `HttpContext` type, for a program that needs what bjoweb does not
+  ;; expose.
   Ctx)
 
 (import (std inbox))
 (import (only (std net) stream->ports))
+(import (only (std ports) close-byte-output-port!))
 (import (only (net websocket protocol)
               ports->websocket websocket-accept-key websocket-close! websocket-closed))
 (import (bjoweb core))
@@ -57,7 +59,11 @@
   (Lifetime    (: Microsoft.Extensions.Hosting.IHostApplicationLifetime))
   (Features    (: Microsoft.AspNetCore.Http.Features.IFeatureCollection))
   (UpgradeFeature (: Microsoft.AspNetCore.Http.Features.IHttpUpgradeFeature))
-  (ConnInfo    (: Microsoft.AspNetCore.Http.ConnectionInfo)))
+  (ConnInfo    (: Microsoft.AspNetCore.Http.ConnectionInfo))
+  ;; A byte port over a stream it does not own, for the response body: nothing
+  ;; registers it on a scope, so no scope's release writes to it with a
+  ;; blocking call, and closing it leaves the stream to Kestrel.
+  (BodyPort    (: Bjolang.Runtime.BjoByteOutputPort (-> Stream bool BodyPort))))
 
 (import/extern
   ;; --- Building and running the host ---
@@ -100,6 +106,11 @@
                     (-> HeaderDict string Values void)))
   (out-body      (: Microsoft.AspNetCore.Http.HttpResponse.Body (-> Outgoing Stream) #:get))
   (body-write!   (: System.IO.Stream.WriteAsync (-> Stream (Array byte) int int void) #:async))
+  ;; Sends the head now, before any of a streamed body exists.
+  (start!        (: Microsoft.AspNetCore.Http.HttpResponse.StartAsync (-> Outgoing void) #:async))
+  ;; Drops the connection, so that a body that was cut off is not taken for a
+  ;; whole one.
+  (abort!        (: Microsoft.AspNetCore.Http.HttpContext.Abort (-> Ctx void)))
 
   ;; --- Stopping ---
   (app-lifetime  (: Microsoft.AspNetCore.Builder.WebApplication.Lifetime (-> App Lifetime) #:get))
@@ -314,6 +325,7 @@
     ((Some (Ok answer))
      (match (response-body answer)
        ((Upgraded up) (upgrade-or-refuse! ctx req c answer up going-away handed-off))
+       ((Streamed writer) (stream-or-head! ctx req c answer writer going-away handed-off))
        (_ (write-response! ctx answer)))
      unit)
     ;; The handler raised. What it said goes to the log, not to the page.
@@ -324,25 +336,42 @@
     (None unit)))
 
 ;; ===========================================================================
+;; Answers that outlive the worker
+;; ===========================================================================
+;;
+;; A websocket session and a streamed body run on a fiber of their own, so that
+;; a long one holds no worker. That fiber answers the call when it is done,
+;; which is what hands the connection back to Kestrel.
+
+;; Starts `run` on a fiber of its own. `run` closes the latch it is given once
+;; it is running, and only then is `handed-off` set: a scope that has begun
+;; closing refuses a new fiber, and then the call is still this worker's to
+;; answer.
+(: hand-off! (-bjo-> (-bjo-> (Inbox Unit) void) (Box bool) void))
+(defbjo (hand-off! run handed-off)
+  (def started (latch))
+  (def running (bjo (run started)))
+  (when (sync (choose (wrap (inbox-closed started) (fun (e) #t))
+                      (wrap (promise-join running) (fun (r) #f))))
+    (box-set! handed-off #t)))
+
+;; What ended a session or a stream first.
+(type (: Ending (Union (Returned (Result Exception Unit))
+                       Gone
+                       Stopping)))
+
+;; ===========================================================================
 ;; A websocket
 ;; ===========================================================================
 
 ;; Hands the call to a session fiber, or answers why it cannot be upgraded.
-;;
-;; `handed-off` is set only once the session fiber is running. A scope that has
-;; begun closing refuses a new fiber, and then the call is still this worker's
-;; to answer.
 (: upgrade-or-refuse! (-bjo-> Ctx Request (Call Ctx Unit) Response Upgrade (Inbox Unit) (Box bool)
                               void))
 (defbjo (upgrade-or-refuse! ctx req c answer up going-away handed-off)
   (match (handshake-refusal ctx req)
     ((Some refusal) (write-response! ctx refusal))
-    (None
-     (def started (latch))
-     (def session (bjo (run-session ctx c req answer up going-away started)))
-     (when (sync (choose (wrap (inbox-closed started) (fun (e) #t))
-                         (wrap (promise-join session) (fun (r) #f))))
-       (box-set! handed-off #t)))))
+    (None (hand-off! (bjoroutine (started) (run-session ctx c req answer up going-away started))
+                     handed-off))))
 
 ;; Why a request that reached a websocket route cannot be upgraded, as the
 ;; answer to send instead, or `None` when it can.
@@ -389,11 +418,6 @@
         ((Err e) (log (str "bjoweb: websocket " (request-path req) " failed: " (.-Message e)))))
     #:finally (ignore (call-reply! c unit))))
 
-;; What ended a session first.
-(type (: Ending (Union (SessionReturned (Result Exception Unit))
-                       SocketClosed
-                       ServerStopping)))
-
 ;; Sends the `101`, runs the session on the socket, and closes it: with 1000
 ;; when the session returns, 1011 when it raises, and 1001 when the server is
 ;; stopping. A session still running once the socket has closed is cancelled.
@@ -417,17 +441,86 @@
                                  #:max-message (record-ref up max-message)
                                  #:keep-alive (record-ref up keep-alive)))))
     (def running (bjo (session ws)))
-    (match (sync (choose (wrap (promise-join running) (fun (r) (SessionReturned r)))
-                         (wrap (websocket-closed ws) (fun (s) SocketClosed))
-                         (wrap (call-abandoned c) (fun (u) SocketClosed))
-                         (wrap (inbox-closed going-away) (fun (e) ServerStopping))))
-      ((SessionReturned (Ok u)) (websocket-close! ws))
-      ((SessionReturned (Err e))
+    (match (sync (choose (wrap (promise-join running) (fun (r) (Returned r)))
+                         (wrap (websocket-closed ws) (fun (s) Gone))
+                         (wrap (call-abandoned c) (fun (u) Gone))
+                         (wrap (inbox-closed going-away) (fun (e) Stopping))))
+      ((Returned (Ok u)) (websocket-close! ws))
+      ((Returned (Err e))
        (log (str "bjoweb: websocket " (request-path req) " raised: " (.-Message e)))
        (websocket-close! ws #:code 1011 #:reason "internal error"))
-      (ServerStopping (websocket-close! ws #:code 1001 #:reason "the server is stopping"))
-      (SocketClosed unit))
+      (Stopping (websocket-close! ws #:code 1001 #:reason "the server is stopping"))
+      (Gone unit))
     (stop (Requested "the websocket is closed"))))
+
+;; ===========================================================================
+;; A streamed body
+;; ===========================================================================
+
+;; Hands a streamed body to a fiber of its own. A `HEAD`, or a status that
+;; cannot have a body, gets the head alone and the writer is not called.
+(: stream-or-head! (-bjo-> Ctx Request (Call Ctx Unit) Response BodyWriter (Inbox Unit) (Box bool)
+                           void))
+(defbjo (stream-or-head! ctx req c answer writer going-away handed-off)
+  (if (or (= (request-method req) "HEAD") (not (body-allowed? (response-status answer))))
+      (write-head! ctx answer #f)
+      (hand-off! (bjoroutine (started) (run-stream ctx c req answer writer going-away started))
+                 handed-off)))
+
+;; Answers the call once the body is over. When it fails, the failure is logged
+;; and the connection aborted, unless the client had gone first: a stream
+;; whose client has gone is not the server's failure, and there is no
+;; connection left to abort.
+(: run-stream (-bjo-> Ctx (Call Ctx Unit) Request Response BodyWriter (Inbox Unit) (Inbox Unit) void))
+(defbjo (run-stream ctx c req answer writer going-away started)
+  (inbox-close! started)
+  (try
+      (match (try (stream-now ctx c answer writer going-away) #:catch (System.Exception))
+        ((Ok u) unit)
+        ((Err e)
+         (unless (abandoned? c)
+           (log (str "bjoweb: " (request-method req) " " (request-path req)
+                     " stream raised: " (.-Message e)))
+           (abort-quietly! ctx))))
+    #:finally (ignore (call-reply! c unit))))
+
+;; Whether the client has gone. `call-abandoned` stays ready once it has fired,
+;; and a `choose` takes the first ready branch, so this does not wait.
+(: abandoned? (-bjo-> (Call Ctx Unit) bool))
+(defbjo (abandoned? c)
+  (sync (choose (wrap (call-abandoned c) (fun (u) #t))
+                (always #f))))
+
+;; Aborting is the last thing done to a response that has failed, and nothing
+;; that goes wrong in it is worth more than the failure that led to it.
+(: abort-quietly! (-> Ctx void))
+(defun (abort-quietly! ctx)
+  (ignore (try (abort! ctx) #:catch (System.Exception))))
+
+;; Sends the head, then runs the writer until it returns, the client goes or
+;; the server stops. The head goes first so that a client sees the status
+;; before the first byte of the body exists. Only a writer that returns ends
+;; the body cleanly: a stopping server aborts the connection, and a writer
+;; still running then is cancelled.
+(: stream-now (-bjo-> Ctx (Call Ctx Unit) Response BodyWriter (Inbox Unit) void))
+(defbjo (stream-now ctx c answer writer going-away)
+  (def response (ctx-response ctx))
+  (write-head! ctx answer #f)
+  (start! response)
+  (def out (cast ByteOutputPort (BodyPort. (out-body response) #f)))
+  (def ending
+    (with-cancel (stop)
+      (def running (bjo (writer out)))
+      (def winner (sync (choose (wrap (promise-join running) (fun (r) (Returned r)))
+                                (wrap (call-abandoned c) (fun (u) Gone))
+                                (wrap (inbox-closed going-away) (fun (e) Stopping)))))
+      (stop (Requested "the stream is over"))
+      winner))
+  (match ending
+    ((Returned (Ok u)) (close-byte-output-port! out))
+    ((Returned (Err e)) (raise e))
+    (Gone unit)
+    (Stopping (abort-quietly! ctx))))
 
 ;; ===========================================================================
 ;; HttpContext -> Request
@@ -502,26 +595,34 @@
 ;; Response -> HttpResponse
 ;; ===========================================================================
 
-;; Writes the status, the headers and the body. `Content-Length` is the
-;; body's, so one among the headers is dropped when there is a body to send.
+;; Writes the status, the headers and a body known in full. `Content-Length` is
+;; the body's, so one among the headers is dropped when there is a body to send.
 (: write-response! (-bjo-> Ctx Response void))
 (defbjo (write-response! ctx answer)
   (def out (ctx-response ctx))
-  (def status (response-status answer))
-  (def payload (if (body-allowed? status) (fixed-body (response-body answer)) None))
-  (out-status! out status)
-  (out-type! out (response-content-type answer))
-  (loop (:for h (response-headers answer))
-        (:do (match h
-               ((Tuple name value)
-                (unless (and (some? payload) (= (string-downcase name) "content-length"))
-                  (header-add! (out-headers out) name (Values. value)))))))
+  (def payload (if (body-allowed? (response-status answer))
+                   (fixed-body (response-body answer))
+                   None))
+  (write-head! ctx answer (some? payload))
   (match payload
     ((Some bytes)
      (def n (array-length bytes))
      (header-add! (out-headers out) "Content-Length" (Values. (int->string n)))
      (when (> n 0) (body-write! (out-body out) bytes 0 n)))
     (None unit)))
+
+;; The status, the content type and the headers. `drop-length` leaves out a
+;; `Content-Length` among them, for a body whose length is known here.
+(: write-head! (-> Ctx Response bool void))
+(defun (write-head! ctx answer drop-length)
+  (def out (ctx-response ctx))
+  (out-status! out (response-status answer))
+  (out-type! out (response-content-type answer))
+  (loop (:for h (response-headers answer))
+        (:do (match h
+               ((Tuple name value)
+                (unless (and drop-length (= (string-downcase name) "content-length"))
+                  (header-add! (out-headers out) name (Values. value))))))))
 
 ;; 1xx, 204 and 304 have no body, and Kestrel refuses to write one.
 (: body-allowed? (-> int bool))
@@ -535,4 +636,5 @@
     (Empty (Some (make-array 0)))
     ((Text s) (Some (encode utf8 s)))
     ((Bytes data) (Some data))
+    ((Streamed writer) None)
     ((Upgraded up) None)))

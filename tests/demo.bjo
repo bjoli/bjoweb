@@ -30,7 +30,8 @@
                               (response-text http-text))
                       "http/"))
 (import (only (std net) tcp-connect))
-(import (only (std ports) read-some write-bytes! flush! utf8))
+(import (only (std ports) read-some read-some-evt write-bytes! flush! utf8))
+(import (std inbox))
 (import (bjoweb core))
 (import (bjoweb router))
 (import (bjoweb server))
@@ -57,7 +58,8 @@
   (stop-it   (: System.Net.Sockets.TcpListener.Stop (-> PortProbe void)))
   (bound-to  (: System.Net.Sockets.TcpListener.LocalEndpoint (-> PortProbe Endpoint) #:get))
   (ip-port   (: System.Net.IPEndPoint.Port (-> System.Net.IPEndPoint int) #:get))
-  (to-bytes  (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte)))))
+  (to-bytes  (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
+  (from-bytes (: System.Text.Encoding.GetString (-> Encoding (Array byte) string))))
 
 (: free-port (-> int))
 (defun (free-port)
@@ -149,6 +151,75 @@
 (defbjo (failing-session ws)
   (raise (cast Exception (Boom. "the session exploded"))))
 
+;; --- Streamed bodies ---------------------------------------------------------
+
+;; Posted to by a check once it has read the first part of `in-two-parts`,
+;; which is how it knows that part went out before the writer had finished.
+(: release (Inbox Unit))
+(def release (make-inbox 1 DropNewest))
+
+;; Posted to by `forever` when it stops, however it was stopped.
+(: writer-ended (Inbox Unit))
+(def writer-ended (make-inbox 4 DropNewest))
+
+;; Posted to by `should-not-run` if it runs.
+(: head-probe (Inbox Unit))
+(def head-probe (make-inbox 4 DropNewest))
+
+(: line (-bjo-> ByteOutputPort string void))
+(defbjo (line out s)
+  (write-bytes! out (to-bytes utf8 (str s "\n")))
+  (flush! out))
+
+(: count-to-three (-bjo-> ByteOutputPort void))
+(defbjo (count-to-three out)
+  (let go ((i 0))
+    (when (< i 3)
+      (line out (int->string i))
+      (go (+ i 1)))))
+
+(: in-two-parts (-bjo-> ByteOutputPort void))
+(defbjo (in-two-parts out)
+  (line out "first")
+  (ignore (sync (inbox-recv release)))
+  (line out "second"))
+
+(: half-then-boom (-bjo-> ByteOutputPort void))
+(defbjo (half-then-boom out)
+  (line out "partial")
+  (raise (cast Exception (Boom. "the stream exploded"))))
+
+(: forever (-bjo-> ByteOutputPort void))
+(defbjo (forever out)
+  (try
+      (let go ()
+        (line out "tick")
+        (ignore (sync (timeout 10)))
+        (go))
+    #:finally (ignore (inbox-post! writer-ended unit))))
+
+;; Says one thing and then waits, writing nothing, until it is stopped. Kestrel
+;; aborts a connection itself when a write it is in the middle of is cancelled,
+;; so a writer stopped while parked is the one that shows what bjoweb does.
+(: say-then-wait (-bjo-> ByteOutputPort void))
+(defbjo (say-then-wait out)
+  (try
+      (let ()
+        (line out "waiting")
+        (ignore (sync (timeout 600000))))
+    #:finally (ignore (inbox-post! writer-ended unit))))
+
+(: should-not-run (-bjo-> ByteOutputPort void))
+(defbjo (should-not-run out)
+  (ignore (inbox-post! head-probe unit)))
+
+;; Text, flushed once in the middle.
+(: greeting-text (-bjo-> TextOutputPort void))
+(defbjo (greeting-text t)
+  (write-string t "grüße, ")
+  (flush-port t)
+  (write-string t "welt"))
+
 ;; A middleware in front of a websocket route, deciding before the upgrade.
 (: require-token (-> Handler Handler))
 (defun (require-token next)
@@ -181,7 +252,15 @@
     (route-get    "/bytes"        (fun (req) (binary #[0 1 254 255])))
     (route-get    "/empty"        (fun (req) (with-body (text "") Empty)))
     (route-get    "/lying"        (fun (req) (with-header (text "abc") "Content-Length" "99")))
-    (route-get    "/nobody"       (fun (req) (with-status (text "dropped") 204)))))
+    (route-get    "/nobody"       (fun (req) (with-status (text "dropped") 204)))
+    ;; --- streamed bodies ---
+    (route-get    "/stream/count"   (fun (req) (stream count-to-three #:content-type "text/plain")))
+    (route-get    "/stream/text"    (fun (req) (stream-text greeting-text)))
+    (route-get    "/stream/parts"   (fun (req) (stream in-two-parts)))
+    (route-get    "/stream/boom"    (fun (req) (stream half-then-boom)))
+    (route-get    "/stream/forever" (fun (req) (stream forever)))
+    (route-get    "/stream/waiting" (fun (req) (stream say-then-wait)))
+    (route-get    "/stream/head"    (fun (req) (stream should-not-run)))))
 
 ;; ---------------------------------------------------------------------------
 ;; A client
@@ -285,13 +364,87 @@
     (match (tcp-connect "127.0.0.1" port)
       ((Err e) (str "refused: " (.-Message e)))
       ((Ok (Tuple in out))
-       (write-bytes! out (to-bytes utf8 (str "GET " path " HTTP/1.1\r\n"
-                                              "Host: localhost\r\n"
-                                              "Connection: close\r\n\r\n")))
-       (flush! out)
+       (send-get! out path)
        ;; The leading dot anchors the match at a byte boundary.
        (def parts (string-split (str "." (drain-dotted in)) ".13.10.13.10."))
        (if (< (vec-length parts) 2) "no blank line" (vec-ref parts 1))))))
+
+(: send-get! (-bjo-> ByteOutputPort string void))
+(defbjo (send-get! out path)
+  (write-bytes! out (to-bytes utf8 (str "GET " path " HTTP/1.1\r\n"
+                                         "Host: localhost\r\n"
+                                         "Connection: close\r\n\r\n")))
+  (flush! out))
+
+;; ---------------------------------------------------------------------------
+;; A streamed body as it arrives
+;; ---------------------------------------------------------------------------
+;; Over a plain socket too, to see what arrives when, and how the body ends: a
+;; chunked body that ends cleanly ends with an empty chunk, `0` and a blank
+;; line, and one that was cut off does not.
+
+(def the-end "\r\n0\r\n\r\n")
+
+;; `so-far`, and whatever arrives on `in` after it until `needle` is in it, the
+;; stream ends, or nothing has arrived for `ms` milliseconds.
+(: read-until (-bjo-> ByteInputPort string int string string))
+(defbjo (read-until in needle ms so-far)
+  (let go ((acc so-far))
+    (if (string-contains? acc needle)
+        acc
+        (match (sync (choose (wrap (read-some-evt in) (fun (r) (Some r)))
+                             (wrap (timeout ms) (fun (u) None))))
+          ((Some (Ok (Some bs))) (go (str acc (from-bytes utf8 bs))))
+          (_ acc)))))
+
+;; The first part arrives while the writer is still waiting to write the
+;; second, and then the rest.
+(: first-part-early (-bjo-> int string))
+(defbjo (first-part-early port)
+  (with-scope
+    (match (tcp-connect "127.0.0.1" port)
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok (Tuple in out))
+       (send-get! out "/stream/parts")
+       (def early (read-until in "first" 3000 ""))
+       (ignore (inbox-post! release unit))
+       (def all (read-until in the-end 3000 early))
+       (str (if (string-contains? early "first") "first while waiting" "first NOT while waiting")
+            (if (string-contains? all "second") ", then second" ", no second")
+            (if (string-contains? all the-end) ", then the end" ", no end"))))))
+
+;; What a GET's stream said, and whether it ended cleanly.
+(: stream-ending (-bjo-> int string string))
+(defbjo (stream-ending port path)
+  (with-scope
+    (match (tcp-connect "127.0.0.1" port)
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok (Tuple in out))
+       (send-get! out path)
+       (def all (read-until in the-end 3000 ""))
+       (str (if (string-contains? all "partial") "partial" "nothing")
+            (if (string-contains? all the-end) ", then the end" ", cut off"))))))
+
+;; Starts reading a stream that never ends, and hangs up.
+(: hang-up (-bjo-> int string))
+(defbjo (hang-up port)
+  (def seen
+    (with-scope
+      (match (tcp-connect "127.0.0.1" port)
+        ((Err e) (str "refused: " (.-Message e)))
+        ((Ok (Tuple in out))
+         (send-get! out "/stream/forever")
+         (read-until in "tick" 3000 "")))))
+  ;; The scope has closed the socket by now.
+  (str (if (string-contains? seen "tick") "ticking" "never ticked")
+       (sync (choose (wrap (inbox-recv writer-ended) (fun (u) ", then stopped"))
+                     (wrap (timeout 5000) (fun (u) ", still running"))))))
+
+;; Whether `should-not-run` ran.
+(: probed (-bjo-> string))
+(defbjo (probed)
+  (sync (choose (wrap (inbox-recv head-probe) (fun (u) "called"))
+                (wrap (timeout 500) (fun (u) "not called")))))
 
 ;; ---------------------------------------------------------------------------
 ;; A websocket client
@@ -477,6 +630,36 @@
               (expect "a 204 sends no body, whatever the handler gave it"
                       (body-bytes port "/nobody") "")
 
+              ;; --- streamed bodies ----------------------------------------
+              (expect "a streamed body"
+                      (fetched (get (str base "/stream/count"))) (Tuple 200 "0\n1\n2\n"))
+
+              (expect "has no Content-Length"
+                      (length-of (get (str base "/stream/count"))) "200 -")
+
+              (expect "streamed text, flushed in the middle"
+                      (fetched (get (str base "/stream/text"))) (Tuple 200 "grüße, welt"))
+
+              (expect "the first part goes out while the writer is still writing"
+                      (first-part-early port)
+                      "first while waiting, then second, then the end")
+
+              (expect "a writer that raises cuts the response off rather than ending it"
+                      (stream-ending port "/stream/boom") "partial, cut off")
+
+              (expect "a client that hangs up stops the writer"
+                      (hang-up port) "ticking, then stopped")
+
+              (expect "HEAD answers a streamed route without calling its writer"
+                      (let ((answer (length-of (request http/HEAD (str base "/stream/head")))))
+                        (str (vec-ref (string-split answer " ") 0) " " (probed)))
+                      "200 not called")
+
+              (expect "which GET does call"
+                      (let ((answer (length-of (get (str base "/stream/head")))))
+                        (str (vec-ref (string-split answer " ") 0) " " (probed)))
+                      "200 called")
+
               ;; Twelve at once through four workers: every answer is the one
               ;; its own request asked for, so no two requests were confused.
               (expect "twelve at once, each answered its own question"
@@ -541,6 +724,42 @@
                 ((Err e) (str "refused: " (.-Message e))))
               "1001:the server is stopping")
       (expect-true "and does not wait for it to close on its own" (< took 3000))))
+
+  ;; --- stopping with a stream open ------------------------------------------
+  ;;
+  ;; One worker, so that a stream that held it would leave none for the plain
+  ;; request. Then the same as for a websocket: the stop does not wait for the
+  ;; stream to end, and the client sees it cut off rather than ended.
+  (def stream-port (free-port))
+  (with-scope
+    (let ((server (start-server app #:port stream-port #:workers 1)))
+      (match (tcp-connect "127.0.0.1" stream-port)
+        ((Err e) (expect "a stream to stop the server under" (.-Message e) "connected"))
+        ((Ok (Tuple in out))
+         (send-get! out "/stream/waiting")
+         ;; Kept, because the end is looked for in everything read: a clean
+         ;; end begins with the line break that ends this chunk.
+         (def opened (read-until in "waiting" 3000 ""))
+         (expect-true "a stream is open" (string-contains? opened "waiting"))
+         (def plain (bjo (body-of (str "http://127.0.0.1:" (int->string stream-port) "/"))))
+         (expect "and with one worker, a plain request is still served"
+                 (sync (choose (wrap (promise-join plain)
+                                     (fun (r) (match r
+                                                ((Ok (Tuple code body)) (int->string code))
+                                                ((Err e) (.-Message e)))))
+                               (wrap (timeout 3000) (fun (u) "timed out"))))
+                 "200")
+         (def before (now))
+         (stop-server! server)
+         (def took (- (now) before))
+         (expect-true "stopping the server does not wait for an open stream" (< took 3000))
+         (expect "which is cut off rather than ended"
+                 (if (string-contains? (read-until in the-end 3000 opened) the-end) "ended" "cut off")
+                 "cut off")
+         (expect "and its writer is stopped"
+                 (sync (choose (wrap (inbox-recv writer-ended) (fun (u) "stopped"))
+                               (wrap (timeout 3000) (fun (u) "still running"))))
+                 "stopped")))))
 
   ;; --- a queue that overflows ----------------------------------------------
   ;;

@@ -111,6 +111,7 @@ A response's body is a ~Body~:
 | ~Empty~                  | nothing                                    |
 | ~(Text string)~          | sent as UTF-8, with no byte order mark     |
 | ~(Bytes (Array byte))~   | sent as it is                              |
+| ~(Streamed writer)~      | written as it is produced; see Streaming   |
 | ~(Upgraded upgrade)~     | what ~websocket~ answers with; see below   |
 
 ~(response-body r)~ is the ~Body~, and ~(response-text r)~ is ~(Some s)~ for a
@@ -138,6 +139,56 @@ Because `pipeline` takes a target handler followed by a variable number of middl
 #+END_SRC
 
 Here, `logger` wraps `auth`, which wraps `home`. The request flows through `logger`, then `auth`, then `home`.
+
+** Streaming
+
+A body can be written as it is produced — a large download, the output of a
+long computation — rather than built in memory first:
+
+#+BEGIN_SRC scheme
+(: countdown (-bjo-> TextOutputPort void))
+(defbjo (countdown out)
+  (let go ((i 10))
+    (when (> i 0)
+      (write-string out (str (int->string i) "\n"))
+      (flush-port out)
+      (ignore (sync (timeout 1000)))
+      (go (- i 1)))))
+
+(router (route-get "/countdown" (fun (req) (stream-text countdown))))
+#+END_SRC
+
+| ~(stream writer)~        | ~writer~ gets the body as a ~ByteOutputPort~; ~application/octet-stream~ |
+| ~(stream-text writer)~   | ~writer~ gets a ~TextOutputPort~ that writes UTF-8; ~text/plain; charset=utf-8~ |
+
+Both take ~#:status~ and ~#:content-type~, and the combinators work on what they
+return as on any response. The writer's ports come from ~(std ports)~ and the
+prelude: ~write-bytes!~ and ~flush!~ on the byte port, ~write-string~ and
+~flush-port~ on the text port.
+
+What is written goes out when the writer flushes, or when the port's buffer
+fills. A client that reads slowly makes the writer's writes wait, so a stream
+holds no more in memory than one buffer. The length is not known in advance,
+so the body goes out chunked; a ~Content-Length~ put among the headers is kept,
+and the writer then has to write exactly that many bytes.
+
+*** Where a writer runs
+
+As a websocket session does: on a fiber of its own, so that a long stream holds
+no worker, with the environment of the fiber that started the server. The head
+— the status and the headers — goes out before the writer is called, so a
+client sees the status at once.
+
+- *The writer returns:* the body ends, and the response is complete. The
+  server closes the port; the writer does not.
+- *The writer raises:* it is logged, and the connection is aborted. The status
+  has already gone out, so a 500 is no longer possible, and a client must not
+  take what did arrive for the whole body.
+- *The client goes away:* the writer is cancelled.
+- *The server stops:* the writer is cancelled and the connection aborted, for
+  the same reason as when it raises.
+- *A ~HEAD~*, or a status that cannot have a body: the head goes out alone, and
+  the writer is never called.
 
 ** Websockets
 
@@ -353,8 +404,9 @@ You can opt into serving static files using Kestrel's highly optimized built-in 
 ** What this is not
 
 No dependency injection, no configuration system, no authentication, no content
-negotiation, no TLS, no HTTP/2, no streaming bodies. Kestrel can do all of those
-and none of them is here. Websockets are, without the compression extension.
+negotiation, no TLS, no HTTP/2, no streamed request bodies. Kestrel can do all
+of those and none of them is here. Websockets are, without the compression
+extension, and so are streamed response bodies.
 
 ~(bjoweb server)~ exports ~Ctx~ — the ~HttpContext~ type itself — so a program
 that needs one of them can reach for it, and so that reaching for it is visible.
@@ -372,8 +424,9 @@ It is an ordinary ~bjo~ package. From a project of your own:
 
 ~(net websocket)~, from [[https://github.com/bjoli/websocket]], comes along with
 it. bjoweb needs a Bjolang whose ~(std net)~ has ~stream->ports~, and from
-0.1.1 on one where closing a byte output port writes only what is pending (see
-Bjolang's changelog).
+0.1.1 on one where closing a byte output port writes only what is pending. From
+0.2.0 on it also needs one where ~utf8~ writes no byte order mark and a call
+handed to a waiting receiver is taken. See Bjolang's changelog for all three.
 
 Note that *the ASP.NET runtime has to be installed wherever the program runs*.
 Not just where it is built: a framework-dependent program asks the host for
@@ -384,7 +437,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 33 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 45 checks, a real socket
+bjo run tests/demo.bjo    ;; 58 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, attributes,
@@ -393,7 +446,7 @@ escaping in text and in attribute values, that an attribute value never gains a
 newline, computed content through ~,~, ~raw~, fragments, and the document and
 response wrappers.
 
-Forty-five checks: the routing table on its own, then a real Kestrel on a port
+Fifty-eight checks: the routing table on its own, then a real Kestrel on a port
 the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
 query strings, request headers, a POST body, a suspending handler, a handler
 that raises, the 404 and the 405, a redirect, and twelve requests at once
@@ -407,6 +460,15 @@ bytes go out as they are, and a 204 sends nothing whatever its handler gave it.
 And ~Content-Length~: in bytes rather than characters, 0 for an empty body, the
 ~GET~'s for a ~HEAD~, and the body's even when the handler put another one in
 the headers.
+
+Streamed bodies are read over a plain socket too, to see what arrives when and
+how the body ends: a streamed body and streamed text, with no ~Content-Length~;
+the first part arriving while the writer is still waiting to write the second;
+a writer that raises, whose response is cut off rather than ended; a client
+that hangs up, which stops the writer; and a ~HEAD~, which never calls it.
+Then a server with one worker, which still serves a plain request while a
+stream is open, and which is stopped with the stream open: the stop does not
+wait for it, the stream is cut off rather than ended, and its writer stops.
 
 It also checks the thing this framework is for: a parameter installed around
 ~start-server~ is readable inside a handler. Kestrel's thread never had it.

@@ -22,6 +22,7 @@
   request-scheme request-host request-client
   request-query request-header request-param
   request-query-or request-header-or request-param-or
+  request-cookie request-cookie-or
 
   ;; Its body, which is read when it is asked for, and so suspends.
   request-body request-bytes request-body-port request-form request-form-or
@@ -47,7 +48,7 @@
 
   ;; Reading one, and adding to it.
   response-status response-content-type response-headers response-body response-text
-  with-status with-content-type with-header with-body
+  with-status with-content-type with-header with-body with-cookie
 
   ;; Websockets: an upgrade is a kind of answer.
   Session Upgrade websocket
@@ -76,7 +77,8 @@
   (collected    (: System.IO.MemoryStream.ToArray (-> Collected (Array byte))))
   (utf8-bytes   (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
   (utf8-text    (: System.Text.Encoding.GetString (-> Encoding (Array byte) int int string)))
-  (unescape     (: System.Uri.UnescapeDataString (-> string string))))
+  (unescape     (: System.Uri.UnescapeDataString (-> string string)))
+  (escape       (: System.Uri.EscapeDataString (-> string string))))
 
 ;; ---------------------------------------------------------------------------
 ;; A header, and the two records
@@ -261,6 +263,45 @@
 (: request-param-or (-> Request string string string))
 (defun (request-param-or r name fallback)
   (map-ref-or (record-ref r params) name fallback))
+
+;; ---------------------------------------------------------------------------
+;; Its cookies
+;; ---------------------------------------------------------------------------
+;;
+;; The browser sends them all in one `Cookie` header, `a=1; b=2`. HTTP/2 lets it
+;; split that into several, and the server joins them again with `; `, so it is
+;; one header here either way.
+
+;; A cookie's value, percent-decoded, or `None`. A value may come in quotes,
+;; which are not part of it. When two cookies have the same name — one set for
+;; `/` and one for `/admin`, say — the browser sends the one for the longer
+;; path first, and that is the one given.
+(: request-cookie (-> Request string (Option string)))
+(defun (request-cookie r name)
+  (loop (:for pair (string-split (request-header-or r "cookie" "") ";"))
+        (:acc found (folding None (match found
+                                    ((Some v) found)
+                                    (None (cookie-named name pair)))))))
+
+(: request-cookie-or (-> Request string string string))
+(defun (request-cookie-or r name fallback)
+  (match (request-cookie r name)
+    ((Some v) v)
+    (None fallback)))
+
+;; The value in `pair`, `name=value`, if the name is `name`.
+(: cookie-named (-> string string (Option string)))
+(defun (cookie-named name pair)
+  (def parts (string-split pair "="))
+  (if (and (>= (vec-length parts) 2) (= (string-trim (vec-ref parts 0)) name))
+      (Some (unescape (unquoted (string-trim (join-rest parts)))))
+      None))
+
+(: unquoted (-> string string))
+(defun (unquoted s)
+  (if (and (>= (string-length s) 2) (string-starts-with? s "\"") (string-ends-with? s "\""))
+      (.Substring s 1 (- (string-length s) 2))
+      s))
 
 ;; ---------------------------------------------------------------------------
 ;; Reading its body
@@ -664,6 +705,78 @@
 (: with-header (-> Response string string Response))
 (defun (with-header r name value)
   (record-set r (headers (vec-add (record-ref r headers) (Tuple name value)))))
+
+;; Sets a cookie: adds a `Set-Cookie` header, one for each cookie. What the
+;; browser is told to do with it starts at the careful choice, since a cookie
+;; that is too open still works and nothing tells anyone:
+;;
+;; - `#:http-only #t`: scripts on the page cannot read it, so one that was
+;;   slipped into a page cannot carry a session away.
+;; - `#:secure #t`: it goes over https only. Browsers count `http://localhost`
+;;   as secure, so it works while an application is being written; on any
+;;   other plain http address the browser drops it.
+;; - `#:same-site "Lax"`: it is sent when the user follows a link here, and not
+;;   with another site's form posts or fetches. `"Strict"` not even with the
+;;   link, `"None"` with everything (browsers take that only with `#:secure`),
+;;   `""` leaves it to the browser.
+;; - `#:path "/"`: it is sent for every path on the site.
+;; - `#:domain ""`: to this host alone. A domain sends it to the subdomains too.
+;; - `#:max-age -1`: it is kept until the browser closes. Otherwise it is kept
+;;   so many seconds, and `0` deletes it: set it again with the path and domain
+;;   it was set with, and any value.
+;;
+;; The value is percent-encoded, so it may be any text, and `request-cookie`
+;; decodes it. A name that is not an HTTP token, a path or domain with a `;` or
+;; a control character in it, or another `#:same-site`, raises
+;; `ArgumentException`.
+(: with-cookie (-> Response string string
+                   (#:path string) (#:domain string) (#:max-age int)
+                   (#:http-only bool) (#:secure bool) (#:same-site string)
+                   Response))
+(defun (with-cookie r name value #:path "/" #:domain "" #:max-age -1
+                    #:http-only #t #:secure #t #:same-site "Lax")
+  (when (or (string-empty? name) (any-char? (fun (c) (not (token-char? c))) name))
+    (refuse (str "a cookie name must be a token: \"" name "\"")))
+  (when (any-char? (fun (c) (not (attribute-char? c))) path)
+    (refuse (str "a cookie path cannot hold a ';' or a control character: \"" path "\"")))
+  (when (any-char? (fun (c) (not (attribute-char? c))) domain)
+    (refuse (str "a cookie domain cannot hold a ';' or a control character: \"" domain "\"")))
+  (unless (or (= same-site "Lax") (= same-site "Strict") (= same-site "None") (= same-site ""))
+    (refuse (str "#:same-site is \"Lax\", \"Strict\", \"None\" or \"\", not \"" same-site "\"")))
+  (when (and (= same-site "None") (not secure))
+    (refuse "#:same-site \"None\" needs #:secure #t; browsers drop the cookie otherwise"))
+  (with-header r "Set-Cookie"
+               (str name "=" (escape value)
+                    (if (string-empty? path) "" (str "; Path=" path))
+                    (if (string-empty? domain) "" (str "; Domain=" domain))
+                    (if (< max-age 0) "" (str "; Max-Age=" (int->string max-age)))
+                    (if secure "; Secure" "")
+                    (if http-only "; HttpOnly" "")
+                    (if (string-empty? same-site) "" (str "; SameSite=" same-site)))))
+
+;; A letter, a digit, or one of the marks an HTTP token may hold.
+(: token-char? (-> char bool))
+(defun (token-char? c)
+  (def n (char->integer c))
+  (or (and (>= n 48) (<= n 57))
+      (and (>= n 65) (<= n 90))
+      (and (>= n 97) (<= n 122))
+      (any-char? (fun (d) (= d c)) "!#$%&'*+-.^_`|~")))
+
+;; Printable ASCII, and not the `;` that would start another attribute.
+(: attribute-char? (-> char bool))
+(defun (attribute-char? c)
+  (def n (char->integer c))
+  (and (>= n 32) (<= n 126) (not (= c #\;))))
+
+(: any-char? (-> (-> char bool) string bool))
+(defun (any-char? pred s)
+  (match (string-index pred s)
+    ((Some at) #t)
+    (None #f)))
+
+(: refuse (-> string %a))
+(defun (refuse why) (raise (cast Exception (Refusal. why))))
 
 ;; ---------------------------------------------------------------------------
 ;; Middleware Pipeline

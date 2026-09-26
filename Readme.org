@@ -81,12 +81,13 @@ Because handlers return a complete ~Response~ value, nothing is written to the c
 | ~(request-param req "id")~          | what ~/users/:id~ bound — an ~Option~              |
 | ~(request-query req "page")~        | ~?page=2~, decoded, ~+~ counted as a space         |
 | ~(request-header req "Accept")~     | case-insensitive                                   |
+| ~(request-cookie req "sid")~        | a cookie's value, decoded; see Cookies             |
 | ~(request-scheme req)~              | ~"http"~ or ~"https"~, as the client asked         |
 | ~(request-host req)~                | ~"example.com"~, with the port if there was one    |
 | ~(request-client req)~              | the client's address, ~"203.0.113.7"~, no port     |
 
-~request-param~, ~-query~ and ~-header~ each have an ~-or~ form taking a
-fallback: ~(request-query-or req "page" "1")~. The last three are what the
+~request-param~, ~-query~, ~-header~ and ~-cookie~ each have an ~-or~ form
+taking a fallback: ~(request-query-or req "page" "1")~. The last three are what the
 client used, which behind a reverse proxy is not what the connection says; see
 Behind a proxy.
 
@@ -191,7 +192,8 @@ build on any of them:
 #+END_SRC
 
 ~with-header~ appends rather than replaces, so a response can carry two
-~Set-Cookie~ s. ~with-content-type~ and ~with-body~ are the other two.
+~Set-Cookie~ s — though ~with-cookie~, below, is the way to write one.
+~with-content-type~ and ~with-body~ are the other two.
 
 A response's body is a ~Body~:
 
@@ -211,6 +213,46 @@ one, whatever the handler gave it. A ~HEAD~ answered by a ~GET~ route gets the
 
 There is no JSON writer here. ~(text json)~ is one import away, and putting one
 in this package would make every program that serves plain text carry it.
+
+*** Cookies
+
+#+BEGIN_SRC scheme
+;; Kept for a year,
+(with-cookie (text "saved") "theme" "dark" #:max-age 31536000)
+
+;; read back on a later request,
+(request-cookie-or req "theme" "light")
+
+;; and deleted: the same name, path and domain, and a max age of 0.
+(with-cookie (text "forgotten") "theme" "" #:max-age 0)
+#+END_SRC
+
+~with-cookie~ adds one ~Set-Cookie~ header, so two calls set two cookies. What
+the browser is told to do with one starts at the careful choice, because a
+cookie that is too open works just the same and nothing says so:
+
+| ~#:http-only #t~    | scripts on the page cannot read it                                  |
+| ~#:secure #t~       | it goes over https only; browsers count ~http://localhost~ as https |
+| ~#:same-site "Lax"~ | not sent with another site's form posts; or ~"Strict"~, ~"None"~, ~""~ |
+| ~#:path "/"~        | sent for every path                                                 |
+| ~#:domain ""~       | this host only, not its subdomains                                  |
+| ~#:max-age -1~      | kept until the browser closes; else seconds, and ~0~ deletes it      |
+
+The value is percent-encoded, so any text will do, and ~request-cookie~ decodes
+it. A name that is not an HTTP token, a path or domain with a ~;~ in it, and
+~#:same-site "None"~ without ~#:secure~ — which browsers drop — raise
+~ArgumentException~.
+
+~#:secure~ is about what the browser used. Behind a proxy that does TLS the
+browser used https, and the cookie comes back, though the proxy talks plain
+http to this server. Served over plain http anywhere but localhost, the browser
+drops a secure cookie, and ~#:secure #f~ is how to say that is meant.
+
+~request-cookie~ reads the ~Cookie~ header. A quoted value loses its quotes, and
+of two cookies with one name — set for two paths — it gives the one for the
+longer path, which the browser sends first. A browser speaking HTTP/2 may send
+one ~Cookie~ header per cookie; the server joins them again, which Kestrel does
+not do by itself.
 
 *** Middleware Pipeline
 
@@ -689,7 +731,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 46 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 88 checks, a real socket
+bjo run tests/demo.bjo    ;; 98 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, text never
@@ -699,10 +741,15 @@ left byte for byte, escaping in text and in attribute values, that an attribute
 value never gains a newline, computed content through ~,~, ~raw~ and a script,
 fragments, and the document and response wrappers.
 
-Eighty-eight checks: the routing table on its own, then a real Kestrel on a port
-the test picks, fetched over a socket with ~(std http)~ — percent-encoded paths,
-query strings, request headers, a POST body, a suspending handler, a handler
-that raises, the 404 and the 405, a redirect, and twelve requests at once
+Ninety-eight checks: the routing table on its own, and cookies read from a
+header and written to one — decoded, unquoted, the first of two with one name,
+the careful defaults, a deleted cookie, any text there and back, and what is
+refused. Then a real Kestrel on a port the test picks, fetched over a socket
+with ~(std http)~ — percent-encoded paths, query strings, request headers, a
+POST body, a suspending handler, a handler that raises, the 404 and the 405, a
+redirect, two ~Cookie~ headers read as one and two cookies set as two
+~Set-Cookie~ lines (those two over a plain socket, to send the headers as an
+HTTP/2 browser would split them), and twelve requests at once
 through four workers, each getting the answer to its own question. Then a second
 server with one worker and one queue slot, to see that six at once come back
 ~200x2 503+retry-after=1x4~ and that it still serves afterwards.
@@ -770,4 +817,6 @@ it with 1001 rather than wait for it.
 
 ** Planned features
 
-Cookies, an access log, and a time limit on a handler. See ~todo.org~.
+An access log, a time limit on a handler, and TLS of its own, with
+certificates from Let's Encrypt, so that Kestrel can speak HTTP/2 and HTTP/3
+without a proxy in front. See ~todo.org~.

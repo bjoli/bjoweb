@@ -9,7 +9,15 @@
 * DONE Middleware / request pipeline
 * DONE Websockets
 * DONE Behind a proxy: request-scheme/host/client, X-Forwarded-* from #:trusted-proxies
-* TODO Cookies: request-cookie, and with-cookie with Secure, HttpOnly and SameSite
+* DONE Cookies: request-cookie, and with-cookie with Secure, HttpOnly and SameSite
+** DONE Repeated Cookie headers joined with "; ", as HTTP/2 needs; Kestrel does not
 * TODO An access log, with the client's address
 * TODO A handler time limit, per route
 * TODO An upload holds a worker while it arrives; hand it off as a stream is
+* TODO TLS of its own, with certificates from Let's Encrypt, for HTTP/2 and HTTP/3
+** Simplest: load what certbot writes, /etc/letsencrypt/live/<host>/{fullchain,privkey}.pem
+** Or speak ACME in the server, and need no certbot at all
+** Renewal without a restart: Kestrel's ServerCertificateSelector picks the current certificate
+** Kestrel does HTTP/2 over TLS with ALPN, and HTTP/3 over QUIC (needs libmsquic on Linux)
+** certbot's HTTP-01 challenge is a GET under /.well-known/acme-challenge/ on port 80
+** Then the "What this is not" section loses "no TLS, no HTTP/2"

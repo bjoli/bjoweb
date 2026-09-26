@@ -359,6 +359,11 @@
     (route-get    "/boom"         boom)
     (route-get    "/leave"        leave-slowly)
     (route-get    "/spawn-fails"  spawn-and-fail)
+    ;; --- cookies ---
+    (route-get    "/cookies"      (fun (req) (text (str (request-cookie-or req "a" "-") ";"
+                                                        (request-cookie-or req "b" "-")))))
+    (route-get    "/set-cookies"  (fun (req) (with-cookie (with-cookie (text "set") "a" "1")
+                                                          "b" "two words" #:max-age 60)))
     ;; An ordinary lambda in a slot declared `(-bjo-> ...)`: the compiler lifts
     ;; it, so a handler that never suspends needs no `defbjo` of its own.
     (route-get    "/elsewhere"    (fun (req) (redirect "/")))
@@ -801,6 +806,65 @@
     (str (string-join answers ",") "|" plain)))
 
 ;; ---------------------------------------------------------------------------
+;; Cookies
+;; ---------------------------------------------------------------------------
+
+;; What `request-cookie` makes of a `Cookie` header, name by name, `-` for none.
+(: cookies-in (-> string (Vec string) string))
+(defun (cookies-in header names)
+  (def r (make-request "GET" "/" (map-empty) (map-set (map-empty) "cookie" header) ""))
+  (string-join (vec-map (fun (n) (request-cookie-or r n "-")) names) "|"))
+
+;; The values of a response's headers, which `with-cookie` adds to, in order.
+(: set-cookies (-> Response string))
+(defun (set-cookies r)
+  (string-join (loop (:for h (response-headers r))
+                     (:acc out (vecing (match h ((Tuple name value) value)))))
+               " / "))
+
+;; The header, or `refused` when `with-cookie` will not make one.
+(: refused (-> (-> Response) string))
+(defun (refused make)
+  (match (try (make) #:catch (System.ArgumentException))
+    ((Ok r) (set-cookies r))
+    ((Err e) "refused")))
+
+;; A value set with `with-cookie` and read back with `request-cookie`: the
+;; header's first pair is what a browser would send.
+(: round-trip (-> string string))
+(defun (round-trip value)
+  (def header (set-cookies (with-cookie (text "") "k" value)))
+  (cookies-in (vec-ref (string-split header ";") 0) ["k"]))
+
+;; A GET over a plain socket, with `extra` among its headers: everything that
+;; comes back.
+(: get-raw (-bjo-> int string string string))
+(defbjo (get-raw port path extra)
+  (with-scope
+    (match (tcp-connect "127.0.0.1" port)
+      ((Err e) (str "refused: " (.-Message e)))
+      ((Ok (Tuple in out))
+       (write-bytes! out (to-bytes utf8 (str "GET " path " HTTP/1.1\r\n"
+                                              "Host: localhost\r\n"
+                                              extra
+                                              "Connection: close\r\n\r\n")))
+       (flush! out)
+       (all-that-arrives in)))))
+
+(: after-head (-> string string))
+(defun (after-head all)
+  (def halves (string-split all "\r\n\r\n"))
+  (if (< (vec-length halves) 2) "" (vec-ref halves 1)))
+
+;; The `Set-Cookie` lines in a response's head.
+(: set-cookie-lines (-> string string))
+(defun (set-cookie-lines all)
+  (string-join (loop (:for line (string-split (vec-ref (string-split all "\r\n\r\n") 0) "\r\n"))
+                     (:when (string-starts-with? line "Set-Cookie: "))
+                     (:acc out (vecing line)))
+               " / "))
+
+;; ---------------------------------------------------------------------------
 ;; The routing table on its own, with no server anywhere
 ;; ---------------------------------------------------------------------------
 
@@ -845,6 +909,41 @@
                  (request-form-or r "upload" "no file")))
           "1;two words;no file")
 
+  ;; --- cookies, which need nothing running either --------------------------
+  (expect "cookies read from the header, trimmed, unquoted and decoded"
+          (cookies-in "a=1; b=two%20words;c=\"quoted\"; d=x=y" ["a" "b" "c" "d"])
+          "1|two words|quoted|x=y")
+  (expect "the first of two with one name; none for a bare name or a missing one"
+          (cookies-in "a=first; flag; a=second" ["a" "flag" "e"])
+          "first|-|-")
+  (expect "no Cookie header, no cookie"
+          (match (request-cookie (make-request "GET" "/" (map-empty) (map-empty) "") "a")
+            ((Some v) v)
+            (None "none"))
+          "none")
+  (expect "a cookie set with the careful defaults, its value encoded"
+          (set-cookies (with-cookie (text "") "sid" "a b;c"))
+          "sid=a%20b%3Bc; Path=/; Secure; HttpOnly; SameSite=Lax")
+  (expect "and with each of them changed"
+          (set-cookies (with-cookie (text "") "theme" "dark" #:path "/app" #:domain "example.com"
+                                    #:max-age 3600 #:http-only #f #:same-site "Strict"))
+          "theme=dark; Path=/app; Domain=example.com; Max-Age=3600; Secure; SameSite=Strict")
+  (expect "a deleted one, and one with everything left out, as two headers"
+          (set-cookies (with-cookie (with-cookie (text "") "a" "" #:max-age 0)
+                                    "b" "2" #:path "" #:secure #f #:http-only #f #:same-site ""))
+          "a=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax / b=2")
+  (expect "any text comes back as it went"
+          (round-trip "Björn; a=b, \"quoted\" 100%")
+          "Björn; a=b, \"quoted\" 100%")
+  (expect "a name that is no token, a path with a ';', no such SameSite, None without Secure"
+          (string-join [(refused (fun () (with-cookie (text "") "a b" "1")))
+                        (refused (fun () (with-cookie (text "") "a" "1" #:path "/; Domain=evil.example")))
+                        (refused (fun () (with-cookie (text "") "a" "1" #:same-site "Sometimes")))
+                        (refused (fun () (with-cookie (text "") "a" "1" #:same-site "None" #:secure #f)))
+                        (refused (fun () (with-cookie (text "") "a" "1" #:same-site "None")))]
+                       " | ")
+          "refused | refused | refused | refused | a=1; Path=/; Secure; HttpOnly; SameSite=None")
+
   ;; --- and now a real socket -----------------------------------------------
   (def port (free-port))
   (def base (str "http://127.0.0.1:" (int->string port)))
@@ -871,6 +970,17 @@
               (expect "a request header"
                       (fetched (get (str base "/headers") #:headers [(Tuple "X-Note" "hi")]))
                       (Tuple 200 "hi"))
+
+              ;; Over a plain socket, so that the two `Cookie` lines go out
+              ;; exactly as they are written here.
+              (expect "two Cookie headers, as an HTTP/2 browser may send, read as one"
+                      (after-head (get-raw port "/cookies" "Cookie: a=1\r\nCookie: b=2\r\n"))
+                      "1;2")
+
+              (expect "two cookies set go out as two Set-Cookie lines"
+                      (set-cookie-lines (get-raw port "/set-cookies" ""))
+                      (str "Set-Cookie: a=1; Path=/; Secure; HttpOnly; SameSite=Lax / "
+                           "Set-Cookie: b=two%20words; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Lax"))
 
               (expect "everything after the wildcard"
                       (body-of (str base "/static/css/site.css")) (Tuple 200 "css/site.css"))

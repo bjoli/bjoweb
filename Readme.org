@@ -633,7 +633,7 @@ It is an ordinary ~bjo~ package. From a project of your own:
 #+BEGIN_SRC scheme
 (depends
   (package (name (bjoweb))
-           (version (version-at-least "0.2.0"))
+           (version (version-at-least "0.3.0"))
            (source (git (url "https://github.com/bjoli/bjoweb")))))
 #+END_SRC
 
@@ -642,6 +642,18 @@ it. bjoweb needs a Bjolang whose ~(std net)~ has ~stream->ports~, and from
 0.1.1 on one where closing a byte output port writes only what is pending. From
 0.2.0 on it also needs one where ~utf8~ writes no byte order mark and a call
 handed to a waiting receiver is taken. See Bjolang's changelog for all three.
+
+*** From 0.2 to 0.3
+
+- A handler runs in a scope of its own. Its worker waits for it even when the
+  client has gone, so ~#:workers~ bounds how many handlers run at once;
+  ~#:cancel-on-disconnect #t~ cancels it instead.
+- A fiber a handler spawns belongs to the request: the response waits for it,
+  and one that fails is answered 500 rather than failing the scope the server
+  was started in. Work meant to outlive the request goes to a fiber that does.
+- HTML text is printed as it was written: only an element whose children are
+  all blocks is broken over lines. A test that compares rendered markup as a
+  string has new expectations to write; see "The output has newlines".
 
 *** From 0.1 to 0.2
 

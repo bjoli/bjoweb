@@ -474,7 +474,7 @@
     (box-set! handed-off #t)))
 
 ;; What ended a session or a stream first.
-(type (: Ending (Union (Returned (Result Exception Unit))
+(type (: Ending (Union (: Returned (Result Exception Unit))
                        Gone
                        Stopping)))
 

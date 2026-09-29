@@ -35,7 +35,7 @@
 
 ;; One segment of a route pattern.
 ;; `Rest` binds the remaining path. A bare `*` binds to `"rest"`.
-(type (: Segment (Union (Literal string) (Param string) (Rest string))))
+(type (: Segment (Union (: Literal string) (: Param string) (: Rest string))))
 
 ;; A single route definition, including its parsed segments.
 (type (: Route (Record (: method string)
@@ -48,8 +48,8 @@
 
 ;; The result of matching a request against the router.
 ;; Can be matched, unmatched (404), or wrong method (405).
-(type (: Match (Union (Matched Request Handler)
-                      (WrongMethod string)
+(type (: Match (Union (: Matched Request Handler)
+                      (: WrongMethod string)
                       Unmatched)))
 
 ;; ---------------------------------------------------------------------------

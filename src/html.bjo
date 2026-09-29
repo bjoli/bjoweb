@@ -78,11 +78,11 @@
 (defun (raw markup) (Raw (html markup)))
 
 (type-rec
-  (: Node (Union (NText string)
-                 (NRaw Raw)
-                 (NSym Symbol)
-                 (NInt int)
-                 (NSub (List Node))))
+  (: Node (Union (: NText string)
+                 (: NRaw Raw)
+                 (: NSym Symbol)
+                 (: NInt int)
+                 (: NSub (List Node))))
   ;; What a parameter must say. See the head of this file.
   (: Nodes (Alias (List Node))))
 

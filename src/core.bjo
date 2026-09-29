@@ -90,12 +90,12 @@
 
 ;; Where a body comes from: bytes already in memory, or a function that opens
 ;; it as a port that fails once more than the limit it is given has been read.
-(type (: BodySource (Union (InMemory (Array byte))
-                           (FromPort (-> int ByteInputPort)))))
+(type (: BodySource (Union (: InMemory (Array byte))
+                           (: FromPort (-> int ByteInputPort)))))
 
 ;; How far a body has got. It is read once, into memory, or taken once as a
 ;; port, and not both.
-(type (: BodyState (Union Unread (Buffered (Array byte)) Taken)))
+(type (: BodyState (Union Unread (: Buffered (Array byte)) Taken)))
 
 ;; A request's body. `limit` is how much of it may be read into memory. The
 ;; router copies the request to bind its parameters, and the copies share the
@@ -141,10 +141,10 @@
 ;; known in advance, so it goes out chunked. `Upgraded` is what `websocket`
 ;; answers with.
 (type (: Body (Union Empty
-                     (Text string)
-                     (Bytes (Array byte))
-                     (Streamed BodyWriter)
-                     (Upgraded Upgrade))))
+                     (: Text string)
+                     (: Bytes (Array byte))
+                     (: Streamed BodyWriter)
+                     (: Upgraded Upgrade))))
 
 ;; Represents an HTTP response. Nothing is written until the handler has
 ;; returned one.
@@ -603,8 +603,8 @@
                                 (string-replace (string-replace s "\r" "\\r") "\n" "\\n")))))))
 
 ;; What woke the loop that owns an event stream's port.
-(type (: Relayed (Union (Finished (Result Exception Unit))
-                        (Said string)
+(type (: Relayed (Union (: Finished (Result Exception Unit))
+                        (: Said string)
                         Quiet)))
 
 ;; Once the writer has returned, anything it started is stopped, and a sink

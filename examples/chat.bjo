@@ -20,9 +20,9 @@
 (import (bjoweb html))
 
 ;; What the room is told.
-(type (: Note (Union (Joined (Inbox string))
-                     (Left (Inbox string))
-                     (Said string))))
+(type (: Note (Union (: Joined (Inbox string))
+                     (: Left (Inbox string))
+                     (: Said string))))
 
 ;; The room keeps one inbox per client and posts every line to each of them.
 ;; A post never waits, so a client that has stopped reading loses its oldest
@@ -38,7 +38,7 @@
        (go members)))))
 
 ;; What woke a session.
-(type (: Turn (Union (FromClient Message) (FromRoom string) Gone)))
+(type (: Turn (Union (: FromClient Message) (: FromRoom string) Gone)))
 
 ;; One client. The session is cancelled once its socket has closed, so leaving
 ;; the room is in `#:finally`, and is a post, which does not wait.

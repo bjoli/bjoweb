@@ -547,8 +547,10 @@ helper.
 
 #+BEGIN_SRC scheme
 ;; default values. Does not serve static files. 
-(serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128 #:quiet #t #:static-files #f #:static-dir "wwwroot"
-           #:trusted-proxies ["127.0.0.0/8" "::1"] #:max-body 1048576 #:cancel-on-disconnect #f)
+(serve app #:port 8080 #:host "127.0.0.1" #:workers 16 #:queue 128
+       #:quiet #t #:static-files #f #:static-dir "wwwroot"
+       #:trusted-proxies ["127.0.0.0/8" "::1"] #:max-body 1048576
+       #:cancel-on-disconnect #f)
 #+END_SRC
 
 ~start-server~ and ~stop-server!~ are the pair for a program that has something

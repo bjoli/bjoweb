@@ -36,8 +36,7 @@
            (route-get "/" (fun (req) (text "hello, world\n")))
            ;; `:what` matches one segment and binds it under that name. It
            ;; arrives percent-decoded — that is the server's job, not yours.
-           (route-get "/echo/:what"
-                      (fun (req) (text (str (request-param-or req "what" "") "\n"))))
+           (route-get "/echo/:what" #(text (str (request-param-or & "what" "") "\n")))
            (route-get "/page/:what" show))
          #:port 8080)
   0)

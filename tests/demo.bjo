@@ -1374,5 +1374,20 @@
               ((Err e) "refused")))
           "refused")
 
+  ;; A port something else listens on. The start is refused, and the scope it
+  ;; was made in ends: the workers it spawned there are let go.
+  (def holder (PortProbe. loopback 0))
+  (start-it holder)
+  (def held-port (match (cast Object (bound-to holder))
+                   ((:is System.Net.IPEndPoint here) (ip-port here))
+                   (_ 0)))
+  (expect "a port that is taken stops the start, and leaves nothing running"
+          (with-scope
+            (match (try (start-server app #:port held-port) #:catch (System.IO.IOException))
+              ((Ok server) (stop-server! server) "started")
+              ((Err e) "refused")))
+          "refused")
+  (stop-it holder)
+
   (println "bjoweb ok")
   0)

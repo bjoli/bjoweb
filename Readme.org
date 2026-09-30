@@ -566,6 +566,17 @@ else to do — a test, mostly:
 
 *Workers are spawned into the caller's scope.* Therefore, ~start-server~ must be used inside a ~with-scope~ that shouldn't end until ~stop-server!~ is called. Using ~serve~ handles this automatically.
 
+A server that cannot start — another program has its port, say — does not
+start either way. ~serve~ ends the program with one line and status 1:
+
+#+BEGIN_SRC text
+bjoweb: cannot serve at http://127.0.0.1:8080: Address already in use
+#+END_SRC
+
+~start-server~ raises what Kestrel said, an ~IOException~ for a port that is
+taken, and lets go of the workers it spawned, so the scope it was called in
+can end. Unless ~#:quiet #f~, ASP.NET does not log the failure as well.
+
 ~stop-server!~ stops Kestrel first and closes the inbox second. Kestrel's stop
 waits for the requests already in the pipeline, and those are calls the workers
 still have to answer — so the inbox has to be open while it runs. Closing it
@@ -733,7 +744,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 46 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 98 checks, a real socket
+bjo run tests/demo.bjo    ;; 99 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, text never
@@ -743,7 +754,7 @@ left byte for byte, escaping in text and in attribute values, that an attribute
 value never gains a newline, computed content through ~,~, ~raw~ and a script,
 fragments, and the document and response wrappers.
 
-Ninety-eight checks: the routing table on its own, and cookies read from a
+Ninety-nine checks: the routing table on its own, and cookies read from a
 header and written to one — decoded, unquoted, the first of two with one name,
 the careful defaults, a deleted cookie, any text there and back, and what is
 refused. Then a real Kestrel on a port the test picks, fetched over a socket
@@ -808,7 +819,9 @@ The test's client is on loopback, so to the first server it is a trusted proxy:
 its ~X-Forwarded-*~ are believed, but not an address written left of the one
 it added, and a trusted proxy further out is looked past. A server told to
 trust only other networks ignores the same headers, and one told to trust a
-host name does not start.
+host name does not start. Nor does one on a port something else listens on,
+and the scope it was started in still ends: leaving its workers waiting there,
+as 0.5.0 did, makes the test hang.
 
 Then websockets, with ~websocket-connect~ as the client: an echo of text and
 binary, a session that returns and one that raises, a subprotocol, a middleware

@@ -128,6 +128,11 @@
   (app-lifetime  (: Microsoft.AspNetCore.Builder.WebApplication.Lifetime (-> App Lifetime) #:get))
   (stopping      (: Microsoft.Extensions.Hosting.IHostApplicationLifetime.ApplicationStopping
                     (-> Lifetime CancellationToken) #:get))
+  (started       (: Microsoft.Extensions.Hosting.IHostApplicationLifetime.ApplicationStarted
+                    (-> Lifetime CancellationToken) #:get))
+  (fired?        (: System.Threading.CancellationToken.IsCancellationRequested
+                    (-> CancellationToken bool) #:get))
+  (inner-exception (: System.Exception.InnerException (-> System.Exception System.Exception) #:get))
 
   ;; --- Upgrading a connection ---
   ;;
@@ -219,10 +224,14 @@
 
 ;; Creates the ASP.NET WebApplication.
 ;; Sets the environment variable to reduce ASP.NET logging noise unless `#:quiet #f`.
+;; The host's own log of a failed start is silenced too, because the failure
+;; reaches the caller anyway: `start-server` raises it and `serve` says it in
+;; one line, where the log would add two stack traces.
 (: new-app (-> bool string App))
 (defun (new-app quiet static-dir)
   (when quiet
-    (set-environment-variable! "Logging__LogLevel__Default" "Warning"))
+    (set-environment-variable! "Logging__LogLevel__Default" "Warning")
+    (set-environment-variable! "Logging__LogLevel__Microsoft.Extensions.Hosting.Internal.Host" "None"))
   (set-environment-variable! "ASPNETCORE_WEBROOT" static-dir)
   (build-app (slim-builder)))
 
@@ -297,6 +306,9 @@
 ;;
 ;; A handler whose client has gone is waited for, unless `#:cancel-on-disconnect`
 ;; says to cancel it.
+;;
+;; A server that cannot start — its address is taken, say — raises what Kestrel
+;; said, having let go of the workers it spawned.
 (: start-server (-bjo-> Router
                         (#:port int) (#:host string) (#:workers int) (#:queue int)
                         (#:quiet bool) (#:static-files bool) (#:static-dir string)
@@ -317,7 +329,14 @@
                         (cancel-on-disconnect cancel-on-disconnect)))
   (loop (:for i (range 0 workers))
         (:do (spawn (worker serving requests))))
-  (app-start app)
+  (match (try (app-start app) #:catch (System.Exception))
+    ((Ok u) unit)
+    ;; The workers and the watch are the caller's scope's, and would keep it
+    ;; open for a server that never was.
+    ((Err e)
+     (inbox-close! going-away)
+     (inbox-close! requests)
+     (raise e)))
   (Server (app app) (requests requests) (going-away going-away) (url url) (port port)))
 
 ;; Stops accepting requests, finishes pending ones, and shuts down the workers.
@@ -329,7 +348,20 @@
   (app-stop (record-ref s app))
   (inbox-close! (record-ref s requests)))
 
+;; The first cause of a failure. Kestrel's "failed to bind" wraps the socket's
+;; own "Address already in use", which says it without repeating the address.
+(: first-cause (-> System.Exception System.Exception))
+(defun (first-cause e)
+  (match (cast Object (inner-exception e))
+    ((:is System.Exception inner) (first-cause inner))
+    (_ e)))
+
 ;; Starts the server and blocks until stopped by an external signal (e.g., Ctrl-C).
+;;
+;; A server that cannot start — its address is taken, say — ends the program
+;; with one line saying so, and status 1: this is what a `main` calls last, and
+;; a stack trace from inside the host says nothing more. What fails once it has
+;; started is raised as it is.
 (: serve (-bjo-> Router
                  (#:port int) (#:host string) (#:workers int) (#:queue int)
                  (#:quiet bool) (#:static-files bool) (#:static-dir string)
@@ -342,6 +374,9 @@
   (def requests (make-request-inbox queue))
   (def going-away (latch))
   (def app (new-app quiet static-dir))
+  (def url (str "http://" host ":" (int->string port)))
+  ;; Taken now: a host that fails is disposed before its failure arrives here.
+  (def up (started (app-lifetime app)))
   (install-inbox! app requests static-files)
   (def serving (Serving (router rt) (going-away going-away) (trusted trusted) (max-body max-body)
                         (cancel-on-disconnect cancel-on-disconnect)))
@@ -351,7 +386,12 @@
      (loop (:for i (range 0 workers))
            (:do (spawn (worker serving requests))))
      (try
-         (app-run app (str "http://" host ":" (int->string port)))
+         (match (try (app-run app url) #:catch (System.Exception))
+           ((Ok u) unit)
+           ((Err e)
+            (if (fired? up)
+                (raise e)
+                (panic! (str "bjoweb: cannot serve at " url ": " (.-Message (first-cause e)))))))
        #:finally (let ()
                    (inbox-close! going-away)
                    (inbox-close! requests))))))

@@ -181,6 +181,7 @@ as they arrive.
 | ~(json-text "{\"a\":1}")~      | ~application/json; charset=utf-8~      |
 | ~(respond 418 "no" #:content-type "text/plain")~ | anything else        |
 | ~(binary bytes)~               | ~application/octet-stream~, or ~#:content-type~ |
+| ~(file "/srv/cat.png" #:content-type "image/png")~ | a file, sent from the disk |
 | ~(redirect "/next")~           | 302, or 301 with ~#:permanent #t~      |
 | ~(not-found)~ ~(bad-request why)~ ~(method-not-allowed allow)~ ~(server-error)~ | |
 
@@ -200,6 +201,7 @@ A response's body is a ~Body~:
 | ~Empty~                  | nothing                                    |
 | ~(Text string)~          | sent as UTF-8, with no byte order mark     |
 | ~(Bytes (Array byte))~   | sent as it is                              |
+| ~(File path)~            | the file, read as it is sent               |
 | ~(Streamed writer)~      | written as it is produced; see Streaming   |
 | ~(Upgraded upgrade)~     | what ~websocket~ answers with; see below   |
 
@@ -210,6 +212,15 @@ A response's body is a ~Body~:
 dropped. A status that cannot have a body — 1xx, 204, 304 — is sent without
 one, whatever the handler gave it. A ~HEAD~ answered by a ~GET~ route gets the
 ~GET~'s ~Content-Length~ and no body.
+
+A file is opened once the handler has returned, and read into a pooled buffer
+a piece at a time, so a big one is never all in memory. It goes out as it was
+when it was opened, with the length it had then: a file replaced meanwhile by
+renaming a new one over it goes out whole, the old or the new. One that is not
+there by then is answered 404. Long text goes out a piece at a time as well,
+encoded into one buffer, rather than as one array its size: an array of
+85 000 bytes or more is only swept by a full collection, and a server making
+one a request spends its time collecting.
 
 There is no JSON writer here. ~(text json)~ is one import away, and putting one
 in this package would make every program that serves plain text carry it.
@@ -698,6 +709,11 @@ it. bjoweb needs a Bjolang whose ~(std net)~ has ~stream->ports~, and from
 0.2.0 on it also needs one where ~utf8~ writes no byte order mark and a call
 handed to a waiting receiver is taken. See Bjolang's changelog for all three.
 
+*** From 0.5 to 0.6
+
+- ~Body~ has a ~File~ case, which ~file~ answers with: a ~match~ on a body that
+  names every case has one more to name.
+
 *** From 0.2 to 0.3
 
 - A handler runs in a scope of its own. Its worker waits for it even when the
@@ -744,7 +760,7 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 46 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 99 checks, a real socket
+bjo run tests/demo.bjo    ;; 106 checks, a real socket
 #+END_SRC
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, text never
@@ -754,7 +770,7 @@ left byte for byte, escaping in text and in attribute values, that an attribute
 value never gains a newline, computed content through ~,~, ~raw~ and a script,
 fragments, and the document and response wrappers.
 
-Ninety-nine checks: the routing table on its own, and cookies read from a
+A hundred and six checks: the routing table on its own, and cookies read from a
 header and written to one — decoded, unquoted, the first of two with one name,
 the careful defaults, a deleted cookie, any text there and back, and what is
 refused. Then a real Kestrel on a port the test picks, fetched over a socket
@@ -772,7 +788,11 @@ drops a byte order mark while it decodes: text goes out as UTF-8 with none,
 bytes go out as they are, and a 204 sends nothing whatever its handler gave it.
 And ~Content-Length~: in bytes rather than characters, 0 for an empty body, the
 ~GET~'s for a ~HEAD~, and the body's even when the handler put another one in
-the headers.
+the headers. A text longer than one piece of encoding goes out whole, with an
+astral character whose halves straddle the end of the first piece, which a
+piece that ended between them would send as two replacement characters. A
+file of more than one read goes out as it is, with its length, which a ~HEAD~
+gets too; a file that is not there is answered 404.
 
 Request bodies, with the server's ~#:max-body~ set to 1000: a form, a body
 asked for twice and read once, bytes read as they came, a body over the limit

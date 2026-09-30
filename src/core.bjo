@@ -37,7 +37,7 @@
   parse-query
 
   ;; Making an answer.
-  respond text html json-text binary redirect
+  respond text html json-text binary file redirect
   not-found method-not-allowed bad-request server-error
 
   ;; Answers written as they are produced.
@@ -135,14 +135,16 @@
 ;; fills. The server closes it once the writer returns.
 (type (: BodyWriter (-bjo-> ByteOutputPort void)))
 
-;; What a response carries after its headers. `Text` goes out as UTF-8. The
-;; server sets `Content-Length` for `Text` and `Bytes`, and sends no body with a
+;; What a response carries after its headers. `Text` goes out as UTF-8. `File`
+;; is the file at that path, read as it is sent. The server sets
+;; `Content-Length` for `Text`, `Bytes` and `File`, and sends no body with a
 ;; status that cannot have one (1xx, 204, 304). A `Streamed` body has no length
 ;; known in advance, so it goes out chunked. `Upgraded` is what `websocket`
 ;; answers with.
 (type (: Body (Union Empty
                      (: Text string)
                      (: Bytes (Array byte))
+                     (: File string)
                      (: Streamed BodyWriter)
                      (: Upgraded Upgrade))))
 
@@ -438,9 +440,12 @@
 (: parse-query (-> string (Map string string)))
 (defun (parse-query raw)
   (def text (if (string-starts-with? raw "?") (drop-first raw) raw))
-  (loop (:for pair (string-split text "&"))
-        (:when (not (string-empty? pair)))
-        (:acc all (folding (map-empty) (add-parameter all pair)))))
+  ;; Most requests have no query.
+  (if (string-empty? text)
+      (map-empty)
+      (loop (:for pair (string-split text "&"))
+            (:when (not (string-empty? pair)))
+            (:acc all (folding (map-empty) (add-parameter all pair))))))
 
 (: add-parameter (-> (Map string string) string (Map string string)))
 (defun (add-parameter all pair)
@@ -509,6 +514,14 @@
 (: binary (-> (Array byte) (#:status int) (#:content-type string) Response))
 (defun (binary data #:status 200 #:content-type "application/octet-stream")
   (Response (status status) (content-type content-type) (headers (vec-empty)) (body (Bytes data))))
+
+;; The file at `path`, sent as it is. It is opened when the answer is written,
+;; after the handler has returned, and read a piece at a time, so a big one is
+;; never all in memory; `Content-Length` is its size then. A file that is not
+;; there by that time is answered 404.
+(: file (-> string (#:status int) (#:content-type string) Response))
+(defun (file path #:status 200 #:content-type "application/octet-stream")
+  (Response (status status) (content-type content-type) (headers (vec-empty)) (body (File path))))
 
 ;; A body written as it is produced: a large download, or the output of a long
 ;; computation. `writer` runs on a fiber of its own once the head has gone out,

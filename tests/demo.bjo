@@ -58,6 +58,7 @@
   (stop-it   (: System.Net.Sockets.TcpListener.Stop (-> PortProbe void)))
   (bound-to  (: System.Net.Sockets.TcpListener.LocalEndpoint (-> PortProbe Endpoint) #:get))
   (ip-port   (: System.Net.IPEndPoint.Port (-> System.Net.IPEndPoint int) #:get))
+  (temp-dir  (: System.IO.Path.GetTempPath (-> string)))
   (to-bytes  (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
   (from-bytes (: System.Text.Encoding.GetString (-> Encoding (Array byte) string))))
 
@@ -106,6 +107,22 @@
   (text "done"))
 
 (def busy-app (router (route-get "/" dawdle)))
+
+;; --- Bodies that are long, or files ------------------------------------------
+
+;; What `/file` sends: more than one read of the file's worth, and not all of
+;; it ASCII. 100 000 + 7 bytes.
+(: served-file string)
+(def served-file (path-combine (temp-dir) "bjoweb-demo-served.txt"))
+
+(: served-text string)
+(def served-text (str (xs 100000) "grüße"))
+
+;; Longer than one piece of text is encoded at a time, with an astral
+;; character whose two halves are the 16 384th and 16 385th UTF-16 units, so
+;; that the first piece would end between them. 16 383 + 4 + 5000 × 8 bytes.
+(: long-text string)
+(def long-text (str (xs 16383) "😀" (repeated "grüße " 5000)))
 
 (: echo (-bjo-> Request Response))
 (defbjo (echo req)
@@ -373,6 +390,9 @@
     (route-get    "/empty"        (fun (req) (with-body (text "") Empty)))
     (route-get    "/lying"        (fun (req) (with-header (text "abc") "Content-Length" "99")))
     (route-get    "/nobody"       (fun (req) (with-status (text "dropped") 204)))
+    (route-get    "/long"         (fun (req) (text long-text)))
+    (route-get    "/file"         (fun (req) (file served-file #:content-type "text/plain; charset=utf-8")))
+    (route-get    "/file/missing" (fun (req) (file (str served-file ".not-there"))))
     ;; --- streamed bodies ---
     (route-get    "/stream/count"   (fun (req) (stream count-to-three #:content-type "text/plain")))
     (route-get    "/stream/text"    (fun (req) (stream-text greeting-text)))
@@ -945,6 +965,7 @@
           "refused | refused | refused | refused | a=1; Path=/; Secure; HttpOnly; SameSite=None")
 
   ;; --- and now a real socket -----------------------------------------------
+  (file-write-text served-file served-text)
   (def port (free-port))
   (def base (str "http://127.0.0.1:" (int->string port)))
 
@@ -1135,6 +1156,27 @@
 
               (expect "a 204 sends no body, whatever the handler gave it"
                       (body-bytes port "/nobody") "")
+
+              (expect "a long text goes out whole, a character split across two pieces too"
+                      (fetched (get (str base "/long"))) (Tuple 200 long-text))
+
+              (expect "with its length in bytes"
+                      (length-of (get (str base "/long"))) "200 56387")
+
+              (expect "which HEAD answers with too"
+                      (length-of (request http/HEAD (str base "/long"))) "200 56387")
+
+              (expect "a file goes out as it is"
+                      (fetched (get (str base "/file"))) (Tuple 200 served-text))
+
+              (expect "with its length"
+                      (length-of (get (str base "/file"))) "200 100007")
+
+              (expect "HEAD answers with the file's length and no body"
+                      (length-of (request http/HEAD (str base "/file"))) "200 100007")
+
+              (expect "a file that is not there is not found"
+                      (fetched (get (str base "/file/missing"))) (Tuple 404 "404 Not Found\n"))
 
               ;; --- streamed bodies ----------------------------------------
               (expect "a streamed body"
@@ -1389,5 +1431,6 @@
           "refused")
   (stop-it holder)
 
+  (file-delete served-file)
   (println "bjoweb ok")
   0)

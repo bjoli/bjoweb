@@ -73,7 +73,13 @@
   ;; A byte port over a stream it does not own, for the response body: nothing
   ;; registers it on a scope, so no scope's release writes to it with a
   ;; blocking call, and closing it leaves the stream to Kestrel.
-  (BodyPort    (: Bjolang.Runtime.BjoByteOutputPort (-> Stream bool BodyPort))))
+  (BodyPort    (: Bjolang.Runtime.BjoByteOutputPort (-> Stream bool BodyPort)))
+  ;; A file sent as a body.
+  (FileIn      (: System.IO.FileStream (-> string FileMode FileAccess FileShare FileIn)
+                  #:exceptions (System.IO.IOException System.UnauthorizedAccessException)))
+  (FileMode    (: System.IO.FileMode))
+  (FileAccess  (: System.IO.FileAccess))
+  (FileShare   (: System.IO.FileShare)))
 
 (import/extern
   ;; --- Building and running the host ---
@@ -180,6 +186,14 @@
   (utf8          (: System.Text.Encoding.UTF8 #:get))
   ;; Never includes a byte order mark, whatever the encoding writes on a stream.
   (encode        (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
+  ;; The UTF-16 units from `index`, `count` of them, into `bytes` at `at`;
+  ;; answers how many bytes that made.
+  (encode-into   (: System.Text.Encoding.GetBytes (-> Encoding string int int (Array byte) int int)))
+  (byte-count    (: System.Text.Encoding.GetByteCount (-> Encoding string int)))
+  (high-surrogate? (: System.Char.IsHighSurrogate (-> string int bool)))
+  (file-length   (: System.IO.FileStream.Length (-> FileIn long) #:get))
+  (copy-to!      (: System.IO.Stream.CopyToAsync (-> Stream Stream void) #:async))
+  (dispose!      (: System.IO.Stream.Dispose (-> Stream void)))
   (from-base64   (: System.Convert.FromBase64String (-> string (Array byte))
                     #:exceptions (System.FormatException)))
   ;; A completed task.
@@ -786,10 +800,18 @@
   (def scheme (in-scheme (ctx-request ctx)))
   (def host (map-ref-or headers "host" ""))
   (match (peer-ip ctx)
-    ((Some ip) (if (trusted? trusted ip)
+    ((Some ip) (if (and (forwarding? headers) (trusted? trusted ip))
                    (forwarded trusted headers scheme host (.ToString ip))
                    (Tuple scheme host (.ToString ip))))
     (None (Tuple scheme host ""))))
+
+;; Whether a proxy said anything. A request with none of the three says what
+;; its connection says even from a trusted proxy, so there is nothing to read.
+(: forwarding? (-> (Map string string) bool))
+(defun (forwarding? headers)
+  (or (map-contains? headers "x-forwarded-for")
+      (map-contains? headers "x-forwarded-proto")
+      (map-contains? headers "x-forwarded-host")))
 
 ;; What a trusted proxy says. Every proxy on the way appends the address it was
 ;; reached from to `X-Forwarded-For`, so read from the right the list can be
@@ -835,8 +857,13 @@
 ;; header arrive joined with a comma already.
 (: header-list (-> (Map string string) string (Vec string)))
 (defun (header-list headers name)
-  (vec-filter (fun (s) (not (string-empty? s)))
-              (vec-map string-trim (string-split (map-ref-or headers name "") ","))))
+  (match (map-try-ref headers name)
+    (None (vec-empty))
+    ((Some value)
+     (loop (:for entry (string-split value ","))
+           (:let trimmed (string-trim entry))
+           (:when (not (string-empty? trimmed)))
+           (:acc (vecing trimmed))))))
 
 ;; The entry `n` from the right, the leftmost when there are fewer, and
 ;; `fallback` when there are none.
@@ -851,21 +878,106 @@
 ;; Response -> HttpResponse
 ;; ===========================================================================
 
-;; Writes the status, the headers and a body known in full. `Content-Length` is
-;; the body's, so one among the headers is dropped when there is a body to send.
+;; Writes the status, the headers and a body known in full: empty, text, bytes
+;; or a file. `Content-Length` is the body's, so one among the headers is
+;; dropped when there is a body to send. A `HEAD` gets the length and no body,
+;; which Kestrel would throw away.
 (: write-response! (-bjo-> Ctx Response void))
 (defbjo (write-response! ctx answer)
+  (def body (response-body answer))
+  (if (body-allowed? (response-status answer))
+      (match body
+        ((File path) (write-file! ctx answer path))
+        ((Streamed writer) (write-head! ctx answer #f))
+        ((Upgraded up) (write-head! ctx answer #f))
+        (_ (write-head! ctx answer #t)
+           (send-fixed! ctx body)))
+      (write-head! ctx answer #f)))
+
+;; How many UTF-16 units of a long text are encoded at a time. None makes more
+;; than three bytes of UTF-8, so the buffer they are encoded into is 48 KiB:
+;; under the 85 000 bytes from which an array goes on the large object heap,
+;; which only a full collection sweeps.
+(: text-piece int)
+(def text-piece 16384)
+
+;; An empty, text or bytes body. A short text is encoded at once; a long one a
+;; piece at a time as it goes out, so that no array its size is made.
+(: send-fixed! (-bjo-> Ctx Body void))
+(defbjo (send-fixed! ctx body)
   (def out (ctx-response ctx))
-  (def payload (if (body-allowed? (response-status answer))
-                   (fixed-body (response-body answer))
-                   None))
-  (write-head! ctx answer (some? payload))
-  (match payload
-    ((Some bytes)
-     (def n (array-length bytes))
-     (header-add! (out-headers out) "Content-Length" (Values. (int->string n)))
-     (when (> n 0) (body-write! (out-body out) bytes 0 n)))
-    (None unit)))
+  (def head? (= (in-method (ctx-request ctx)) "HEAD"))
+  (match body
+    ((Text s)
+     (if (<= (string-length s) text-piece)
+         (send-bytes! out (encode utf8 s) head?)
+         (begin
+           (content-length! out (int->string (byte-count utf8 s)))
+           (unless head? (send-pieces! out s)))))
+    ((Bytes data) (send-bytes! out data head?))
+    (_ (content-length! out "0"))))
+
+(: send-bytes! (-bjo-> Outgoing (Array byte) bool void))
+(defbjo (send-bytes! out bytes head?)
+  (def n (array-length bytes))
+  (content-length! out (int->string n))
+  (when (and (> n 0) (not head?))
+    (body-write! (out-body out) bytes 0 n)))
+
+(: send-pieces! (-bjo-> Outgoing string void))
+(defbjo (send-pieces! out s)
+  (def n (string-length s))
+  (def buffer (piece-buffer))
+  (let go ((at 0))
+    (when (< at n)
+      (let* ((end (piece-end s at n))
+             (made (encode-into utf8 s at (- end at) buffer 0)))
+        (body-write! (out-body out) buffer 0 made)
+        (go end)))))
+
+(: piece-buffer (-> (Array byte)))
+(defun (piece-buffer) (make-array (* 3 text-piece)))
+
+;; Where the piece from `at` ends: `text-piece` units on, or at the end of the
+;; text, and never between the two halves of a surrogate pair, which would go
+;; out as two replacement characters.
+(: piece-end (-> string int int int))
+(defun (piece-end s at n)
+  (def end (if (< (- n at) text-piece) n (+ at text-piece)))
+  (if (and (< end n) (high-surrogate? s (- end 1))) (- end 1) end))
+
+;; A file body: the file as it is when it is opened, with the length it has
+;; then, so that one replaced meanwhile — a new version renamed over it — goes
+;; out whole, the old or the new. Other readers, and a rename over it, are let
+;; be while it is sent. It is read a piece at a time, into a pooled buffer.
+;;
+;; A file that is not there is answered 404, one that cannot be read 500.
+(: write-file! (-bjo-> Ctx Response string void))
+(defbjo (write-file! ctx answer path)
+  (def in (ctx-request ctx))
+  ;; 5 is FileShare.Read | FileShare.Delete.
+  (match (FileIn. path FileMode.Open FileAccess.Read (cast FileShare 5))
+    ((Ok opened)
+     (def file (cast Stream opened))
+     (try
+         (let ()
+           (write-head! ctx answer #t)
+           (content-length! (ctx-response ctx) (.ToString (file-length opened)))
+           (unless (= (in-method in) "HEAD")
+             (copy-to! file (out-body (ctx-response ctx)))))
+       #:finally (dispose! file)))
+    ((Err e)
+     (match e
+       ((:is System.IO.FileNotFoundException gone) (write-response! ctx (not-found)))
+       ((:is System.IO.DirectoryNotFoundException gone) (write-response! ctx (not-found)))
+       (_
+        (log (str "bjoweb: " (in-method in) " " (text-or-empty (path-text (in-path in)))
+                  " cannot send " path ": " (.-Message e)))
+        (write-response! ctx (server-error)))))))
+
+(: content-length! (-> Outgoing string void))
+(defun (content-length! out n)
+  (header-add! (out-headers out) "Content-Length" (Values. n)))
 
 ;; The status, the content type and the headers. `drop-length` leaves out a
 ;; `Content-Length` among them, for a body whose length is known here.
@@ -884,13 +996,3 @@
 (: body-allowed? (-> int bool))
 (defun (body-allowed? status)
   (not (or (< status 200) (= status 204) (= status 304))))
-
-;; The bytes of a body that is known in full.
-(: fixed-body (-> Body (Option (Array byte))))
-(defun (fixed-body b)
-  (match b
-    (Empty (Some (make-array 0)))
-    ((Text s) (Some (encode utf8 s)))
-    ((Bytes data) (Some data))
-    ((Streamed writer) None)
-    ((Upgraded up) None)))

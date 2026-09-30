@@ -1247,15 +1247,15 @@
   (with-scope
     (let ((server (start-server app #:port ws-port #:workers 2)))
       (def opened (websocket-connect (str "ws://127.0.0.1:" (int->string ws-port) "/ws/echo")))
-      (def before (now))
+      (def before (monotonic-ms))
       (stop-server! server)
-      (def took (- (now) before))
+      (def took (- (monotonic-ms) before))
       (expect "stopping the server closes an open websocket with 1001"
               (match opened
                 ((Ok ws) (status-text (sync (websocket-closed ws))))
                 ((Err e) (str "refused: " (.-Message e))))
               "1001:the server is stopping")
-      (expect-true "and does not wait for it to close on its own" (< took 3000))))
+      (expect-true "and does not wait for it to close on its own" (< took 3000L))))
 
   ;; --- stopping with a stream open ------------------------------------------
   ;;
@@ -1281,10 +1281,10 @@
                                                 ((Err e) (.-Message e)))))
                                (wrap (timeout 3000) (fun (u) "timed out"))))
                  "200")
-         (def before (now))
+         (def before (monotonic-ms))
          (stop-server! server)
-         (def took (- (now) before))
-         (expect-true "stopping the server does not wait for an open stream" (< took 3000))
+         (def took (- (monotonic-ms) before))
+         (expect-true "stopping the server does not wait for an open stream" (< took 3000L))
          (expect "which is cut off rather than ended"
                  (if (string-contains? (read-until in the-end 3000 opened) the-end) "ended" "cut off")
                  "cut off")

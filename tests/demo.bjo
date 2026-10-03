@@ -423,12 +423,12 @@
        (Tuple code body)))))
 
 (: body-of (-bjo-> string (Tuple int string)))
-(defbjo (body-of url) (fetched (get url)))
+(defbjo (body-of url) (fetched (http-get url)))
 
 ;; The status alone, and the header that goes with a refusal.
 (: status-and-retry (-bjo-> string (Tuple int string)))
 (defbjo (status-and-retry url)
-  (match (fetch (get url))
+  (match (fetch (http-get url))
     ((Err e) (Tuple 0 (.-Message e)))
     ((Ok r)
      (let* ((code (http-status r))
@@ -488,7 +488,7 @@
 ;; and the client.
 (: who (-bjo-> string (Vec (Tuple string string)) string))
 (defbjo (who base headers)
-  (match (fetched (get (str base "/whoami") #:headers headers))
+  (match (fetched (http-get (str base "/whoami") #:headers headers))
     ((Tuple code body) body)))
 
 ;; ---------------------------------------------------------------------------
@@ -697,7 +697,7 @@
 ;; The values of some response headers, `-` for one that is missing.
 (: header-values (-bjo-> string (Vec string) string))
 (defbjo (header-values url names)
-  (match (fetch (get url))
+  (match (fetch (http-get url))
     ((Err e) (.-Message e))
     ((Ok r)
      (let ((values (loop (:for n names)
@@ -735,7 +735,7 @@
 ;; waited would wait for good, so it is given three seconds and then stopped.
 (: late-send (-bjo-> string string))
 (defbjo (late-send base)
-  (ignore (fetched (get (str base "/events/escape"))))
+  (ignore (fetched (http-get (str base "/events/escape"))))
   (match (sync (choose (wrap (inbox-recv kept-sinks) (fun (s) (Some s)))
                        (wrap (timeout 3000) (fun (u) None))))
     (None "no sink was kept")
@@ -989,7 +989,7 @@
                       (body-of (str base "/query?a=1&b=two+words")) (Tuple 200 "1;two words"))
 
               (expect "a request header"
-                      (fetched (get (str base "/headers") #:headers [(Tuple "X-Note" "hi")]))
+                      (fetched (http-get (str base "/headers") #:headers [(Tuple "X-Note" "hi")]))
                       (Tuple 200 "hi"))
 
               ;; Over a plain socket, so that the two `Cookie` lines go out
@@ -1007,17 +1007,17 @@
                       (body-of (str base "/static/css/site.css")) (Tuple 200 "css/site.css"))
 
               (expect "a body sent and read back"
-                      (fetched (post (str base "/echo") (http/Text "ping")))
+                      (fetched (http-post (str base "/echo") (http/Text "ping")))
                       (Tuple 200 "{\"said\":\"ping\"}"))
 
               ;; --- request bodies -----------------------------------------
               (expect "a form"
-                      (fetched (post (str base "/form")
+                      (fetched (http-post (str base "/form")
                                      (http/Form [(Tuple "a" "1") (Tuple "b" "two words")])))
                       (Tuple 200 "1;two words"))
 
               (expect "a body asked for twice is read once"
-                      (fetched (post (str base "/twice") (http/Text "ping")))
+                      (fetched (http-post (str base "/twice") (http/Text "ping")))
                       (Tuple 200 "ping|ping"))
 
               (expect "bytes, as they came"
@@ -1025,7 +1025,7 @@
                       "200 | 0.1.254.255.")
 
               (expect "a body over #:max-body is refused with 413"
-                      (match (fetched (post (str base "/echo") (http/Text (xs 2000))))
+                      (match (fetched (http-post (str base "/echo") (http/Text (xs 2000))))
                         ((Tuple code body) code))
                       413)
 
@@ -1037,11 +1037,11 @@
                       "413")
 
               (expect "a handler that takes the body as a port may take more"
-                      (fetched (post (str base "/upload") (http/Text (xs 5000))))
+                      (fetched (http-post (str base "/upload") (http/Text (xs 5000))))
                       (Tuple 200 "5000"))
 
               (expect "a body nobody reads is not refused"
-                      (fetched (post (str base "/ignore") (http/Text (xs 5000))))
+                      (fetched (http-post (str base "/ignore") (http/Text (xs 5000))))
                       (Tuple 200 "ignored"))
 
               ;; --- multipart ----------------------------------------------
@@ -1095,7 +1095,7 @@
               (expect "no route" (body-of (str base "/nowhere")) (Tuple 404 "404 Not Found\n"))
 
               (expect "the wrong verb"
-                      (fetched (post (str base "/") http/Empty))
+                      (fetched (http-post (str base "/") http/Empty))
                       (Tuple 405 "405 Method Not Allowed\n"))
 
               (expect "a handler that raised"
@@ -1137,7 +1137,7 @@
                       (body-bytes port "/") "104.101.108.108.111.")
 
               (expect "with its length in bytes, not in characters"
-                      (length-of (get (str base "/hello/Bj%C3%B6rn"))) "200 13")
+                      (length-of (http-get (str base "/hello/Bj%C3%B6rn"))) "200 13")
 
               (expect "HEAD answers with the length and no body"
                       (length-of (request http/HEAD (str base "/"))) "200 5")
@@ -1146,47 +1146,47 @@
                       (body-bytes port "/bytes") "0.1.254.255.")
 
               (expect "with their length"
-                      (length-of (get (str base "/bytes"))) "200 4")
+                      (length-of (http-get (str base "/bytes"))) "200 4")
 
               (expect "an empty body has length 0"
-                      (length-of (get (str base "/empty"))) "200 0")
+                      (length-of (http-get (str base "/empty"))) "200 0")
 
               (expect "a Content-Length among the headers is replaced by the body's"
-                      (fetched (get (str base "/lying"))) (Tuple 200 "abc"))
+                      (fetched (http-get (str base "/lying"))) (Tuple 200 "abc"))
 
               (expect "a 204 sends no body, whatever the handler gave it"
                       (body-bytes port "/nobody") "")
 
               (expect "a long text goes out whole, a character split across two pieces too"
-                      (fetched (get (str base "/long"))) (Tuple 200 long-text))
+                      (fetched (http-get (str base "/long"))) (Tuple 200 long-text))
 
               (expect "with its length in bytes"
-                      (length-of (get (str base "/long"))) "200 56387")
+                      (length-of (http-get (str base "/long"))) "200 56387")
 
               (expect "which HEAD answers with too"
                       (length-of (request http/HEAD (str base "/long"))) "200 56387")
 
               (expect "a file goes out as it is"
-                      (fetched (get (str base "/file"))) (Tuple 200 served-text))
+                      (fetched (http-get (str base "/file"))) (Tuple 200 served-text))
 
               (expect "with its length"
-                      (length-of (get (str base "/file"))) "200 100007")
+                      (length-of (http-get (str base "/file"))) "200 100007")
 
               (expect "HEAD answers with the file's length and no body"
                       (length-of (request http/HEAD (str base "/file"))) "200 100007")
 
               (expect "a file that is not there is not found"
-                      (fetched (get (str base "/file/missing"))) (Tuple 404 "404 Not Found\n"))
+                      (fetched (http-get (str base "/file/missing"))) (Tuple 404 "404 Not Found\n"))
 
               ;; --- streamed bodies ----------------------------------------
               (expect "a streamed body"
-                      (fetched (get (str base "/stream/count"))) (Tuple 200 "0\n1\n2\n"))
+                      (fetched (http-get (str base "/stream/count"))) (Tuple 200 "0\n1\n2\n"))
 
               (expect "has no Content-Length"
-                      (length-of (get (str base "/stream/count"))) "200 -")
+                      (length-of (http-get (str base "/stream/count"))) "200 -")
 
               (expect "streamed text, flushed in the middle"
-                      (fetched (get (str base "/stream/text"))) (Tuple 200 "grüße, welt"))
+                      (fetched (http-get (str base "/stream/text"))) (Tuple 200 "grüße, welt"))
 
               (expect "the first part goes out while the writer is still writing"
                       (first-part-early port)
@@ -1204,13 +1204,13 @@
                       "200 not called")
 
               (expect "which GET does call"
-                      (let ((answer (length-of (get (str base "/stream/head")))))
+                      (let ((answer (length-of (http-get (str base "/stream/head")))))
                         (str (vec-ref (string-split answer " ") 0) " " (probed)))
                       "200 called")
 
               ;; --- server-sent events -------------------------------------
               (expect "an event stream: an opening comment, the retry, and each event whole"
-                      (fetched (get (str base "/events/some")))
+                      (fetched (http-get (str base "/events/some")))
                       (Tuple 200 (str ":\n"
                                       "retry: 2500\n\n"
                                       "event: greeting\nid: 1\ndata: hello\n\n"

@@ -59,7 +59,7 @@
   escape escape-attribute)
 
 (import (std prelude))
-(import (only (std set) list->set set-contains?))
+(import (only (std hashset) list->hashset hashset-contains?))
 (import (bjoweb core))
 
 ;; ---------------------------------------------------------------------------
@@ -106,36 +106,36 @@
 ;; ---------------------------------------------------------------------------
 
 ;; Elements with no closing tag.
-(: void-tags (Set string))
+(: void-tags (HashSet string))
 (def void-tags
-  (list->set (list "area" "base" "br" "col" "embed" "hr" "img" "input" "link" "meta" "param"
+  (list->hashset (list "area" "base" "br" "col" "embed" "hr" "img" "input" "link" "meta" "param"
                    "source" "track" "wbr")))
 
 (: void-tag? (-> string bool))
-(defun (void-tag? name) (set-contains? void-tags name))
+(defun (void-tag? name) (hashset-contains? void-tags name))
 
 ;; Elements whose content is the content. Every byte between the tags is part
 ;; of the value, so indenting inside one does not tidy it up — it edits it.
 ;; These are therefore printed with no added whitespace whatsoever.
-(: preformatted-tags (Set string))
-(def preformatted-tags (list->set (list "pre" "textarea")))
+(: preformatted-tags (HashSet string))
+(def preformatted-tags (list->hashset (list "pre" "textarea")))
 
 (: preformatted-tag? (-> string bool))
-(defun (preformatted-tag? name) (set-contains? preformatted-tags name))
+(defun (preformatted-tag? name) (hashset-contains? preformatted-tags name))
 
 ;; Elements that sit in a line of text: HTML's phrasing content, less the ones
 ;; that render nothing (`script`, `template`). A newline beside one of these is
 ;; a space the reader sees.
-(: inline-tags (Set string))
+(: inline-tags (HashSet string))
 (def inline-tags
-  (list->set (list "a" "abbr" "audio" "b" "bdi" "bdo" "br" "button" "canvas" "cite" "code"
+  (list->hashset (list "a" "abbr" "audio" "b" "bdi" "bdo" "br" "button" "canvas" "cite" "code"
                    "data" "datalist" "del" "dfn" "em" "embed" "i" "iframe" "img" "input" "ins"
                    "kbd" "label" "map" "mark" "math" "meter" "object" "output" "picture"
                    "progress" "q" "ruby" "s" "samp" "select" "slot" "small" "span" "strong"
                    "sub" "sup" "svg" "textarea" "time" "u" "var" "video" "wbr")))
 
 (: inline-tag? (-> string bool))
-(defun (inline-tag? name) (set-contains? inline-tags name))
+(defun (inline-tag? name) (hashset-contains? inline-tags name))
 
 ;; ---------------------------------------------------------------------------
 ;; Rendering

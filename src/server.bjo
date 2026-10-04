@@ -87,7 +87,7 @@
   ;; Uses CreateSlimBuilder for a faster startup with fewer default services.
   (slim-builder  (: Microsoft.AspNetCore.Builder.WebApplication.CreateSlimBuilder (-> AppBuilder)))
   (build-app     (: Microsoft.AspNetCore.Builder.WebApplicationBuilder.Build (-> AppBuilder App)))
-  (app-urls      (: Microsoft.AspNetCore.Builder.WebApplication.Urls (-> App (Collection string)) #:get))
+  (app-urls      (: Microsoft.AspNetCore.Builder.WebApplication.Urls (-> App (Collection System.String)) #:get))
   (app-start     (: Microsoft.AspNetCore.Builder.WebApplication.StartAsync (-> App void) #:async))
   (app-stop      (: Microsoft.AspNetCore.Builder.WebApplication.StopAsync (-> App void) #:async))
   ;; Runs the application and blocks until host shutdown.
@@ -124,6 +124,8 @@
                     (-> HeaderDict string Values void)))
   (out-body      (: Microsoft.AspNetCore.Http.HttpResponse.Body (-> Outgoing Stream) #:get))
   (body-write!   (: System.IO.Stream.WriteAsync (-> Stream (Array byte) int int void) #:async))
+  ;; A string's own UTF-8.
+  (body-write-text! (: System.IO.Stream.WriteAsync (-> Stream (System.ReadOnlyMemory byte) void) #:async))
   ;; Sends the head now, before any of a streamed body exists.
   (start!        (: Microsoft.AspNetCore.Http.HttpResponse.StartAsync (-> Outgoing void) #:async))
   ;; Drops the connection, so that a body that was cut off is not taken for a
@@ -183,14 +185,6 @@
                       (-> Rejected int) #:get))
 
   ;; --- Base .NET ---
-  (utf8          (: System.Text.Encoding.UTF8 #:get))
-  ;; Never includes a byte order mark, whatever the encoding writes on a stream.
-  (encode        (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
-  ;; The UTF-16 units from `index`, `count` of them, into `bytes` at `at`;
-  ;; answers how many bytes that made.
-  (encode-into   (: System.Text.Encoding.GetBytes (-> Encoding string int int (Array byte) int int)))
-  (byte-count    (: System.Text.Encoding.GetByteCount (-> Encoding string int)))
-  (high-surrogate? (: System.Char.IsHighSurrogate (-> string int bool)))
   (file-length   (: System.IO.FileStream.Length (-> FileIn long) #:get))
   (copy-to!      (: System.IO.Stream.CopyToAsync (-> Stream Stream void) #:async))
   (dispose!      (: System.IO.Stream.Dispose (-> Stream void)))
@@ -199,12 +193,10 @@
   ;; A completed task.
   (nothing-to-do (: System.Threading.Tasks.Task.CompletedTask Task #:get)))
 
-;; Extracts a string, returning an empty string if null.
+;; Extracts a string, returning an empty string if null. A .NET string becomes
+;; a Bjolang one at the call, and a null becomes "" there.
 (: text-or-empty (-> string string))
-(defun (text-or-empty s)
-  (match (cast Object s)
-    ((:is System.String present) present)
-    (_ "")))
+(defun (text-or-empty s) s)
 
 ;; ===========================================================================
 ;; The server
@@ -439,7 +431,7 @@
 (defbjo (answer serving c)
   (def handed-off (make-box #f))
   (try
-      (ignore (try (answer-now serving c handed-off) #:catch (System.Exception)))
+      (match (try (answer-now serving c handed-off) #:catch (System.Exception)) ((Err e) (println (.ToString e))) (_ unit))
     #:finally (unless (box-ref handed-off) (ignore (call-reply! c unit)))))
 
 ;; Executes the handler and writes the response.
@@ -701,7 +693,7 @@
 (: read-request (-> Ctx (Vec Network) int Request))
 (defun (read-request ctx trusted max-body)
   (def in (ctx-request ctx))
-  (def headers (collect-headers (cast (Seq (Pairing string Values)) (in-headers in))))
+  (def headers (collect-headers (cast (Seq (Pairing System.String Values)) (in-headers in))))
   (match (reached-as trusted ctx headers)
     ((Tuple scheme host client)
      (make-request/streamed (in-method in)
@@ -734,7 +726,7 @@
 ;; instead, which is what its pairs are separated by: HTTP/2 lets a browser
 ;; split it into one header per cookie, and says the server joins them so
 ;; (RFC 9113, 8.2.3). Kestrel does not.
-(: collect-headers (-> (Seq (Pairing string Values)) (Map string string)))
+(: collect-headers (-> (Seq (Pairing System.String Values)) (Map string string)))
 (defun (collect-headers headers)
   (loop (:for h headers)
         (:acc all (mapping (header-entry (string-downcase (.-Key h)) (.-Value h))))))
@@ -894,26 +886,17 @@
            (send-fixed! ctx body)))
       (write-head! ctx answer #f)))
 
-;; How many UTF-16 units of a long text are encoded at a time. None makes more
-;; than three bytes of UTF-8, so the buffer they are encoded into is 48 KiB:
-;; under the 85 000 bytes from which an array goes on the large object heap,
-;; which only a full collection sweeps.
-(: text-piece int)
-(def text-piece 16384)
-
-;; An empty, text or bytes body. A short text is encoded at once; a long one a
-;; piece at a time as it goes out, so that no array its size is made.
+;; An empty, text or bytes body. A text is UTF-8 already, so its bytes go out
+;; as they are, with no copy made.
 (: send-fixed! (-bjo-> Ctx Body void))
 (defbjo (send-fixed! ctx body)
   (def out (ctx-response ctx))
   (def head? (= (in-method (ctx-request ctx)) "HEAD"))
   (match body
     ((Text s)
-     (if (<= (string-length s) text-piece)
-         (send-bytes! out (encode utf8 s) head?)
-         (begin
-           (content-length! out (int->string (byte-count utf8 s)))
-           (unless head? (send-pieces! out s)))))
+     (content-length! out (int->string (string-length s)))
+     (unless (or head? (string-empty? s))
+       (body-write-text! (out-body out) (.AsMemory s))))
     ((Bytes data) (send-bytes! out data head?))
     (_ (content-length! out "0"))))
 
@@ -923,28 +906,6 @@
   (content-length! out (int->string n))
   (when (and (> n 0) (not head?))
     (body-write! (out-body out) bytes 0 n)))
-
-(: send-pieces! (-bjo-> Outgoing string void))
-(defbjo (send-pieces! out s)
-  (def n (string-length s))
-  (def buffer (piece-buffer))
-  (let go ((at 0))
-    (when (< at n)
-      (let* ((end (piece-end s at n))
-             (made (encode-into utf8 s at (- end at) buffer 0)))
-        (body-write! (out-body out) buffer 0 made)
-        (go end)))))
-
-(: piece-buffer (-> (Array byte)))
-(defun (piece-buffer) (make-array (* 3 text-piece)))
-
-;; Where the piece from `at` ends: `text-piece` units on, or at the end of the
-;; text, and never between the two halves of a surrogate pair, which would go
-;; out as two replacement characters.
-(: piece-end (-> string int int int))
-(defun (piece-end s at n)
-  (def end (if (< (- n at) text-piece) n (+ at text-piece)))
-  (if (and (< end n) (high-surrogate? s (- end 1))) (- end 1) end))
 
 ;; A file body: the file as it is when it is opened, with the length it has
 ;; then, so that one replaced meanwhile — a new version renamed over it — goes

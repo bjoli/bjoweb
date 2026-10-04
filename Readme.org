@@ -217,10 +217,8 @@ A file is opened once the handler has returned, and read into a pooled buffer
 a piece at a time, so a big one is never all in memory. It goes out as it was
 when it was opened, with the length it had then: a file replaced meanwhile by
 renaming a new one over it goes out whole, the old or the new. One that is not
-there by then is answered 404. Long text goes out a piece at a time as well,
-encoded into one buffer, rather than as one array its size: an array of
-85 000 bytes or more is only swept by a full collection, and a server making
-one a request spends its time collecting.
+there by then is answered 404. Text goes out as the UTF-8 the string already
+is, with no copy made.
 
 There is no JSON writer here. ~(text json)~ is one import away, and putting one
 in this package would make every program that serves plain text carry it.
@@ -788,9 +786,7 @@ drops a byte order mark while it decodes: text goes out as UTF-8 with none,
 bytes go out as they are, and a 204 sends nothing whatever its handler gave it.
 And ~Content-Length~: in bytes rather than characters, 0 for an empty body, the
 ~GET~'s for a ~HEAD~, and the body's even when the handler put another one in
-the headers. A text longer than one piece of encoding goes out whole, with an
-astral character whose halves straddle the end of the first piece, which a
-piece that ended between them would send as two replacement characters. A
+the headers. A long text with an astral character in it goes out whole. A
 file of more than one read goes out as it is, with its length, which a ~HEAD~
 gets too; a file that is not there is answered 404.
 

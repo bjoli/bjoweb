@@ -66,9 +66,9 @@
 ;; Returns the string without its first character.
 (: drop-first (-> string string))
 (defun (drop-first s)
-  (substring/cursors s
-                     (string-cursor-next s (string-cursor-start s))
-                     (string-cursor-end s)))
+  (substring s
+             (string-cursor-next s (string-cursor-start s))
+             (string-cursor-end s)))
 
 (: parse-segment (-> string Segment))
 (defun (parse-segment piece)

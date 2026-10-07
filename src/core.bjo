@@ -57,8 +57,9 @@
   pipeline)
 
 (import (std prelude))
-(import (only (std ports) byte->text-output-port utf8
+(import (only (std ports) byte->text-output-port
               read-some byte-pipe write-bytes! close-byte-output-port!))
+(import (only (text encodings) utf-8))
 (import (only (std inbox) make-inbox inbox-close! inbox-closed))
 (import (net websocket protocol))
 (import (bjoweb multipart))
@@ -75,10 +76,14 @@
 (import/extern
   (collect!     (: System.IO.MemoryStream.Write (-> Collected (Array byte) int int void)))
   (collected    (: System.IO.MemoryStream.ToArray (-> Collected (Array byte))))
-  (utf8-bytes   (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
-  (utf8-text    (: System.Text.Encoding.GetString (-> Encoding (Array byte) int int string)))
   (unescape     (: System.Uri.UnescapeDataString (-> string string)))
   (escape       (: System.Uri.EscapeDataString (-> string string))))
+
+;; Text from a client, read as UTF-8 with what is not UTF-8 as U+FFFD: a body
+;; that is not well formed is the handler's to judge, not an error here.
+(: lenient-text (-> (Array byte) int int string))
+(defun (lenient-text bytes start end)
+  (bytes->string bytes #:start start #:end end #:replace (Some #\xFFFD)))
 
 ;; ---------------------------------------------------------------------------
 ;; A header, and the two records
@@ -175,7 +180,7 @@
                     (#:scheme string) (#:host string) (#:client string)
                     Request))
 (defun (make-request method path query headers body #:scheme "http" #:host "" #:client "")
-  (new-request method path query headers (InMemory (utf8-bytes utf8 body)) 0 scheme host client))
+  (new-request method path query headers (InMemory (string->bytes body)) 0 scheme host client))
 
 ;; The same, with a body that is read from a port when it is asked for: the
 ;; server's kind. `open` is given a limit and answers the body as a port that
@@ -330,15 +335,15 @@
      bytes)))
 
 ;; The body as UTF-8 text, `""` when there was none. A byte order mark at the
-;; start is left out, as a text port leaves it out.
+;; start is left out.
 (: request-body (-bjo-> Request string))
 (defbjo (request-body r)
   (def bytes (request-bytes r))
   (def n (array-length bytes))
   (if (and (>= n 3)
            (= (array-ref bytes 0) 239uy) (= (array-ref bytes 1) 187uy) (= (array-ref bytes 2) 191uy))
-      (utf8-text utf8 bytes 3 (- n 3))
-      (utf8-text utf8 bytes 0 n)))
+      (lenient-text bytes 3 n)
+      (lenient-text bytes 0 n)))
 
 ;; The body as a port, for one that should not be held in memory: an upload,
 ;; read and written somewhere as it arrives. `#:max-body` is how much of it may
@@ -547,7 +552,7 @@
 ;; into the byte port, and the server closes that.
 (: write-text-through (-bjo-> (-bjo-> TextOutputPort void) ByteOutputPort void))
 (defbjo (write-text-through writer out)
-  (def port (byte->text-output-port out utf8))
+  (def port (byte->text-output-port out utf-8))
   (writer port)
   (flush-port port))
 
@@ -624,7 +629,7 @@
 ;; that has outlived the stream answers `#f`.
 (: run-events (-bjo-> (-bjo-> EventSink void) int int ByteOutputPort void))
 (defbjo (run-events writer keep-alive retry out)
-  (def port (byte->text-output-port out utf8))
+  (def port (byte->text-output-port out utf-8))
   (def texts (make-chan))
   (def over (make-inbox 1 DropNewest))
   (say! port (str ":\n" (if (> retry 0) (str "retry: " (int->string retry) "\n\n") "")))

@@ -30,7 +30,7 @@
                               (response-text http-text))
                       "http/"))
 (import (only (std net) tcp-connect))
-(import (only (std ports) read-some read-some-evt write-bytes! flush! utf8))
+(import (only (std ports) read-some read-some-evt write-bytes! flush!))
 (import (std inbox))
 (import (bjoweb core))
 (import (bjoweb router))
@@ -58,9 +58,7 @@
   (stop-it   (: System.Net.Sockets.TcpListener.Stop (-> PortProbe void)))
   (bound-to  (: System.Net.Sockets.TcpListener.LocalEndpoint (-> PortProbe Endpoint) #:get))
   (ip-port   (: System.Net.IPEndPoint.Port (-> System.Net.IPEndPoint int) #:get))
-  (temp-dir  (: System.IO.Path.GetTempPath (-> string)))
-  (to-bytes  (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
-  (from-bytes (: System.Text.Encoding.GetString (-> Encoding (Array byte) string))))
+  (temp-dir  (: System.IO.Path.GetTempPath (-> string))))
 
 (: free-port (-> int))
 (defun (free-port)
@@ -232,7 +230,7 @@
 
 (: line (-bjo-> ByteOutputPort string void))
 (defbjo (line out s)
-  (write-bytes! out (to-bytes utf8 (str s "\n")))
+  (write-bytes! out (string->bytes (str s "\n")))
   (flush! out))
 
 (: count-to-three (-bjo-> ByteOutputPort void))
@@ -521,7 +519,7 @@
 
 (: send-get! (-bjo-> ByteOutputPort string void))
 (defbjo (send-get! out path)
-  (write-bytes! out (to-bytes utf8 (str "GET " path " HTTP/1.1\r\n"
+  (write-bytes! out (string->bytes (str "GET " path " HTTP/1.1\r\n"
                                          "Host: localhost\r\n"
                                          "Connection: close\r\n\r\n")))
   (flush! out))
@@ -539,7 +537,7 @@
   (let go ((acc ""))
     (match (sync (choose (wrap (read-some-evt in) (fun (r) (Some r)))
                          (wrap (timeout 3000) (fun (u) None))))
-      ((Some (Ok (Some bs))) (go (str acc (from-bytes utf8 bs))))
+      ((Some (Ok (Some bs))) (go (str acc (bytes->string bs #:replace (Some #\xFFFD)))))
       (_ acc))))
 
 ;; A POST over a plain socket, with `framing` saying how long its body is and
@@ -550,7 +548,7 @@
     (match (tcp-connect "127.0.0.1" port)
       ((Err e) (str "refused: " (.-Message e)))
       ((Ok (Tuple in out))
-       (write-bytes! out (to-bytes utf8 (str "POST " path " HTTP/1.1\r\n"
+       (write-bytes! out (string->bytes (str "POST " path " HTTP/1.1\r\n"
                                               "Host: localhost\r\n"
                                               "Connection: close\r\n"
                                               framing "\r\n")))
@@ -567,7 +565,7 @@
 (: chunked-1800 (-> (Array byte)))
 (defun (chunked-1800)
   (def one (str "258\r\n" (xs 600) "\r\n"))
-  (to-bytes utf8 (str one one one "0\r\n\r\n")))
+  (string->bytes (str one one one "0\r\n\r\n")))
 
 ;; --- Multipart bodies, with the boundary XyZ ---------------------------------
 
@@ -588,7 +586,7 @@
 ;; A multipart POST over a plain socket, `content-type` saying what it is.
 (: post-multipart (-bjo-> int string string string string))
 (defbjo (post-multipart port path content-type body)
-  (def bytes (to-bytes utf8 body))
+  (def bytes (string->bytes body))
   (post-raw port path
             (str "Content-Type: " content-type "\r\n"
                  "Content-Length: " (int->string (array-length bytes)) "\r\n")
@@ -619,7 +617,7 @@
         acc
         (match (sync (choose (wrap (read-some-evt in) (fun (r) (Some r)))
                              (wrap (timeout ms) (fun (u) None))))
-          ((Some (Ok (Some bs))) (go (str acc (from-bytes utf8 bs))))
+          ((Some (Ok (Some bs))) (go (str acc (bytes->string bs #:replace (Some #\xFFFD)))))
           (_ acc)))))
 
 ;; The first part arrives while the writer is still waiting to write the
@@ -862,7 +860,7 @@
     (match (tcp-connect "127.0.0.1" port)
       ((Err e) (str "refused: " (.-Message e)))
       ((Ok (Tuple in out))
-       (write-bytes! out (to-bytes utf8 (str "GET " path " HTTP/1.1\r\n"
+       (write-bytes! out (string->bytes (str "GET " path " HTTP/1.1\r\n"
                                               "Host: localhost\r\n"
                                               extra
                                               "Connection: close\r\n\r\n")))

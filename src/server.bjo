@@ -51,7 +51,6 @@
   (Values      (: Microsoft.Extensions.Primitives.StringValues (-> string Values)))
   ((Collection %a) (: System.Collections.Generic.ICollection))
   (Stream      (: System.IO.Stream))
-  (Encoding    (: System.Text.Encoding))
   (SizeLimit   (: Microsoft.AspNetCore.Http.Features.IHttpMaxRequestBodySizeFeature))
   ;; What Kestrel raises for a request it will not take: 413 for a body over
   ;; the limit, 400 for one that is malformed or cut short.

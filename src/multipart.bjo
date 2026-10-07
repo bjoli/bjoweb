@@ -20,7 +20,7 @@
   part-read-some part-bytes part-text)
 
 (import (std prelude))
-(import (only (std ports) peek-bytes read-bytes utf8))
+(import (only (std ports) peek-bytes read-bytes))
 
 (import/class
   (Violation (: System.Net.ProtocolViolationException (-> string Violation)))
@@ -28,9 +28,14 @@
 
 (import/extern
   (collect!   (: System.IO.MemoryStream.Write (-> Collected (Array byte) int int void)))
-  (collected  (: System.IO.MemoryStream.ToArray (-> Collected (Array byte))))
-  (utf8-bytes (: System.Text.Encoding.GetBytes (-> Encoding string (Array byte))))
-  (utf8-text  (: System.Text.Encoding.GetString (-> Encoding (Array byte) int int string))))
+  (collected  (: System.IO.MemoryStream.ToArray (-> Collected (Array byte)))))
+
+;; Text from a client, read as UTF-8 with what is not UTF-8 as U+FFFD: a
+;; header or a part that is not well formed is the handler's to judge, not
+;; an error here.
+(: lenient-text (-> (Array byte) int int string))
+(defun (lenient-text bytes start end)
+  (bytes->string bytes #:start start #:end end #:replace (Some #\xFFFD)))
 
 ;; ---------------------------------------------------------------------------
 ;; The types
@@ -78,7 +83,7 @@
 (: read-parts (-> InputPort string Parts))
 (defun (read-parts in boundary)
   (Parts (in in)
-         (delimiter (utf8-bytes utf8 (str "\r\n--" boundary)))
+         (delimiter (string->bytes (str "\r\n--" boundary)))
          (phase (make-box Before))
          (current (make-box 0))))
 
@@ -192,7 +197,7 @@
             (match (find-bytes block crlf-crlf 0)
               ((Some at)
                (ignore (read-bytes in (+ at 4)))
-               (parse-headers (utf8-text utf8 block 0 at)))
+               (parse-headers (lenient-text block 0 at)))
               (None (malformed "a part's headers are too long, or never end"))))
            (None (malformed "it ends inside a part's headers")))))
     (None (malformed "it ends inside a part's headers"))))
@@ -270,7 +275,7 @@
 (: part-text (-bjo-> Part string))
 (defbjo (part-text p)
   (def bytes (part-bytes p))
-  (utf8-text utf8 bytes 0 (array-length bytes)))
+  (lenient-text bytes 0 (array-length bytes)))
 
 ;; ---------------------------------------------------------------------------
 ;; Content, up to the delimiter

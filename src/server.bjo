@@ -57,7 +57,7 @@
   ;; the limit, 400 for one that is malformed or cut short.
   (Rejected    (: Microsoft.AspNetCore.Http.BadHttpRequestException))
   ;; The request body, unowned for the reason `BodyPort` is.
-  (BodyIn      (: Bjolang.Runtime.BjoByteInputPort (-> Stream bool BodyIn)))
+  (BodyIn      (: Bjolang.Runtime.BjoInputPort (-> Stream bool BodyIn)))
   (Object      (: System.Object))
   ((Pairing %k %v) (: System.Collections.Generic.KeyValuePair))
   (Lifetime    (: Microsoft.Extensions.Hosting.IHostApplicationLifetime))
@@ -712,14 +712,14 @@
 ;;
 ;; Unowned, so that no scope's release closes Kestrel's stream. The limit can
 ;; no longer be set once the body is being read, nor on an upgraded request.
-(: open-body (-> Ctx int ByteInputPort))
+(: open-body (-> Ctx int InputPort))
 (defun (open-body ctx limit)
   (match (cast Object (size-limit (ctx-features ctx)))
     ((:is Microsoft.AspNetCore.Http.Features.IHttpMaxRequestBodySizeFeature feature)
      (unless (limit-fixed? feature)
        (limit! feature (cast (System.Nullable long) (cast System.Int64 limit)))))
     (_ unit))
-  (cast ByteInputPort (BodyIn. (in-body (ctx-request ctx)) #f)))
+  (cast InputPort (BodyIn. (in-body (ctx-request ctx)) #f)))
 
 ;; Collects headers into a map with lower-cased keys. A header that came more
 ;; than once is one value, joined with `,`. `Cookie` is joined with `; `

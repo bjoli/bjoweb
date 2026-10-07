@@ -498,7 +498,7 @@
   (loop (:for i (range 0 (array-length bs)))
         (:acc acc (folding "" (str acc (byte->string (array-ref bs i)) ".")))))
 
-(: drain-dotted (-bjo-> ByteInputPort string))
+(: drain-dotted (-bjo-> InputPort string))
 (defbjo (drain-dotted in)
   (let go ((acc ""))
     (match (read-some in)
@@ -534,7 +534,7 @@
 
 ;; Everything that arrives on `in` until it ends, or nothing has for three
 ;; seconds.
-(: all-that-arrives (-bjo-> ByteInputPort string))
+(: all-that-arrives (-bjo-> InputPort string))
 (defbjo (all-that-arrives in)
   (let go ((acc ""))
     (match (sync (choose (wrap (read-some-evt in) (fun (r) (Some r)))
@@ -612,7 +612,7 @@
 
 ;; `so-far`, and whatever arrives on `in` after it until `needle` is in it, the
 ;; stream ends, or nothing has arrived for `ms` milliseconds.
-(: read-until (-bjo-> ByteInputPort string int string string))
+(: read-until (-bjo-> InputPort string int string string))
 (defbjo (read-until in needle ms so-far)
   (let go ((acc so-far))
     (if (string-contains? acc needle)

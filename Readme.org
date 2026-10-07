@@ -96,7 +96,7 @@ Behind a proxy.
 | ~(request-body req)~                | the whole body as UTF-8 text, or ~""~              |
 | ~(request-bytes req)~               | the whole body as it came, an ~(Array byte)~       |
 | ~(request-form req "email")~        | a form field, urlencoded or multipart; ~-or~ too   |
-| ~(request-body-port req)~           | the body as a ~ByteInputPort~, read as it arrives  |
+| ~(request-body-port req)~           | the body as a ~InputPort~, read as it arrives  |
 
 A body is read when a handler first asks for it, not before, so a request
 answered 401 or 404 is never read at all. That is why these four suspend,
@@ -170,7 +170,7 @@ path to save it under.
 
 A body that is not multipart, or breaks the format — a boundary that never
 closes, headers that never end — is answered ~400~. ~(bjoweb multipart)~ is the
-parser on its own, over any ~ByteInputPort~, and knows nothing of requests.
+parser on its own, over any ~InputPort~, and knows nothing of requests.
 ~examples/upload.bjo~ is a page with a form, which counts the files sent to it
 as they arrive.
 

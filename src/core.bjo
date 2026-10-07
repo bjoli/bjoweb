@@ -91,7 +91,7 @@
 ;; Where a body comes from: bytes already in memory, or a function that opens
 ;; it as a port that fails once more than the limit it is given has been read.
 (type (: BodySource (Union (: InMemory (Array byte))
-                           (: FromPort (-> int ByteInputPort)))))
+                           (: FromPort (-> int InputPort)))))
 
 ;; How far a body has got. It is read once, into memory, or taken once as a
 ;; port, and not both.
@@ -182,7 +182,7 @@
 ;; fails once more than that has been read. `max-body` is the limit on reading
 ;; it into memory; `request-body-port` may ask for another.
 (: make-request/streamed (-> string string (Map string string) (Map string string)
-                             (-> int ByteInputPort) int
+                             (-> int InputPort) int
                              (#:scheme string) (#:host string) (#:client string)
                              Request))
 (defun (make-request/streamed method path query headers open max-body
@@ -347,7 +347,7 @@
 ;;
 ;; It is the one port there is. Once it is taken, `request-body` and the rest
 ;; raise; a body already read into memory is served from there instead.
-(: request-body-port (-> Request (#:max-body int) ByteInputPort))
+(: request-body-port (-> Request (#:max-body int) InputPort))
 (defun (request-body-port r #:max-body 0)
   (def body (record-ref r body))
   (def state (record-ref body state))
@@ -414,7 +414,7 @@
     ((Some boundary) (read-parts (request-body-port r #:max-body max-body) boundary))
     (None (raise (cast Exception (Violation. "the body is not multipart/form-data"))))))
 
-(: read-to-end (-bjo-> ByteInputPort (Array byte)))
+(: read-to-end (-bjo-> InputPort (Array byte)))
 (defbjo (read-to-end p)
   (def all (Collected.))
   (let go ()
@@ -423,7 +423,7 @@
       (None (collected all)))))
 
 ;; A pipe is in memory, so writing all of it at once never waits.
-(: bytes-port (-> (Array byte) ByteInputPort))
+(: bytes-port (-> (Array byte) InputPort))
 (defun (bytes-port bytes)
   (match (byte-pipe)
     ((Tuple in out)

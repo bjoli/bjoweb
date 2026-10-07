@@ -43,7 +43,7 @@
 ;; A multipart body being read. `delimiter` is CRLF, `--` and the boundary,
 ;; which is what ends every part. `current` numbers the part handed out last,
 ;; so that one handed out before it knows its content is over.
-(type (: Parts #:opaque (Record (: in ByteInputPort)
+(type (: Parts #:opaque (Record (: in InputPort)
                                 (: delimiter (Array byte))
                                 (: phase (Box Phase))
                                 (: current (Box int)))))
@@ -75,7 +75,7 @@
 
 ;; The parts of a body read from `in`, separated by `boundary`. Nothing is read
 ;; until `next-part!` asks.
-(: read-parts (-> ByteInputPort string Parts))
+(: read-parts (-> InputPort string Parts))
 (defun (read-parts in boundary)
   (Parts (in in)
          (delimiter (utf8-bytes utf8 (str "\r\n--" boundary)))
@@ -160,7 +160,7 @@
     (None (malformed "it ends after a boundary"))))
 
 ;; Spaces and tabs may follow a boundary before the end of its line.
-(: skip-padding! (-bjo-> ByteInputPort void))
+(: skip-padding! (-bjo-> InputPort void))
 (defbjo (skip-padding! in)
   (let go ()
     (match (peek-bytes in 0 1)
@@ -170,7 +170,7 @@
          (go)))
       (None unit))))
 
-(: expect-line-end! (-bjo-> ByteInputPort void))
+(: expect-line-end! (-bjo-> InputPort void))
 (defbjo (expect-line-end! in)
   (match (read-bytes in 2)
     ((Some two)
@@ -180,7 +180,7 @@
 
 ;; The headers, up to and including the blank line that ends them, with their
 ;; names lower-cased. The first of a name given twice is kept.
-(: read-headers! (-bjo-> ByteInputPort (Map string string)))
+(: read-headers! (-bjo-> InputPort (Map string string)))
 (defbjo (read-headers! in)
   (match (peek-bytes in 0 2)
     ((Some two)

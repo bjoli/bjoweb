@@ -30,7 +30,7 @@
                               (response-text http-text))
                       "http/"))
 (import (only (std net) tcp-connect))
-(import (only (std ports) read-some read-some-evt write-bytes! flush!))
+(import (only (std ports) read-some read-some-evt write-bytes!))
 (import (std inbox))
 (import (bjoweb core))
 (import (bjoweb router))
@@ -228,30 +228,30 @@
 (: head-probe (Inbox Unit))
 (def head-probe (make-inbox 4 DropNewest))
 
-(: line (-bjo-> ByteOutputPort string void))
+(: line (-bjo-> OutputPort string void))
 (defbjo (line out s)
   (write-bytes! out (string->bytes (str s "\n")))
-  (flush! out))
+  (flush-port out))
 
-(: count-to-three (-bjo-> ByteOutputPort void))
+(: count-to-three (-bjo-> OutputPort void))
 (defbjo (count-to-three out)
   (let go ((i 0))
     (when (< i 3)
       (line out (int->string i))
       (go (+ i 1)))))
 
-(: in-two-parts (-bjo-> ByteOutputPort void))
+(: in-two-parts (-bjo-> OutputPort void))
 (defbjo (in-two-parts out)
   (line out "first")
   (ignore (sync (inbox-recv release)))
   (line out "second"))
 
-(: half-then-boom (-bjo-> ByteOutputPort void))
+(: half-then-boom (-bjo-> OutputPort void))
 (defbjo (half-then-boom out)
   (line out "partial")
   (raise (cast Exception (Boom. "the stream exploded"))))
 
-(: forever (-bjo-> ByteOutputPort void))
+(: forever (-bjo-> OutputPort void))
 (defbjo (forever out)
   (try
       (let go ()
@@ -263,7 +263,7 @@
 ;; Says one thing and then waits, writing nothing, until it is stopped. Kestrel
 ;; aborts a connection itself when a write it is in the middle of is cancelled,
 ;; so a writer stopped while parked is the one that shows what bjoweb does.
-(: say-then-wait (-bjo-> ByteOutputPort void))
+(: say-then-wait (-bjo-> OutputPort void))
 (defbjo (say-then-wait out)
   (try
       (let ()
@@ -271,7 +271,7 @@
         (ignore (sync (timeout 600000))))
     #:finally (ignore (inbox-post! writer-ended unit))))
 
-(: should-not-run (-bjo-> ByteOutputPort void))
+(: should-not-run (-bjo-> OutputPort void))
 (defbjo (should-not-run out)
   (ignore (inbox-post! head-probe unit)))
 
@@ -304,7 +304,7 @@
   (raise (cast Exception (Boom. "the handler's fiber exploded"))))
 
 ;; Text, flushed once in the middle.
-(: greeting-text (-bjo-> TextOutputPort void))
+(: greeting-text (-bjo-> OutputPort void))
 (defbjo (greeting-text t)
   (write-string t "grüße, ")
   (flush-port t)
@@ -517,12 +517,12 @@
        (def parts (string-split (str "." (drain-dotted in)) ".13.10.13.10."))
        (if (< (vec-length parts) 2) "no blank line" (vec-ref parts 1))))))
 
-(: send-get! (-bjo-> ByteOutputPort string void))
+(: send-get! (-bjo-> OutputPort string void))
 (defbjo (send-get! out path)
   (write-bytes! out (string->bytes (str "GET " path " HTTP/1.1\r\n"
                                          "Host: localhost\r\n"
                                          "Connection: close\r\n\r\n")))
-  (flush! out))
+  (flush-port out))
 
 ;; `n` of the letter x.
 (: xs (-> int string))
@@ -553,7 +553,7 @@
                                               "Connection: close\r\n"
                                               framing "\r\n")))
        (write-bytes! out body)
-       (flush! out)
+       (flush-port out)
        (def all (all-that-arrives in))
        (def status-line (vec-ref (string-split all "\r\n") 0))
        (def code (let ((words (string-split status-line " ")))
@@ -864,7 +864,7 @@
                                               "Host: localhost\r\n"
                                               extra
                                               "Connection: close\r\n\r\n")))
-       (flush! out)
+       (flush-port out)
        (all-that-arrives in)))))
 
 (: after-head (-> string string))

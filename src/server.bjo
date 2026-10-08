@@ -25,7 +25,6 @@
 
 (import (std inbox))
 (import (only (std net) stream->ports))
-(import (only (std ports) close-byte-output-port!))
 (import (only (net websocket protocol)
               ports->websocket websocket-accept-key websocket-close! websocket-closed))
 (import (bjoweb core))
@@ -69,10 +68,10 @@
   ;; one address.
   (Network     (: System.Net.IPNetwork (-> Address int Network)))
   (Refusal     (: System.ArgumentException (-> string Refusal)))
-  ;; A byte port over a stream it does not own, for the response body: nothing
-  ;; registers it on a scope, so no scope's release writes to it with a
+  ;; An output port over a stream it does not own, for the response body:
+  ;; nothing registers it on a scope, so no scope's release writes to it with a
   ;; blocking call, and closing it leaves the stream to Kestrel.
-  (BodyPort    (: Bjolang.Runtime.BjoByteOutputPort (-> Stream bool BodyPort)))
+  (BodyPort    (: Bjolang.Runtime.BjoOutputPort (-> Stream bool BodyPort)))
   ;; A file sent as a body.
   (FileIn      (: System.IO.FileStream (-> string FileMode FileAccess FileShare FileIn)
                   #:exceptions (System.IO.IOException System.UnauthorizedAccessException)))
@@ -669,7 +668,7 @@
   (def response (ctx-response ctx))
   (write-head! ctx answer #f)
   (start! response)
-  (def out (cast ByteOutputPort (BodyPort. (out-body response) #f)))
+  (def out (cast OutputPort (BodyPort. (out-body response) #f)))
   (def ending
     (with-cancel (stop)
       (def running (bjo (writer out)))
@@ -679,7 +678,7 @@
       (stop (Requested "the stream is over"))
       winner))
   (match ending
-    ((Returned (Ok u)) (close-byte-output-port! out))
+    ((Returned (Ok u)) (close-output-port out))
     ((Returned (Err e)) (raise e))
     (Gone unit)
     (Stopping (abort-quietly! ctx))))

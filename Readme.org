@@ -118,13 +118,13 @@ An upload too big to hold goes through the port, which has its own limit:
 (: save-upload (-bjo-> Request Response))
 (defbjo (save-upload req)
   (def in (request-body-port req #:max-body (* 200 (* 1024 1024))))
-  (match (open-byte-output-file "upload.bin")
+  (match (open-output-file "upload.bin")
     ((Err e) (server-error))
     ((Ok out)
      (let copy ()
        (match (read-some in)
          ((Some chunk) (write-bytes! out chunk) (copy))
-         (None (close-byte-output-port! out) (text "saved\n")))))))
+         (None (close-output-port out) (text "saved\n")))))))
 #+END_SRC
 
 There is one port. Once it is taken, ~request-body~ and the rest raise; a body
@@ -284,7 +284,7 @@ A body can be written as it is produced — a large download, the output of a
 long computation — rather than built in memory first:
 
 #+BEGIN_SRC scheme
-(: countdown (-bjo-> TextOutputPort void))
+(: countdown (-bjo-> OutputPort void))
 (defbjo (countdown out)
   (let go ((i 10))
     (when (> i 0)
@@ -296,13 +296,13 @@ long computation — rather than built in memory first:
 (router (route-get "/countdown" (fun (req) (stream-text countdown))))
 #+END_SRC
 
-| ~(stream writer)~        | ~writer~ gets the body as a ~ByteOutputPort~; ~application/octet-stream~ |
-| ~(stream-text writer)~   | ~writer~ gets a ~TextOutputPort~ that writes UTF-8; ~text/plain; charset=utf-8~ |
+| ~(stream writer)~        | ~writer~ gets the body as an ~OutputPort~; ~application/octet-stream~ |
+| ~(stream-text writer)~   | the same; ~text/plain; charset=utf-8~ |
 
 Both take ~#:status~ and ~#:content-type~, and the combinators work on what they
-return as on any response. The writer's ports come from ~(std ports)~ and the
-prelude: ~write-bytes!~ and ~flush!~ on the byte port, ~write-string~ and
-~flush-port~ on the text port.
+return as on any response. The port is Bjolang's one ~OutputPort~, so a writer
+writes text with ~write-string~ (as UTF-8) and bytes with ~write-bytes!~ from
+~(std ports)~, on the same port, and ~flush-port~ sends what it has written.
 
 What is written goes out when the writer flushes, or when the port's buffer
 fills. A client that reads slowly makes the writer's writes wait, so a stream
@@ -706,6 +706,15 @@ it. bjoweb needs a Bjolang whose ~(std net)~ has ~stream->ports~, and from
 0.1.1 on one where closing a byte output port writes only what is pending. From
 0.2.0 on it also needs one where ~utf8~ writes no byte order mark and a call
 handed to a waiting receiver is taken. See Bjolang's changelog for all three.
+From 0.9.0 on it needs one with a single ~OutputPort~ type ("One output port
+type, which writes UTF-8").
+
+*** From 0.8 to 0.9
+
+- A ~stream~ or ~stream-text~ writer is ~(-bjo-> OutputPort void)~, for both:
+  Bjolang's ~ByteOutputPort~ and ~TextOutputPort~ are one type now. A writer
+  that took a ~TextOutputPort~ only changes its type; one that called ~flush!~
+  calls ~flush-port~.
 
 *** From 0.5 to 0.6
 

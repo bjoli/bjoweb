@@ -57,9 +57,7 @@
   pipeline)
 
 (import (std prelude))
-(import (only (std ports) byte->text-output-port
-              read-some byte-pipe write-bytes! close-byte-output-port!))
-(import (only (text encodings) utf-8))
+(import (only (std ports) read-some byte-pipe write-bytes!))
 (import (only (std inbox) make-inbox inbox-close! inbox-closed))
 (import (net websocket protocol))
 (import (bjoweb multipart))
@@ -138,7 +136,7 @@
 ;; What writes a streamed body, on a fiber of its own. The port is the response
 ;; body: what is written goes out when the writer flushes it or its buffer
 ;; fills. The server closes it once the writer returns.
-(type (: BodyWriter (-bjo-> ByteOutputPort void)))
+(type (: BodyWriter (-bjo-> OutputPort void)))
 
 ;; What a response carries after its headers. `Text` goes out as UTF-8. `File`
 ;; is the file at that path, read as it is sent. The server sets
@@ -433,7 +431,7 @@
   (match (byte-pipe)
     ((Tuple in out)
      (write-bytes! out bytes)
-     (close-byte-output-port! out)
+     (close-output-port out)
      in)))
 
 ;; ---------------------------------------------------------------------------
@@ -530,8 +528,8 @@
 
 ;; A body written as it is produced: a large download, or the output of a long
 ;; computation. `writer` runs on a fiber of its own once the head has gone out,
-;; and gets the response body as a byte port. `flush!` sends what has been
-;; written so far.
+;; and gets the response body as an output port, for bytes and text alike.
+;; `flush-port` sends what has been written so far.
 ;;
 ;; The body ends cleanly when `writer` returns. When it raises, when the client
 ;; goes away or when the server stops, the connection is aborted instead, so
@@ -541,20 +539,11 @@
 (defun (stream writer #:status 200 #:content-type "application/octet-stream")
   (Response (status status) (content-type content-type) (headers (vec-empty)) (body (Streamed writer))))
 
-;; `stream` for text. `writer` gets a text port over the body that writes
-;; UTF-8, and `flush-port` on it sends what has been written so far.
-(: stream-text (-> (-bjo-> TextOutputPort void) (#:status int) (#:content-type string) Response))
+;; `stream` for text: the same port, which writes text as UTF-8, under a
+;; content type that says so.
+(: stream-text (-> BodyWriter (#:status int) (#:content-type string) Response))
 (defun (stream-text writer #:status 200 #:content-type "text/plain; charset=utf-8")
-  (stream (bjoroutine (out) (write-text-through writer out))
-          #:status status #:content-type content-type))
-
-;; The text port needs no closing: flushing it at the end pushes what it holds
-;; into the byte port, and the server closes that.
-(: write-text-through (-bjo-> (-bjo-> TextOutputPort void) ByteOutputPort void))
-(defbjo (write-text-through writer out)
-  (def port (byte->text-output-port out utf-8))
-  (writer port)
-  (flush-port port))
+  (stream writer #:status status #:content-type content-type))
 
 ;; ---------------------------------------------------------------------------
 ;; Server-sent events
@@ -627,9 +616,8 @@
 
 ;; Once the writer has returned, anything it started is stopped, and a sink
 ;; that has outlived the stream answers `#f`.
-(: run-events (-bjo-> (-bjo-> EventSink void) int int ByteOutputPort void))
-(defbjo (run-events writer keep-alive retry out)
-  (def port (byte->text-output-port out utf-8))
+(: run-events (-bjo-> (-bjo-> EventSink void) int int OutputPort void))
+(defbjo (run-events writer keep-alive retry port)
   (def texts (make-chan))
   (def over (make-inbox 1 DropNewest))
   (say! port (str ":\n" (if (> retry 0) (str "retry: " (int->string retry) "\n\n") "")))
@@ -647,7 +635,7 @@
 
 ;; Writes what the writer sends, and a comment whenever it has been quiet for
 ;; `keep-alive` milliseconds, until it returns.
-(: relay (-bjo-> TextOutputPort (Chan string) (Promise Unit) int (Result Exception Unit)))
+(: relay (-bjo-> OutputPort (Chan string) (Promise Unit) int (Result Exception Unit)))
 (defbjo (relay port texts running keep-alive)
   (let go ()
     (match (sync (choose (wrap (chan-recv texts) (fun (t) (Said t)))
@@ -660,7 +648,7 @@
 (: quiet-for (-> int (Event Unit)))
 (defun (quiet-for ms) (if (> ms 0) (timeout ms) (never)))
 
-(: say! (-bjo-> TextOutputPort string void))
+(: say! (-bjo-> OutputPort string void))
 (defbjo (say! port text)
   (write-string port text)
   (flush-port port))

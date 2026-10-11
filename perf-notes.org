@@ -4,8 +4,7 @@
 Notes from one investigation, October 2026. The numbers are from the
 5900X (24 threads), .NET 10, with ~bench/bjoweb-rate.py~ from the Bjolang
 repository: oha at fixed rates over 256 connections, ~--latency-correction~,
-the server pinned to CPUs 0-11 and oha to 12-23, server GC. All changes
-described here are in the working tree and are not committed.
+the server pinned to CPUs 0-11 and oha to 12-23, server GC.
 
 * What was asked
 
@@ -94,6 +93,7 @@ Measured with ~dotnet-counters~ (total allocated / requests), two runs each:
 | the worker's ~choose~ made once, not per request             | 4755-4823 |
 | headers in two arrays, known names lower-cased once          | 4087-4090 |
 | the router matches on slices in an array, binds only the winner | 3583-3588 |
+| ~handled~ calls the handler on the worker's fiber            | 2778-2779 |
 
 - *The log category* (~server.bjo~, ~new-app~): while
   ~Microsoft.AspNetCore.Hosting.Diagnostics~ logs at any level, ASP.NET starts
@@ -119,6 +119,18 @@ Measured with ~dotnet-counters~ (total allocated / requests), two runs each:
   the route that matched binds its parameters. ~path-segments~ is still
   exported with its ~Vec~. A parameter is a slice of the path, so one kept
   after the request keeps the path alive.
+- *~handled~* (~server.bjo~): the handler ran on a fiber of its own (~bjo~),
+  raced against ~call-abandoned~ in a ~choose~. The ~with-cancel~ scope waits
+  for the handler anyway, so the race only decided between the answer and
+  ~None~; now the handler is called on the worker's fiber in the same scope,
+  and afterwards ~client-gone?~ reads Kestrel's ~RequestAborted~ token, which
+  is what abandons the call, and allocates nothing. With
+  ~#:cancel-on-disconnect~ a ~spawn/daemon~ fiber waits for ~call-abandoned~
+  and cancels the scope; the scope cancels it when the handler is done. The
+  tests of a client that leaves (waited for one at a time, cancelled after
+  its shield, a spawned fiber's failure is the handler's) pass. With DATAS
+  on, 25k/s: p99 1.5 ms, p99.9 6.3-6.9 ms; DATAS now collects ~18 times a
+  second, ~1.2 ms each, since little survives.
 
 Not possible without a compiler change: ~import/extern~ of a member of a
 generic CLR struct (~KeyValuePair`2.Key~) resolves the declaration but not
@@ -168,7 +180,7 @@ each request left its losing sync on the gate. *A server that never closes
 its inbox grew by ~225 bytes a request for as long as it ran.* The old build
 had the same leak.
 
-** The fix (in Bjolang, not committed)
+** The fix (Bjolang d3dbf92)
 
 ~Gate<T>~ now prunes as ~Promise<T>~ does: under its lock, once the list has
 grown to twice what survived the last prune, the nodes whose ~SyncState~ has
@@ -201,16 +213,11 @@ seconds after a server starts. Not looked into.
 
 * What is left
 
-- Commit, or not: bjoweb's four changes (working tree), and Bjolang's
-  ~Gate~ prune with its test (~BjolangRuntime/Cml/Inbox.cs~,
-  ~Cml/Tests/FiberTests.cs~). The old bjoweb is in a worktree at
-  ~/tmp/ab/bjoweb-old~ for comparisons; ~git worktree remove~ it when done.
+- The old bjoweb is in a worktree at ~/tmp/ab/bjoweb-old~ for comparisons;
+  ~git worktree remove~ it when done.
 - Other events that, like the gate, keep a losing branch's waiter until they
   fire: worth a look at every ~Publish~ that only adds to a list.
-- ~handled~, 1.4 KB a request: a scope, a fiber and a ~choose~ for each
-  request, so that a client that hangs up is noticed. The largest item, and
-  the most delicate: cancel-on-disconnect, and a worker staying busy until
-  its handler is done.
+- What the 2.8 KB a request is now: not traced since ~handled~ changed.
 - DATAS: decide whether a server should turn it off. That needs its memory
   cost measured, and a manifest ~runtime~ setting for
   ~System.GC.DynamicAdaptationMode~ in Bjolang if so.

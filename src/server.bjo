@@ -473,20 +473,31 @@
 ;; fails is the handler's failure, not the server's, and the response waits for
 ;; it. The response itself is written after the scope, since a stream or a
 ;; websocket handed off from here must not be waited for.
+;;
+;; The handler is called here, on the worker's fiber. It ran on a fiber of its
+;; own, raced against `call-abandoned` in a `choose`; since the scope waits for
+;; the handler anyway, the race only chose between its answer and `None`, and
+;; asking whether the client has gone once the handler is done answers the
+;; same. That fiber and that `choose` were about 1.1 KB a request. Only
+;; `#:cancel-on-disconnect` needs to hear of the client going while the handler
+;; runs, and it gets a fiber that waits for that and cancels the scope.
 (: handled (-bjo-> Serving (Call Ctx Unit) Request (Option (Result Exception Response))))
 (defbjo (handled serving c req)
-  (match (try (with-cancel (stop)
-                (def running (bjo (handle (record-ref serving router) req)))
-                (match (sync (choose (wrap (promise-join running) (fun (r) (Some r)))
-                                     (wrap (call-abandoned c) (fun (u) None))))
-                  ((Some r) (Some r))
-                  (None
-                   (when (record-ref serving cancel-on-disconnect)
-                     (stop (Requested "the client has gone")))
-                   None)))
-         #:catch (System.Exception))
-    ((Ok outcome) outcome)
-    ((Err e) (Some (Err e)))))
+  (def outcome
+    (try (with-cancel (stop)
+           (when (record-ref serving cancel-on-disconnect)
+             ;; Cancelled with the scope when the handler is done.
+             (spawn/daemon (let ()
+                             (sync (call-abandoned c))
+                             (stop (Requested "the client has gone")))))
+           (handle (record-ref serving router) req))
+         #:catch (System.Exception)))
+  (if (client-gone? (call-request c)) None (Some outcome)))
+
+;; Whether the client has gone. The call is abandoned when this token fires,
+;; and reading it allocates nothing, where `abandoned?` syncs a `choose`.
+(: client-gone? (-> Ctx bool))
+(defun (client-gone? ctx) (fired? (ctx-aborted ctx)))
 
 ;; A handler that raised. Kestrel refusing the body — too large, malformed, cut
 ;; short — is the client's doing, and gets the status Kestrel chose; so is a

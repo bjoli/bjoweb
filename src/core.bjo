@@ -17,6 +17,9 @@
   ;; Request construction.
   make-request make-request/streamed RequestBody
 
+  ;; A request's headers, as the server makes them.
+  Headers make-headers map->headers headers-try-ref headers-ref-or headers-contains?
+
   ;; Reading one.
   request-method request-path
   request-scheme request-host request-client
@@ -109,6 +112,14 @@
                                       (: state (Box BodyState))
                                       (: form (Box (Option (Map string string)))))))
 
+;; A request's headers: the names lower-cased, each with its value, in the
+;; order they came. A name that came more than once has one value, its values
+;; joined. Two arrays, searched from the start: a request has a few headers,
+;; and Kestrel takes 100 at most. A persistent map made for each request cost
+;; about 1 KB of the 5.7 KB a request allocated.
+(type (: Headers #:opaque (Record (: names (Array string))
+                                  (: values (Array string)))))
+
 ;; Represents an HTTP request.
 ;; Note: `headers` keys are lower-cased. `body` is read when it is first asked
 ;; for, not before. `scheme`, `host` and `client` are what the client used,
@@ -116,7 +127,7 @@
 (type (: Request (Record (: method string)
                          (: path string)
                          (: query (Map string string))
-                         (: headers (Map string string))
+                         (: headers Headers)
                          (: params (Map string string))
                          (: body RequestBody)
                          (: scheme string)
@@ -178,13 +189,14 @@
                     (#:scheme string) (#:host string) (#:client string)
                     Request))
 (defun (make-request method path query headers body #:scheme "http" #:host "" #:client "")
-  (new-request method path query headers (InMemory (string->bytes body)) 0 scheme host client))
+  (new-request method path query (map->headers headers) (InMemory (string->bytes body)) 0
+               scheme host client))
 
 ;; The same, with a body that is read from a port when it is asked for: the
 ;; server's kind. `open` is given a limit and answers the body as a port that
 ;; fails once more than that has been read. `max-body` is the limit on reading
 ;; it into memory; `request-body-port` may ask for another.
-(: make-request/streamed (-> string string (Map string string) (Map string string)
+(: make-request/streamed (-> string string (Map string string) Headers
                              (-> int InputPort) int
                              (#:scheme string) (#:host string) (#:client string)
                              Request))
@@ -192,7 +204,47 @@
                               #:scheme "http" #:host "" #:client "")
   (new-request method path query headers (FromPort open) max-body scheme host client))
 
-(: new-request (-> string string (Map string string) (Map string string) BodySource int
+;; Headers from lower-cased names and their values, at the same index. The
+;; arrays become the headers', and are not to be written afterwards.
+(: make-headers (-> (Array string) (Array string) Headers))
+(defun (make-headers names values) (Headers (names names) (values values)))
+
+;; Headers from a map of lower-cased names.
+(: map->headers (-> (Map string string) Headers))
+(defun (map->headers m)
+  (def n (map-length m))
+  (def names (make-array n))
+  (def values (make-array n))
+  (loop (:for (Tuple k v) (map->seq m))
+        (:for i (range 0 n))
+        (:do (array-set! names i k)
+             (array-set! values i v)))
+  (make-headers names values))
+
+;; The value of the lower-cased `name`.
+(: headers-try-ref (-> Headers string (Option string)))
+(defun (headers-try-ref h name)
+  (def i (header-index h name))
+  (if (< i 0) None (Some (array-ref (record-ref h values) i))))
+
+(: headers-ref-or (-> Headers string string string))
+(defun (headers-ref-or h name fallback)
+  (def i (header-index h name))
+  (if (< i 0) fallback (array-ref (record-ref h values) i)))
+
+(: headers-contains? (-> Headers string bool))
+(defun (headers-contains? h name) (>= (header-index h name) 0))
+
+;; Where `name` is, or -1.
+(: header-index (-> Headers string int))
+(defun (header-index h name)
+  (def names (record-ref h names))
+  (let go ((i 0))
+    (cond ((= i (array-length names)) -1)
+          ((= (array-ref names i) name) i)
+          (else (go (+ i 1))))))
+
+(: new-request (-> string string (Map string string) Headers BodySource int
                    string string string
                    Request))
 (defun (new-request method path query headers source limit scheme host client)
@@ -206,7 +258,7 @@
                               (state (make-box Unread))
                               (form (make-box None))))
            (scheme scheme)
-           (host (if (string-empty? host) (map-ref-or headers "host" "") host))
+           (host (if (string-empty? host) (headers-ref-or headers "host" "") host))
            (client client)))
 
 ;; ---------------------------------------------------------------------------
@@ -250,7 +302,7 @@
 ;; Gets a header value case-insensitively.
 (: request-header (-> Request string (Option string)))
 (defun (request-header r name)
-  (map-try-ref (record-ref r headers) (string-downcase name)))
+  (headers-try-ref (record-ref r headers) (string-downcase name)))
 
 ;; Gets a route parameter bound by the router, or `None` if absent.
 (: request-param (-> Request string (Option string)))
@@ -263,7 +315,7 @@
 
 (: request-header-or (-> Request string string string))
 (defun (request-header-or r name fallback)
-  (map-ref-or (record-ref r headers) (string-downcase name) fallback))
+  (headers-ref-or (record-ref r headers) (string-downcase name) fallback))
 
 (: request-param-or (-> Request string string string))
 (defun (request-param-or r name fallback)

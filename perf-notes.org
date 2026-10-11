@@ -1,0 +1,221 @@
+#+TITLE: Why bjoweb's p99 is long, and what it allocates
+#+STARTUP: showall
+
+Notes from one investigation, October 2026. The numbers are from the
+5900X (24 threads), .NET 10, with ~bench/bjoweb-rate.py~ from the Bjolang
+repository: oha at fixed rates over 256 connections, ~--latency-correction~,
+the server pinned to CPUs 0-11 and oha to 12-23, server GC. All changes
+described here are in the working tree and are not committed.
+
+* What was asked
+
+p99.9 of bjoweb's ~examples/hello.exe~ was 13-30 ms at moderate rates, with a
+median of 0.3-0.7 ms.
+
+* What was found
+
+** The 13-17 ms p99.9 floor is not bjoweb's
+
+A plain C# Kestrel hello (minimal API, logging providers cleared) and a Go
+~net/http~ hello, measured the same way:
+
+| rate   |             | Go net/http | plain Kestrel | bjoweb      |
+|--------+-------------+-------------+---------------+-------------|
+| 2k/s   | p99 us      | 271-291     | 346-372       | 830-903     |
+|        | p99.9 ms    | 13-16       | 15-17         | 13          |
+| 25k/s  | p99 us      | 783-987     | 706-1424      | 6944-7483   |
+|        | p99.9 ms    | 9-11        | 9-19          | 15-23       |
+| 100k/s | p99 us      | 4189-5910   | 4347-5084     | 13875-18749 |
+|        | p99.9 ms    | 11          | 12-13         | 26-27       |
+
+At 2k/s all three have the same p99.9. Something in the machine or in oha
+puts that floor there. What is bjoweb's is the p99: 7 ms against 1 ms at
+25k/s, with the machine nearly idle.
+
+** It is the GC
+
+~dotnet-counters~ during 5 s at 25k/s (125,000 requests):
+
+|               | allocated | collections | GC pause | p99     | p99.9   |
+|---------------+-----------+-------------+----------+---------+---------|
+| plain Kestrel | 51 MB     | 2           | 22 ms    | 0.53 ms | 12.9 ms |
+| bjoweb        | 712 MB    | 15-16       | 127-135  | 6.4-7.1 | 23-24   |
+
+About 385 bytes a request for Kestrel and 5.7 KB for bjoweb. A gen0 pause
+took 6-8 ms in bjoweb and 5 ms in Kestrel, so the pauses are about as long;
+bjoweb has seven or eight times as many, and each one stalls every
+connection.
+
+Not the cause, each measured: the scheduler's 10 ms monitor (1 ms changed
+nothing), the 16 workers (64 and 256 were no better), gen0 size (256 MB made
+p99.9 60 ms; 16 MB and 4 MB changed nothing), 4 GC heaps, workstation GC.
+
+** DATAS decides how often it collects
+
+Server GC in .NET 9 and later runs with DATAS (dynamic adaptation). It keeps
+the GC's share of the time near a target, so a program that allocates less
+gets a smaller gen0 budget and is collected as often:
+
+- With DATAS (the default), 16 % less allocation (the Activity, below) left
+  15 collections in 5 s, and p99 at 25k/s stayed at 6-9 ms after all the
+  changes below (5.7 -> 3.6 KB a request).
+- With ~DOTNET_GCDynamicAdaptationMode=0~ and the old bjoweb, collections came
+  once every ~2 s and paused 14-15 ms each. p99 at 25k/s was 0.67-3.5 ms, as
+  low as plain Kestrel's.
+
+So fewer allocations alone do not shorten the tail; with DATAS off they
+would make the collections rarer. Its memory cost is not measured yet.
+
+* Where 5.7 KB a request went
+
+~dotnet-trace --profile gc-verbose~, the GC's allocation samples summed by
+the first bjoweb frame on each stack (the analyzer is ~/tmp/ab/alloc~, not
+kept):
+
+| B/req | where                  | what                                                  |
+|-------+------------------------+-------------------------------------------------------|
+|  1371 | ~handled~              | per request a ~with-cancel~ scope, a ~bjo~ fiber, a ~choose~ |
+|  1232 | ASP.NET                | ~500 an ~Activity~, ~340 ~ExecutionContext~ for it   |
+|  1085 | ~collect-headers~      | every header to a Bjolang string, names lower-cased, a ~Map~ |
+|   631 | ~path-segments~        | ~string-split~, a ~Vec~ through an RRB builder       |
+|   345 | ~worker~               | the ~choose~ rebuilt for every request               |
+|   225 | ~make-request/streamed~ | the ~Request~ record                                |
+|   277 | ~router-match~ and ~match-segments~ |                                          |
+|   462 | the rest               | ~read-request~, ~write-response!~, ~send-fixed!~, ~reached-as~ |
+
+* What was changed, and what each saved
+
+Measured with ~dotnet-counters~ (total allocated / requests), two runs each:
+
+| step                                                         | B/req     |
+|--------------------------------------------------------------+-----------|
+| before                                                       | 5700-5770 |
+| quiet mode turns off ~Microsoft.AspNetCore.Hosting.Diagnostics~ | 4881   |
+| the worker's ~choose~ made once, not per request             | 4755-4823 |
+| headers in two arrays, known names lower-cased once          | 4087-4090 |
+| the router matches on slices in an array, binds only the winner | 3583-3588 |
+
+- *The log category* (~server.bjo~, ~new-app~): while
+  ~Microsoft.AspNetCore.Hosting.Diagnostics~ logs at any level, ASP.NET starts
+  an ~Activity~ for every request. Its messages are the request-started and
+  -finished lines that Warning hides anyway.
+- *The worker* (~server.bjo~, ~worker~): an event is a value, so the ~choose~
+  of ~inbox-recv~ and ~inbox-closed~ is made once and synced for each
+  request. It saved less than its share in the trace (90 of 345 bytes): what
+  a sync costs when it publishes stays. A single "receive, or ~None~ once
+  closed" event in ~(std inbox)~ would save more; that is a Bjolang change.
+- *Headers* (~core.bjo~ ~Headers~, ~server.bjo~ ~collect-headers~): a
+  ~Request~ is still a complete snapshot, now two arrays of names and values
+  searched in order, which ~request-header~ and ~-or~ read. ~make-request~
+  still takes a ~Map~ and converts it; ~make-request/streamed~, the server's,
+  takes ~Headers~. The usual header names have their lower-cased Bjolang
+  string made once, in ~known-header-names~. A .NET ~Dictionary~ was not
+  measured: two arrays are ~150 bytes for 4 headers, a ~Dictionary~ ~300.
+  Lazy headers (read from Kestrel's dictionary when asked for) were not done:
+  Kestrel reuses that dictionary for the next request, so a ~Request~ kept
+  after its response would read another request's headers.
+- *The router* (~router.bjo~): the path's pieces are ~substring/slice~ views
+  in an array of the exact size, a route is tested without binding, and only
+  the route that matched binds its parameters. ~path-segments~ is still
+  exported with its ~Vec~. A parameter is a slice of the path, so one kept
+  after the request keeps the path alive.
+
+Not possible without a compiler change: ~import/extern~ of a member of a
+generic CLR struct (~KeyValuePair`2.Key~) resolves the declaration but not
+the call, so a header's name cannot be read as a .NET string to look it up
+without converting it first.
+
+All of bjoweb's tests pass after each step (~tests/demo.bjo~ run with
+~DOTNET_hostBuilder__reloadConfigOnChange=false~, see below; ~tests/html.bjo~).
+
+* The regression, and the leak behind it
+
+With DATAS off, 20 s runs at 25k/s, old and new in turn (before the router
+change):
+
+|            | 25k/s p99    | 25k/s p99.9 | 25k/s max | 100k/s p99  |
+|------------+--------------+-------------+-----------+-------------|
+| old bjoweb | 2.4-3.5 ms   | 25 ms       | 39 ms     | 12.5-22 ms  |
+| new bjoweb | 12.8-13.9 ms | 54-61 ms    | 72-76 ms  | 10-12 ms    |
+
+The new build had the worse tail at 25k/s, although it allocated less.
+
+** Per collection
+
+~dotnet-counters~, 20 s at 25k/s, DATAS off:
+
+- old: a gen0 collection every ~2 s, 12-16 ms each; gen1 grew ~7 MB at each.
+- new: a gen0 collection every ~6 s, 33-45 ms each; gen1 grew ~20 MB at each.
+
+So both kept about 3.4 MB a second of request data alive past a gen0
+collection, and a gen0 pause is mostly copying what survives. Collected less
+often, the new build had more survivors at each collection, so longer
+pauses. Allocating less was not the fault; something kept every request's
+objects alive.
+
+** What survived
+
+~dotnet-gcdump~ 8 s into 25k/s (new build, DATAS off): 34.7 MB live in 576k
+objects, of which 128,800 each of ~Action<Option<Exception>>~, ~SyncState~,
+~WrapSink<Option<Exception>, ...Call...>~ and ~Node<Option<Exception>>~:
+29 MB, ~225 bytes a request.
+
+That is the worker's ~(wrap (inbox-closed requests) ...)~ branch. Every sync
+of the ~choose~ publishes a waiter on the inbox's closed event, a ~Gate<T>~
+in Bjolang's ~BjolangRuntime/Cml/Inbox.cs~, and ~Gate.Publish~ pushed a node
+and never removed one until the inbox closed. The receive wins every time, so
+each request left its losing sync on the gate. *A server that never closes
+its inbox grew by ~225 bytes a request for as long as it ran.* The old build
+had the same leak.
+
+** The fix (in Bjolang, not committed)
+
+~Gate<T>~ now prunes as ~Promise<T>~ does: under its lock, once the list has
+grown to twice what survived the last prune, the nodes whose ~SyncState~ has
+committed are unlinked. A committed sync cannot commit again, and ~Signal~
+detaches the list under the same lock before it walks it. A test in
+~Cml/Tests/FiberTests.cs~, "losing inbox-closed branches do not accumulate
+waiters", fails without the prune (5000 nodes after 5000 syncs) and passes
+with it. The Cml tests (157), ~run_tests.py~ and ~run_bjo_tests.py~ pass.
+
+** After the fix
+
+New bjoweb (all four changes) on the fixed runtime, 20 s at 25k/s, DATAS
+off: gen0 pauses of 1.0-2.5 ms, gen1 a few MB, live heap 5.3 MB in 60k
+objects; p99 0.53 ms, p99.9 1.9 ms.
+
+~bench/bjoweb-rate.py~, 5 s a rate, two rounds each:
+
+| rate   |          | before (DATAS on) | after, DATAS on | after, DATAS off | plain Kestrel |
+|--------+----------+-------------------+-----------------+------------------+---------------|
+| 2k/s   | p99 us   | 830-903           | 362-847         | 345-357          | 346-372       |
+| 25k/s  | p99 us   | 6944-7483         | 2131-2870       | 1240-1342        | 706-1424      |
+|        | p99.9 ms | 15-23             | 11-24           | 10-18            | 9-19          |
+| 100k/s | p99 us   | 13875-18749       | 7428-11167      | 2833-4112        | 4347-5084     |
+|        | p99.9 ms | 26-27             | 15-19           | 21               | 12-13         |
+| 150k/s | p99 us   | 25000-37000       | 16513-33124     | 8437-9838        |               |
+
+p99.9 in the 5 s runs stays near the 10-20 ms that Go and Kestrel show, while
+the 20 s counter run gave 1.9 ms; some of that floor may be the first
+seconds after a server starts. Not looked into.
+
+* What is left
+
+- Commit, or not: bjoweb's four changes (working tree), and Bjolang's
+  ~Gate~ prune with its test (~BjolangRuntime/Cml/Inbox.cs~,
+  ~Cml/Tests/FiberTests.cs~). The old bjoweb is in a worktree at
+  ~/tmp/ab/bjoweb-old~ for comparisons; ~git worktree remove~ it when done.
+- Other events that, like the gate, keep a losing branch's waiter until they
+  fire: worth a look at every ~Publish~ that only adds to a list.
+- ~handled~, 1.4 KB a request: a scope, a fiber and a ~choose~ for each
+  request, so that a client that hangs up is noticed. The largest item, and
+  the most delicate: cancel-on-disconnect, and a worker staying busy until
+  its handler is done.
+- DATAS: decide whether a server should turn it off. That needs its memory
+  cost measured, and a manifest ~runtime~ setting for
+  ~System.GC.DynamicAdaptationMode~ in Bjolang if so.
+- ~tests/demo.bjo~ can fail with "the configured user limit (128) on the
+  number of inotify instances has been reached": ASP.NET opens a file
+  watcher for its configuration for each server it starts, and editors hold
+  many of the 128. Quiet mode could turn ~hostBuilder:reloadConfigOnChange~
+  off as it sets the log levels.

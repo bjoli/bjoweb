@@ -24,6 +24,7 @@
   Ctx)
 
 (import (std inbox))
+(import (only (std mutable map) mutablemap mutablemap-set! mutablemap-ref-or))
 (import (only (std net) stream->ports))
 (import (only (net websocket protocol)
               ports->websocket websocket-accept-key websocket-close! websocket-closed))
@@ -235,7 +236,13 @@
 (defun (new-app quiet static-dir)
   (when quiet
     (set-environment-variable! "Logging__LogLevel__Default" "Warning")
-    (set-environment-variable! "Logging__LogLevel__Microsoft.Extensions.Hosting.Internal.Host" "None"))
+    (set-environment-variable! "Logging__LogLevel__Microsoft.Extensions.Hosting.Internal.Host" "None")
+    ;; While this category logs at any level, ASP.NET starts an `Activity` for
+    ;; each request, about 900 bytes with what `Activity.Current` costs. Its
+    ;; messages are the request-started and -finished lines, which Warning
+    ;; hides anyway. An exception a request raises is logged by Kestrel's own
+    ;; category, which stays on.
+    (set-environment-variable! "Logging__LogLevel__Microsoft.AspNetCore.Hosting.Diagnostics" "None"))
   (set-environment-variable! "ASPNETCORE_WEBROOT" static-dir)
   (build-app (slim-builder)))
 
@@ -417,9 +424,11 @@
 ;; A worker fiber processing requests until the inbox is closed.
 (: worker (-bjo-> Serving (Inbox (Call Ctx Unit)) Unit))
 (defbjo (worker serving requests)
-  (let go ()
-    (match (sync (choose (wrap (inbox-recv requests) (fun (c) (Some c)))
+  ;; Made once: an event is a value, and every sync of it is a new wait.
+  (def next-call (choose (wrap (inbox-recv requests) (fun (c) (Some c)))
                          (wrap (inbox-closed requests) (fun (e) None))))
+  (let go ()
+    (match (sync next-call)
       (None unit)
       ((Some c) (answer serving c) (go)))))
 
@@ -691,7 +700,7 @@
 (: read-request (-> Ctx (Vec Network) int Request))
 (defun (read-request ctx trusted max-body)
   (def in (ctx-request ctx))
-  (def headers (collect-headers (cast (Seq (Pairing System.String Values)) (in-headers in))))
+  (def headers (collect-headers (in-headers in)))
   (match (reached-as trusted ctx headers)
     ((Tuple scheme host client)
      (make-request/streamed (in-method in)
@@ -724,16 +733,49 @@
 ;; instead, which is what its pairs are separated by: HTTP/2 lets a browser
 ;; split it into one header per cookie, and says the server joins them so
 ;; (RFC 9113, 8.2.3). Kestrel does not.
-(: collect-headers (-> (Seq (Pairing System.String Values)) (Map string string)))
-(defun (collect-headers headers)
-  (loop (:for h headers)
-        (:acc all (mapping (header-entry (string-downcase (.-Key h)) (.-Value h))))))
+(: collect-headers (-> HeaderDict Headers))
+(defun (collect-headers dict)
+  (def n (.-Count (cast (Collection (Pairing System.String Values)) dict)))
+  (def names (make-array n))
+  (def values (make-array n))
+  (loop (:for h (cast (Seq (Pairing System.String Values)) dict))
+        (:for i (range 0 n))
+        (:let name (header-name (.-Key h)))
+        (:do (array-set! names i name)
+             (array-set! values i (header-value name (.-Value h)))))
+  (make-headers names values))
 
-(: header-entry (-> string Values (Tuple string string)))
-(defun (header-entry name values)
-  (Tuple name (if (= name "cookie")
-                  (join-strings "; " (all-values values))
-                  (.ToString values))))
+(: header-value (-> string Values string))
+(defun (header-value name values)
+  (if (= name "cookie")
+      (join-strings "; " (all-values values))
+      (.ToString values)))
+
+;; Kestrel spells the headers it knows as `"Host"` or `"User-Agent"`. The
+;; lower-cased names of the usual ones are made once, so that such a name is
+;; not lower-cased again, into a copy, for each request. The table is only read
+;; after it is made, so the workers can share it.
+(: known-header-names (MutableMap string string))
+(def known-header-names
+  (let ((table (mutablemap)))
+    (loop (:for name ["Accept" "Accept-Charset" "Accept-Encoding" "Accept-Language"
+                      "Authorization" "Cache-Control" "Connection" "Content-Encoding"
+                      "Content-Length" "Content-Type" "Cookie" "DNT" "Expect" "Host"
+                      "If-Match" "If-Modified-Since" "If-None-Match" "If-Range"
+                      "If-Unmodified-Since" "Keep-Alive" "Origin" "Pragma" "Priority"
+                      "Range" "Referer" "Sec-Fetch-Dest" "Sec-Fetch-Mode" "Sec-Fetch-Site"
+                      "Sec-Fetch-User" "Sec-WebSocket-Extensions" "Sec-WebSocket-Key"
+                      "Sec-WebSocket-Protocol" "Sec-WebSocket-Version" "TE" "Upgrade"
+                      "Upgrade-Insecure-Requests" "User-Agent" "Via"
+                      "X-Forwarded-For" "X-Forwarded-Host" "X-Forwarded-Proto"
+                      "X-Requested-With"])
+          (:do (mutablemap-set! table name (string-downcase name))))
+    table))
+
+(: header-name (-> string string))
+(defun (header-name name)
+  (def known (mutablemap-ref-or known-header-names name ""))
+  (if (string-empty? known) (string-downcase name) known))
 
 ;; ===========================================================================
 ;; Who asked, and how
@@ -785,10 +827,10 @@
 ;; The scheme, the host and the client's address, in that order. A connection
 ;; that is not a trusted proxy's speaks for itself, and `X-Forwarded-*` is
 ;; ignored.
-(: reached-as (-> (Vec Network) Ctx (Map string string) (Tuple string string string)))
+(: reached-as (-> (Vec Network) Ctx Headers (Tuple string string string)))
 (defun (reached-as trusted ctx headers)
   (def scheme (in-scheme (ctx-request ctx)))
-  (def host (map-ref-or headers "host" ""))
+  (def host (headers-ref-or headers "host" ""))
   (match (peer-ip ctx)
     ((Some ip) (if (and (forwarding? headers) (trusted? trusted ip))
                    (forwarded trusted headers scheme host (.ToString ip))
@@ -797,11 +839,11 @@
 
 ;; Whether a proxy said anything. A request with none of the three says what
 ;; its connection says even from a trusted proxy, so there is nothing to read.
-(: forwarding? (-> (Map string string) bool))
+(: forwarding? (-> Headers bool))
 (defun (forwarding? headers)
-  (or (map-contains? headers "x-forwarded-for")
-      (map-contains? headers "x-forwarded-proto")
-      (map-contains? headers "x-forwarded-host")))
+  (or (headers-contains? headers "x-forwarded-for")
+      (headers-contains? headers "x-forwarded-proto")
+      (headers-contains? headers "x-forwarded-host")))
 
 ;; What a trusted proxy says. Every proxy on the way appends the address it was
 ;; reached from to `X-Forwarded-For`, so read from the right the list can be
@@ -813,7 +855,7 @@
 ;; they go, since most proxies set them rather than append to them. A header
 ;; that is missing leaves what the connection says: with no `X-Forwarded-For`,
 ;; the proxy is the client.
-(: forwarded (-> (Vec Network) (Map string string) string string string (Tuple string string string)))
+(: forwarded (-> (Vec Network) Headers string string string (Tuple string string string)))
 (defun (forwarded trusted headers scheme host peer)
   (match (client-in trusted (header-list headers "x-forwarded-for"))
     ((Tuple client hops)
@@ -845,9 +887,9 @@
 
 ;; The entries of a header that is a comma-separated list. Two lines of one
 ;; header arrive joined with a comma already.
-(: header-list (-> (Map string string) string (Vec string)))
+(: header-list (-> Headers string (Vec string)))
 (defun (header-list headers name)
-  (match (map-try-ref headers name)
+  (match (headers-try-ref headers name)
     (None (vec-empty))
     ((Some value)
      (loop (:for entry (string-split value ","))

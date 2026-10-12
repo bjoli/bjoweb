@@ -11,6 +11,16 @@
 * DONE Behind a proxy: request-scheme/host/client, X-Forwarded-* from #:trusted-proxies
 * DONE Cookies: request-cookie, and with-cookie with Secure, HttpOnly and SameSite
 ** DONE Repeated Cookie headers joined with "; ", as HTTP/2 needs; Kestrel does not
+* DONE Logins: (bjoweb auth)
+** DONE Logins on the server, a __Host- cookie with a token, the store holding its SHA-256
+** DONE with-user: the handler gets the user, so a route cannot forget the check
+** DONE Idle limit and lifetime, read from current-clock
+** DONE A new token at each login; logout; logout-everywhere!
+** DONE cross-origin-guard: Sec-Fetch-Site, then Origin, as Go's CrossOriginProtection
+** DONE safe-next, password-matches?, a throttle
+** DONE with-middleware: one middleware over a whole router
+* TODO Logins: a store in SQLite, with a DELETE of ended logins
+* TODO Logins: flash messages, which need data on a login and not only the user
 * TODO An access log, with the client's address
 * TODO A handler time limit, per route
 * TODO An upload holds a worker while it arrives; hand it off as a stream is

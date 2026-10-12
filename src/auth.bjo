@@ -1,0 +1,508 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/src/auth.bjo — the module (bjoweb auth).
+;;
+;; Logins kept on the server, a cookie that names one, and handlers that get
+;; the user as an argument:
+;;
+;;     (def auth (make-auth (memory-store) find-user))
+;;
+;;     (: submit (-bjo-> Request User Response))
+;;     (defbjo (submit req user) ...)
+;;
+;;     (route-post "/aches" (with-user auth submit))
+;;
+;; A handler that needs a user has a type that `Handler` is not, and
+;; `with-user` is the only way from one to the other. So a route cannot forget
+;; to check the login: the program does not compile.
+;;
+;; The cookie holds a random token of 256 bits. The store holds the SHA-256 of
+;; the token, not the token, so a store that leaks gives nobody a login. A
+;; store is a record of four bjoroutines, so a program can keep its logins in
+;; its own database. `memory-store` keeps them in the process.
+;;
+;; A login ends when it was not used for `#:idle`, or when it is older than
+;; `#:lifetime`, whichever is first. Each use moves the idle limit, but at most
+;; once a minute, so that a page with many requests does not write to the
+;; store for each one.
+;;
+;; Not here: the passwords and the users. A program keeps those itself, and
+;; checks a password with (std crypto hash). `password-matches?` and the
+;; throttle below are the two parts of that check that are easy to get wrong.
+
+(export
+  ;; A login, and where the logins are.
+  Login SessionStore memory-store
+
+  ;; The configuration.
+  Auth make-auth
+
+  ;; The handlers that need a user, or can use one.
+  with-user with-optional-user request-user
+
+  ;; Logging in and out: they add to the answer, as `with-cookie` does.
+  with-login with-logout logout-everywhere!
+
+  ;; Where to go after a login.
+  login-path safe-next
+
+  ;; Cross-site requests.
+  cross-origin-guard
+
+  ;; Password checks.
+  password-matches?
+  Throttle make-throttle throttle-allowed? throttle-failed! throttle-reset!)
+
+(import (std prelude))
+(import (only (std atomic) make-atomic atomic-ref atomic-update!))
+(import (only (std random) random-bytes!))
+(import (only (std datetime) duration duration->milliseconds duration->seconds
+              now instant->unix-milliseconds))
+(import (std crypto hash))
+(import (bjoweb core))
+
+(import/class
+  (Refusal (: System.ArgumentException (-> string Refusal))))
+
+(import/extern
+  (escape-data (: System.Uri.EscapeDataString (-> string string))))
+
+(: refuse (-> string %a))
+(defun (refuse why) (raise (cast Exception (Refusal. why))))
+
+;; Milliseconds since 1970, from `current-clock`, so a test can move the time.
+(: now-ms (-> long))
+(defun (now-ms) (instant->unix-milliseconds (now)))
+
+;; ---------------------------------------------------------------------------
+;; Logins and stores
+;; ---------------------------------------------------------------------------
+
+;; One login. Times are milliseconds since 1970. `expires` is when it ends if
+;; it is not used again: the earlier of `seen` plus the idle limit and
+;; `created` plus the lifetime. A store can delete a login after `expires`
+;; without asking.
+(type (: Login (Record (: user string)
+                       (: created long)
+                       (: seen long)
+                       (: expires long))))
+
+;; Where the logins are. The key is the hex SHA-256 of the cookie's token.
+;; `remove-user!` removes all logins of one user.
+(type (: SessionStore (Record (: load (-bjo-> string (Option Login)))
+                              (: save! (-bjo-> string Login void))
+                              (: remove! (-bjo-> string void))
+                              (: remove-user! (-bjo-> string void)))))
+
+;; The logins, and the size at the last prune.
+(type (: Kept (Record (: logins (Map string Login))
+                      (: mark int))))
+
+;; A map does not shrink when its logins expire. So a save prunes when the map
+;; has grown to twice the size it had after the last prune, which costs
+;; constant time for each save on average.
+(: prune-floor int)
+(def prune-floor 256)
+
+(: kept-save (-> Kept string Login Kept))
+(defun (kept-save k key login)
+  (def logins (map-set (record-ref k logins) key login))
+  (cond
+    ((< (map-length logins) (* 2 (record-ref k mark)))
+     (Kept (logins logins) (mark (record-ref k mark))))
+    (else
+     ;; A login in the store has `seen` at or before the one saved now.
+     (def at (record-ref login seen))
+     (def alive (map-filter (fun (_ l) (>= (record-ref l expires) at)) logins))
+     (Kept (logins alive) (mark (max prune-floor (map-length alive)))))))
+
+;; Logins in this process. They are lost when it stops, so all users must log
+;; in again.
+(: memory-store (-> SessionStore))
+(defun (memory-store)
+  (def state (make-atomic (Kept (logins (map-empty)) (mark prune-floor))))
+  (SessionStore
+    (load (fun (key) (map-try-ref (record-ref (atomic-ref state) logins) key)))
+    (save! (fun (key login)
+             (ignore (atomic-update! state (fun (k) (kept-save k key login))))))
+    (remove! (fun (key)
+               (ignore (atomic-update! state
+                         (fun (k) (record-set k (logins (map-remove (record-ref k logins) key))))))))
+    (remove-user! (fun (user)
+                    (ignore (atomic-update! state
+                              (fun (k) (record-set k (logins (map-filter (fun (_ l) (not (= (record-ref l user) user)))
+                                                                           (record-ref k logins)))))))))))
+
+;; ---------------------------------------------------------------------------
+;; The configuration
+;; ---------------------------------------------------------------------------
+
+;; `%u` is the program's user. `load-user` finds one from the user ID that
+;; `with-login` was given.
+(type (: (Auth %u) #:opaque
+         (Record (: store SessionStore)
+                 (: load-user (-bjo-> string (Option %u)))
+                 (: login-path string)
+                 (: cookie string)
+                 (: secure bool)
+                 (: idle long)
+                 (: lifetime long))))
+
+;; The idle limit moves at most this often.
+(: refresh-ms long)
+(def refresh-ms 60000L)
+
+;; `#:cookie` starts with `__Host-`, so the browser keeps it only when it was
+;; set over https (or on localhost), with `Path=/` and with no `Domain`. Over
+;; plain http on another host, use another name and `#:secure #f`.
+(: make-auth (-> SessionStore (-bjo-> string (Option %u))
+                 (#:login-path string) (#:idle Duration) (#:lifetime Duration)
+                 (#:cookie string) (#:secure bool)
+                 (Auth %u)))
+(defun (make-auth store load-user
+                  #:login-path "/login"
+                  #:idle (duration #:days 1L)
+                  #:lifetime (duration #:days 30L)
+                  #:cookie "__Host-session"
+                  #:secure #t)
+  (when (and (string-starts-with? cookie "__Host-") (not secure))
+    (refuse "a cookie named __Host-... needs #:secure #t; browsers drop it otherwise"))
+  (when (<= (duration->milliseconds idle) 0L)
+    (refuse "#:idle must be longer than zero"))
+  (when (< (duration->seconds lifetime) 1L)
+    (refuse "#:lifetime must be at least one second"))
+  (unless (string-starts-with? login-path "/")
+    (refuse (str "#:login-path must be a path on this site: \"" login-path "\"")))
+  (Auth (store store)
+        (load-user load-user)
+        (login-path login-path)
+        (cookie cookie)
+        (secure secure)
+        (idle (duration->milliseconds idle))
+        (lifetime (duration->milliseconds lifetime))))
+
+(: login-path (-> (Auth %u) string))
+(defun (login-path auth) (record-ref auth login-path))
+
+(: expires-at (-> (Auth %u) long long long))
+(defun (expires-at auth created seen)
+  (min (+ seen (record-ref auth idle)) (+ created (record-ref auth lifetime))))
+
+;; ---------------------------------------------------------------------------
+;; Tokens
+;; ---------------------------------------------------------------------------
+
+;; 32 bytes from (std random), as 64 hex digits.
+(: new-token (-> string))
+(defun (new-token)
+  (def bytes (make-array 32))
+  (random-bytes! bytes)
+  (bytes->hex bytes))
+
+;; A cookie that is not 64 hex digits was not made here. It is not looked up.
+(: token-shaped? (-> string bool))
+(defun (token-shaped? token)
+  (and (= (string-length token) 64)
+       (match (hex->bytes token) ((Some _) #t) (None #f))))
+
+(: token-key (-> string string))
+(defun (token-key token) (bytes->hex (hash-string token)))
+
+;; The key of the token the request has, if it has one that is token-shaped.
+(: request-key (-> (Auth %u) Request (Option string)))
+(defun (request-key auth req)
+  (match (request-cookie req (record-ref auth cookie))
+    ((Some token) (if (token-shaped? token) (Some (token-key token)) None))
+    (None None)))
+
+;; ---------------------------------------------------------------------------
+;; Finding the user
+;; ---------------------------------------------------------------------------
+
+;; The login that the key names, if it has not ended. One that has ended is
+;; removed. One that is used is saved with the new time, at most once in
+;; `refresh-ms`.
+(: live-login (-bjo-> (Auth %u) string (Option Login)))
+(defbjo (live-login auth key)
+  (def store (record-ref auth store))
+  (match ((record-ref store load) key)
+    (None None)
+    ((Some login)
+     (def t (now-ms))
+     (cond
+       ((> t (record-ref login expires))
+        ((record-ref store remove!) key)
+        None)
+       ((>= (- t (record-ref login seen)) refresh-ms)
+        (def used (record-set login
+                    (seen t)
+                    (expires (expires-at auth (record-ref login created) t))))
+        ((record-ref store save!) key used)
+        (Some used))
+       (else (Some login))))))
+
+;; The user that the request is logged in as. A login whose user
+;; `load-user` cannot find is removed.
+(: request-user (-bjo-> (Auth %u) Request (Option %u)))
+(defbjo (request-user auth req)
+  (match (request-key auth req)
+    (None None)
+    ((Some key)
+     (match (live-login auth key)
+       (None None)
+       ((Some login)
+        (match ((record-ref auth load-user) (record-ref login user))
+          ((Some user) (Some user))
+          (None
+           ((record-ref (record-ref auth store) remove!) key)
+           None)))))))
+
+;; A page for one user must not be kept by a shared cache, or shown again from
+;; the browser's history after a logout. A handler that set its own
+;; `Cache-Control` keeps it.
+(: private (-> Response Response))
+(defun (private r)
+  (if (any? (fun (h) (def (name _) h) (= (string-downcase name) "cache-control"))
+            (response-headers r))
+      r
+      (with-header r "Cache-Control" "no-store")))
+
+;; Without a login: a `GET` or `HEAD` goes to the login page, with the path it
+;; asked for as `next`. Anything else is 401, because a redirect would lose
+;; the body of a form.
+(: anonymous (-> (Auth %u) Request Response))
+(defun (anonymous auth req)
+  (def method (request-method req))
+  (if (or (= method "GET") (= method "HEAD"))
+      (redirect (str (record-ref auth login-path) "?next=" (escape-data (request-path req))))
+      (respond 401 "401 Unauthorized\n")))
+
+;; The handler gets the user. Without a login, it is not called.
+(: with-user (-> (Auth %u) (-bjo-> Request %u Response) Handler))
+(defun (with-user auth h)
+  (bjoroutine (req)
+    (match (request-user auth req)
+      ((Some user) (private (h req user)))
+      (None (anonymous auth req)))))
+
+;; The handler gets the user if there is a login, and `None` if not: a page
+;; that all can see, but that shows more to a user.
+(: with-optional-user (-> (Auth %u) (-bjo-> Request (Option %u) Response) Handler))
+(defun (with-optional-user auth h)
+  (bjoroutine (req)
+    (match (request-user auth req)
+      ((Some user) (private (h req (Some user))))
+      (None (h req None)))))
+
+;; ---------------------------------------------------------------------------
+;; Logging in and out
+;; ---------------------------------------------------------------------------
+
+;; Logs the request in as `user`: a new login, and its cookie on `r`. A login
+;; that the request had is removed first. A token that was known before the
+;; login, because an attacker set it in the browser, then names nothing.
+;;
+;; With `#:remember #t`, the cookie is kept for the lifetime of the login.
+;; Without it, the browser removes the cookie when it closes, and the login
+;; ends then.
+(: with-login (-bjo-> (Auth %u) Request string Response (#:remember bool) Response))
+(defbjo (with-login auth req user r #:remember #f)
+  (def store (record-ref auth store))
+  (when-let (old (request-key auth req))
+    ((record-ref store remove!) old))
+  (def token (new-token))
+  (def t (now-ms))
+  ((record-ref store save!) (token-key token)
+                            (Login (user user) (created t) (seen t) (expires (expires-at auth t t))))
+  (private
+    (with-cookie r (record-ref auth cookie) token
+                 #:max-age (if remember (cast int (/ (record-ref auth lifetime) 1000L)) -1)
+                 #:secure (record-ref auth secure))))
+
+;; Ends the request's login, and removes its cookie from the browser.
+(: with-logout (-bjo-> (Auth %u) Request Response Response))
+(defbjo (with-logout auth req r)
+  (when-let (key (request-key auth req))
+    ((record-ref (record-ref auth store) remove!) key))
+  (private
+    (with-cookie r (record-ref auth cookie) "" #:max-age 0 #:secure (record-ref auth secure))))
+
+;; Ends all logins of a user: after a password change, or when a device was
+;; lost.
+(: logout-everywhere! (-bjo-> (Auth %u) string void))
+(defbjo (logout-everywhere! auth user)
+  ((record-ref (record-ref auth store) remove-user!) user))
+
+;; `next` if it is a path on this site, `default` if not. A login page that
+;; redirects to any `next` it was given sends users to a site that an attacker
+;; chose, with this site's name in the link.
+;;
+;; `//evil.example` and `/\evil.example` start with `/`, but browsers read
+;; them as another host.
+(: safe-next (-> string (#:default string) string))
+(defun (safe-next next #:default "/")
+  (if (and (string-starts-with? next "/")
+           (not (string-starts-with? next "//"))
+           (not (string-contains? next "\\"))
+           (not (string-any-control? next)))
+      next
+      default))
+
+(: string-any-control? (-> string bool))
+(defun (string-any-control? s)
+  (match (string-index (fun (c) (def n (char->integer c)) (or (< n 32) (= n 127))) s)
+    ((Some _) #t)
+    (None #f)))
+
+;; ---------------------------------------------------------------------------
+;; Cross-site requests
+;; ---------------------------------------------------------------------------
+;;
+;; A form on another site can post to this one, and the browser sends this
+;; site's cookies with it. `SameSite=Lax` stops that in current browsers, and
+;; this guard stops it with the headers that browsers add to each request.
+;; This is the method of Go's `http.CrossOriginProtection`:
+;;
+;; 1. `GET`, `HEAD` and `OPTIONS` are allowed. They must not change anything.
+;; 2. `Sec-Fetch-Site` is sent by all current browsers. `same-origin`, and
+;;    `none` (the user typed the address), are allowed. Others are refused.
+;; 3. Without it, `Origin` is compared with the host of the request.
+;; 4. Without either, the request did not come from a browser, or came from a
+;;    very old one, and it is allowed. A request that a program sends does not
+;;    have the user's cookies.
+;;
+;; `#:trusted` are origins that may post here from another site, such as
+;; `"https://login.example.com"`.
+
+(: safe-method? (-> string bool))
+(defun (safe-method? m) (or (= m "GET") (= m "HEAD") (= m "OPTIONS")))
+
+;; The host and port of an origin: `https://a.example:8443` is `a.example:8443`.
+(: origin-host (-> string string))
+(defun (origin-host origin)
+  (def parts (string-split origin "://"))
+  (if (= (vec-length parts) 2) (vec-ref parts 1) ""))
+
+(: cross-origin? (-> Request (Vec string) bool))
+(defun (cross-origin? req trusted)
+  (def origin (string-downcase (request-header-or req "origin" "")))
+  (def trusted? (any? (fun (t) (= (string-downcase t) origin)) trusted))
+  (cond
+    ((safe-method? (request-method req)) #f)
+    (else
+     (match (request-header req "sec-fetch-site")
+       ((Some site)
+        (not (or (= site "same-origin") (= site "none") trusted?)))
+       (None
+        (cond
+          ((string-empty? origin) #f)
+          (trusted? #f)
+          (else (not (= (origin-host origin) (string-downcase (request-host req)))))))))))
+
+(: cross-origin-guard (-> (#:trusted (Vec string)) Middleware))
+(defun (cross-origin-guard #:trusted (vec-empty))
+  (fun (next)
+    (bjoroutine (req)
+      (if (cross-origin? req trusted)
+          (respond 403 "403 Forbidden: a cross-origin request\n")
+          (next req)))))
+
+;; ---------------------------------------------------------------------------
+;; Passwords
+;; ---------------------------------------------------------------------------
+
+;; A hash to verify against when there is no user. Made once, when it is first
+;; needed, because it takes as long as a hash does. Two fibers that need it at
+;; once can both make one; either is correct.
+(: no-user-hash (Box (Option string)))
+(def no-user-hash (make-box None))
+
+(: dummy-hash (-bjo-> string))
+(defbjo (dummy-hash)
+  (match (box-ref no-user-hash)
+    ((Some h) h)
+    (None
+     (def h (password-hash "no user has this password"))
+     (box-set! no-user-hash (Some h))
+     h)))
+
+;; True when `stored` is a hash of `password`. Give it `None` when there is no
+;; such user. It then takes as long as with a hash, so the time of the answer
+;; does not tell an attacker which user names exist.
+;;
+;; The hash for `None` uses the defaults of `password-hash`. A program that
+;; hashes with other parameters should give its own hash of a password nobody
+;; has.
+(: password-matches? (-bjo-> string (Option string) bool))
+(defbjo (password-matches? password stored)
+  (match stored
+    ((Some h) (password-verify password h))
+    (None
+     (ignore (password-verify password (dummy-hash)))
+     #f)))
+
+;; ---------------------------------------------------------------------------
+;; Throttle
+;; ---------------------------------------------------------------------------
+;;
+;; Counts failed attempts for each key, such as a user name or a client
+;; address, in a window of time. A login page checks `throttle-allowed?` before
+;; it checks the password, because a check takes a core for a few hundred
+;; milliseconds. A key with no failures for a window starts again at zero.
+
+(type (: Attempts (Record (: count int) (: since long))))
+
+(type (: Counted (Record (: keys (Map string Attempts))
+                         (: mark int))))
+
+(type (: Throttle #:opaque
+         (Record (: attempts int)
+                 (: window long)
+                 (: state (Atomic Counted)))))
+
+(: make-throttle (-> (#:attempts int) (#:window Duration) Throttle))
+(defun (make-throttle #:attempts 5 #:window (duration #:minutes 15L))
+  (when (< attempts 1) (refuse "#:attempts must be at least 1"))
+  (when (<= (duration->milliseconds window) 0L) (refuse "#:window must be longer than zero"))
+  (Throttle (attempts attempts)
+            (window (duration->milliseconds window))
+            (state (make-atomic (Counted (keys (map-empty)) (mark prune-floor))))))
+
+;; The failures of `key` that are still in the window at `t`.
+(: current-count (-> Throttle Counted string long int))
+(defun (current-count th c key t)
+  (match (map-try-ref (record-ref c keys) key)
+    (None 0)
+    ((Some a) (if (> (- t (record-ref a since)) (record-ref th window)) 0 (record-ref a count)))))
+
+(: throttle-allowed? (-> Throttle string bool))
+(defun (throttle-allowed? th key)
+  (< (current-count th (atomic-ref (record-ref th state)) key (now-ms)) (record-ref th attempts)))
+
+;; Counts one failure. The window starts at the first failure.
+(: throttle-failed! (-> Throttle string void))
+(defun (throttle-failed! th key)
+  (def t (now-ms))
+  (def window (record-ref th window))
+  (ignore
+    (atomic-update! (record-ref th state)
+      (fun (c)
+        (def n (current-count th c key t))
+        (def since (match (map-try-ref (record-ref c keys) key)
+                     ((Some a) (if (= n 0) t (record-ref a since)))
+                     (None t)))
+        (def keys (map-set (record-ref c keys) key (Attempts (count (+ n 1)) (since since))))
+        (if (< (map-length keys) (* 2 (record-ref c mark)))
+            (Counted (keys keys) (mark (record-ref c mark)))
+            (let ()
+              (def alive (map-filter (fun (_ a) (<= (- t (record-ref a since)) window)) keys))
+              (Counted (keys alive) (mark (max prune-floor (map-length alive))))))))))
+
+;; Forgets the failures of `key`, after a correct password.
+(: throttle-reset! (-> Throttle string void))
+(defun (throttle-reset! th key)
+  (ignore
+    (atomic-update! (record-ref th state)
+      (fun (c) (record-set c (keys (map-remove (record-ref c keys) key)))))))

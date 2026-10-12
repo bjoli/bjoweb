@@ -16,7 +16,7 @@
   Segment Route Router Match
 
   ;; Building a table.
-  router route with-fallback
+  router route with-fallback with-middleware
   route-get route-post route-put route-patch route-delete route-head
 
   ;; Using one.
@@ -119,6 +119,22 @@
 ;; Sets a custom fallback handler for unmatched requests.
 (: with-fallback (-> Router Handler Router))
 (defun (with-fallback rt handler) (record-set rt (fallback handler)))
+
+;; Wraps each route's handler and the fallback, as `pipeline` wraps one
+;; handler: `(with-middleware rt m1 m2)` gives each handler `(m1 (m2 h))`. A
+;; middleware runs after the route matched, so it sees the bound parameters.
+;; A 405 is answered by the router, and goes through none of them.
+(: with-middleware (-> Router #:rest Middleware Router))
+(defun (with-middleware rt #:rest middlewares)
+  (def ms (loop (:for m (in-array middlewares)) (:acc out (vecing m))))
+  (def wrap (fun (h)
+              (let go ((i (- (vec-length ms) 1)) (curr h))
+                (if (< i 0)
+                    curr
+                    (go (- i 1) ((vec-ref ms i) curr))))))
+  (Router (routes (vec-map (fun (r) (record-set r (handler (wrap (record-ref r handler)))))
+                           (record-ref rt routes)))
+          (fallback (wrap (record-ref rt fallback)))))
 
 (: router-routes (-> Router (Vec Route)))
 (defun (router-routes rt) (record-ref rt routes))

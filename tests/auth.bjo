@@ -1,0 +1,301 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjoweb/tests/auth.bjo — (bjoweb auth) on its own. No server anywhere.
+;;
+;;     bjo run tests/auth.bjo
+;;
+;; Requests are made with `make-request`, and the cookie a response sets is
+;; sent back by hand, as a browser would. The time is a manual clock, bound to
+;; `current-clock`, so that the idle limit and the lifetime can be passed.
+
+(import (std prelude))
+(import (std simpletest))
+(import (std datetime))
+(import (std crypto hash))
+(import (bjoweb core))
+(import (bjoweb router))
+(import (bjoweb auth))
+
+;; ---------------------------------------------------------------------------
+;; Users, and requests
+;; ---------------------------------------------------------------------------
+
+(type (: User (Record (: id string) (: name string))))
+
+(: users (Map string User))
+(def users (map-set (map-set (map-empty) "ada" (User (id "ada") (name "Ada")))
+                    "bob" (User (id "bob") (name "Bob"))))
+
+(: find-user (-bjo-> string (Option User)))
+(defbjo (find-user id) (map-try-ref users id))
+
+(: headers-of (-> (Vec (Tuple string string)) (Map string string)))
+(defun (headers-of pairs)
+  (vec-fold (fun (pair m) (match pair ((Tuple k v) (map-set m k v)))) (map-empty) pairs))
+
+(: request (-> string string (Vec (Tuple string string)) Request))
+(defun (request method path pairs)
+  (make-request method path (map-empty) (headers-of pairs) "" #:scheme "https" #:host "aches.example"))
+
+;; A request with the cookie a browser would send, `""` for none.
+(: with-token (-> string string string Request))
+(defun (with-token method path token)
+  (request method path (if (string-empty? token)
+                           (vec-empty)
+                           [(Tuple "cookie" (str "__Host-session=" token))])))
+
+;; The value of the first header with the name, `-` for none.
+(: header-of (-> Response string string))
+(defun (header-of r name)
+  (match (find (fun (h) (match h ((Tuple n _) (= (string-downcase n) (string-downcase name)))))
+               (response-headers r))
+    ((Some (Tuple _ v)) v)
+    (None "-")))
+
+;; The token a response sets, as the browser keeps it.
+(: token-of (-> Response string))
+(defun (token-of r)
+  (def first (vec-ref (string-split (header-of r "Set-Cookie") ";") 0))
+  (vec-ref (string-split first "=") 1))
+
+;; What a protected page answers: the user's name, or the status and where it
+;; redirects.
+(: answer (-> Response string))
+(defun (answer r)
+  (match (response-text r)
+    ((Some s) (if (= (response-status r) 200)
+                  s
+                  (str (int->string (response-status r)) " " (header-of r "Location"))))
+    (None (str (int->string (response-status r)) " " (header-of r "Location")))))
+
+(: whoami (-bjo-> Request User Response))
+(defbjo (whoami req user) (text (record-ref user name)))
+
+(: maybe-whoami (-bjo-> Request (Option User) Response))
+(defbjo (maybe-whoami req user)
+  (match user
+    ((Some u) (text (record-ref u name)))
+    (None (text "nobody"))))
+
+(: ok (-bjo-> Request Response))
+(defbjo (ok req) (text "ok"))
+
+(: refused? (-> (-> %a) bool))
+(defun (refused? thunk)
+  (match (try (thunk) #:catch (System.ArgumentException))
+    ((Ok _) #f)
+    ((Err _) #t)))
+
+(: minutes (-> long Duration))
+(defun (minutes n) (duration #:minutes n))
+
+(: start Instant)
+(def start (match (unix-seconds->instant 1767225600L) ((Some i) i) (None (panic! "start"))))
+
+(: visit (-bjo-> Handler string string string))
+(defbjo (visit page path token) (answer (page (with-token "GET" path token))))
+
+(: log-in (-bjo-> (Auth User) string string))
+(defbjo (log-in auth user)
+  (token-of (with-login auth (request "POST" "/login" (vec-empty)) user (redirect "/"))))
+
+(: from (-bjo-> Handler string (Vec (Tuple string string)) int))
+(defbjo (from guarded method pairs) (response-status (guarded (request method "/aches" pairs))))
+
+;; ---------------------------------------------------------------------------
+;; The checks
+;; ---------------------------------------------------------------------------
+
+(defbjo (main args)
+  (def clock (manual-clock start utc))
+  (parameterize ((current-clock clock))
+    (def store (memory-store))
+    (def auth (make-auth store find-user #:idle (minutes 30L) #:lifetime (duration #:days 1L)))
+    (def page (with-user auth whoami))
+    (def open-page (with-optional-user auth maybe-whoami))
+
+    ;; ---- Logging in -------------------------------------------------------
+    (def login (with-login auth (request "POST" "/login" (vec-empty)) "ada" (redirect "/")))
+    (def ada (token-of login))
+    (expect "a login sets a careful cookie, kept until the browser closes"
+            (string-join (vec-map (fun (part) (string-trim part))
+                                  (vec-filter (fun (part) (not (string-contains? part "__Host-session=")))
+                                              (string-split (header-of login "Set-Cookie") ";")))
+                         "; ")
+            "Path=/; Secure; HttpOnly; SameSite=Lax")
+    (expect "the token is 64 hex digits" (string-length ada) 64)
+    (expect "the answer to a login is not cached" (header-of login "Cache-Control") "no-store")
+    (expect "the answer is still the redirect" (header-of login "Location") "/")
+    (expect "#:remember keeps the cookie for the lifetime"
+            (string-contains? (header-of (with-login auth (request "POST" "/login" (vec-empty)) "ada"
+                                                     (redirect "/") #:remember #t)
+                                         "Set-Cookie")
+                              "Max-Age=86400")
+            #t)
+    (expect "two logins get two tokens" (= (log-in auth "ada") (log-in auth "ada")) #f)
+
+    ;; ---- The store holds the hash of the token ------------------------------
+    (expect "the store does not know the token"
+            (some? ((record-ref store load) ada)) #f)
+    (expect "it knows the token's SHA-256"
+            (match ((record-ref store load) (bytes->hex (hash-string ada)))
+              ((Some l) (record-ref l user))
+              (None "none"))
+            "ada")
+
+    ;; ---- Pages that need a user ---------------------------------------------
+    (expect "with the cookie, the handler gets the user" (visit page "/aches" ada) "Ada")
+    (expect "a page for a user is not cached"
+            (header-of (page (with-token "GET" "/aches" ada)) "Cache-Control") "no-store")
+    (expect "a handler's own Cache-Control is kept"
+            (header-of ((with-user auth (bjoroutine (req user)
+                                          (with-header (text "x") "Cache-Control" "private, max-age=60")))
+                        (with-token "GET" "/" ada))
+                       "Cache-Control")
+            "private, max-age=60")
+    (expect "without a cookie, a GET goes to the login page" (visit page "/aches" "") "302 /login?next=%2Faches")
+    (expect "without a cookie, a POST is 401"
+            (answer (page (with-token "POST" "/aches" ""))) "401 -")
+    (expect "a token that was never made" (visit page "/aches" (bytes->hex (hash-string "guess"))) "302 /login?next=%2Faches")
+    (expect "a cookie that is not a token" (visit page "/aches" "ada") "302 /login?next=%2Faches")
+    (expect "the hash of a token is not a token" (visit page "/aches" (bytes->hex (hash-string ada))) "302 /login?next=%2Faches")
+    (expect "an optional user, there" (answer (open-page (with-token "GET" "/" ada))) "Ada")
+    (expect "an optional user, not there" (answer (open-page (with-token "GET" "/" ""))) "nobody")
+    (expect "a public page is not marked private"
+            (header-of (open-page (with-token "GET" "/" "")) "Cache-Control") "-")
+
+    ;; ---- Time ---------------------------------------------------------------
+    (def busy (log-in auth "ada"))
+    (clock-advance! clock (minutes 20L))
+    (expect "used after 20 minutes" (visit page "/aches" busy) "Ada")
+    (clock-advance! clock (minutes 20L))
+    (expect "40 minutes, but used 20 minutes ago" (visit page "/aches" busy) "Ada")
+    (expect "an unused login from 40 minutes ago has ended" (visit page "/aches" ada) "302 /login?next=%2Faches")
+    (expect "and is gone from the store"
+            (some? ((record-ref store load) (bytes->hex (hash-string ada)))) #f)
+    (clock-advance! clock (minutes 31L))
+    (expect "31 minutes without use" (visit page "/aches" busy) "302 /login?next=%2Faches")
+
+    (def short (make-auth store find-user #:idle (duration #:days 1L) #:lifetime (minutes 60L)))
+    (def brief (token-of (with-login short (request "POST" "/login" (vec-empty)) "ada" (redirect "/"))))
+    (clock-advance! clock (minutes 30L))
+    (expect "within the lifetime" (visit (with-user short whoami) "/" brief) "Ada")
+    (clock-advance! clock (minutes 31L))
+    (expect "past the lifetime, though it was used" (visit (with-user short whoami) "/" brief) "302 /login?next=%2F")
+
+    ;; ---- A new token at each login ------------------------------------------
+    (def planted (log-in auth "bob"))
+    (def fresh (token-of (with-login auth (with-token "POST" "/login" planted) "ada" (redirect "/"))))
+    (expect "the token the request had names nothing after a login" (visit page "/aches" planted) "302 /login?next=%2Faches")
+    (expect "the new one is the user's" (visit page "/aches" fresh) "Ada")
+
+    ;; ---- Logging out --------------------------------------------------------
+    (def out (with-logout auth (with-token "POST" "/logout" fresh) (redirect "/")))
+    (expect "a logout deletes the cookie"
+            (string-contains? (header-of out "Set-Cookie") "Max-Age=0") #t)
+    (expect "and the login" (visit page "/aches" fresh) "302 /login?next=%2Faches")
+    (expect "a logout without a login still answers"
+            (header-of (with-logout auth (with-token "POST" "/logout" "") (redirect "/")) "Location") "/")
+
+    (def ada-1 (log-in auth "ada"))
+    (def ada-2 (log-in auth "ada"))
+    (def bob (log-in auth "bob"))
+    (logout-everywhere! auth "ada")
+    (expect "logged out everywhere"
+            (vec-map (bjoroutine (t) (visit page "/aches" t)) [ada-1 ada-2])
+            ["302 /login?next=%2Faches" "302 /login?next=%2Faches"])
+    (expect "another user is not" (visit page "/aches" bob) "Bob")
+
+    (def ghost (log-in auth "ghost"))
+    (expect "a user that is gone" (visit page "/aches" ghost) "302 /login?next=%2Faches")
+    (expect "takes the login with it"
+            (some? ((record-ref store load) (bytes->hex (hash-string ghost)))) #f)
+
+    ;; ---- The memory store prunes ---------------------------------------------
+    (def pruned (memory-store))
+    ((record-ref pruned save!) "old" (Login (user "x") (created 0L) (seen 0L) (expires 10L)))
+    (loop (:for i (up-from 0))
+          (:while (< i 600))
+          (:do ((record-ref pruned save!) (int->string i)
+                                          (Login (user "x") (created 100L) (seen 100L) (expires 200L)))))
+    (expect "an ended login is pruned as the store grows" (some? ((record-ref pruned load) "old")) #f)
+    (expect "and a live one is not" (some? ((record-ref pruned load) "599")) #t)
+
+    ;; ---- Configuration ------------------------------------------------------
+    (expect "a __Host- cookie must be secure"
+            (refused? #(make-auth store find-user #:secure #f)) #t)
+    (expect "another name may be sent over http"
+            (refused? #(make-auth store find-user #:secure #f #:cookie "session")) #f)
+    (expect "the login page is a path" (refused? #(make-auth store find-user #:login-path "login")) #t)
+    (expect "an idle limit of zero" (refused? #(make-auth store find-user #:idle (minutes 0L))) #t)
+    (expect "the login path" (login-path auth) "/login")
+
+    ;; ---- Where to go after a login --------------------------------------------
+    (expect "where it may go"
+            (vec-map (fun (n) (safe-next n))
+                     ["/aches" "/aches?sort=new" "https://evil.example" "//evil.example"
+                      "/\\evil.example" "evil" "" "/a\nb"])
+            ["/aches" "/aches?sort=new" "/" "/" "/" "/" "/" "/"])
+    (expect "another default" (safe-next "http://x" #:default "/home") "/home")
+
+    ;; ---- Cross-site requests --------------------------------------------------
+    (def guarded (pipeline ok (cross-origin-guard #:trusted ["https://friend.example"])))
+    (expect "a GET from anywhere" (from guarded "GET" [(Tuple "sec-fetch-site" "cross-site")]) 200)
+    (expect "a POST from this site" (from guarded "POST" [(Tuple "sec-fetch-site" "same-origin")]) 200)
+    (expect "a POST the user typed" (from guarded "POST" [(Tuple "sec-fetch-site" "none")]) 200)
+    (expect "a POST from another site" (from guarded "POST" [(Tuple "sec-fetch-site" "cross-site")]) 403)
+    (expect "a POST from a subdomain" (from guarded "POST" [(Tuple "sec-fetch-site" "same-site")]) 403)
+    (expect "a DELETE from another site" (from guarded "DELETE" [(Tuple "sec-fetch-site" "cross-site")]) 403)
+    (expect "a trusted origin"
+            (from guarded "POST" [(Tuple "sec-fetch-site" "cross-site") (Tuple "origin" "https://friend.example")]) 200)
+    (expect "an older browser, this site's origin" (from guarded "POST" [(Tuple "origin" "https://aches.example")]) 200)
+    (expect "an older browser, the origin in capitals" (from guarded "POST" [(Tuple "origin" "https://Aches.Example")]) 200)
+    (expect "an older browser, another origin" (from guarded "POST" [(Tuple "origin" "https://evil.example")]) 403)
+    (expect "an origin of null" (from guarded "POST" [(Tuple "origin" "null")]) 403)
+    (expect "another port is another origin" (from guarded "POST" [(Tuple "origin" "https://aches.example:8443")]) 403)
+    (expect "no browser headers at all" (from guarded "POST" (vec-empty)) 200)
+
+    ;; ---- A whole router guarded ----------------------------------------------
+    (def app (with-middleware
+               (router (route-get "/aches/:id" (bjoroutine (req) (text (request-param-or req "id" "-"))))
+                       (route-post "/aches/:id" ok))
+               (cross-origin-guard)))
+    (expect "a route, through the router's middleware"
+            (answer (handle app (request "GET" "/aches/7" (vec-empty)))) "7")
+    (expect "a cross-site POST to a route"
+            (response-status (handle app (request "POST" "/aches/7" [(Tuple "sec-fetch-site" "cross-site")])))
+            403)
+    (expect "a cross-site POST to no route goes through the fallback's guard"
+            (response-status (handle app (request "POST" "/nowhere" [(Tuple "sec-fetch-site" "cross-site")])))
+            403)
+    (expect "a same-site POST"
+            (response-status (handle app (request "POST" "/aches/7" [(Tuple "sec-fetch-site" "same-origin")])))
+            200)
+
+    ;; ---- Throttle -------------------------------------------------------------
+    (def th (make-throttle #:attempts 3 #:window (minutes 10L)))
+    (throttle-failed! th "ada")
+    (throttle-failed! th "ada")
+    (expect "two failures of three" (throttle-allowed? th "ada") #t)
+    (throttle-failed! th "ada")
+    (expect "three failures" (throttle-allowed? th "ada") #f)
+    (expect "another key" (throttle-allowed? th "bob") #t)
+    (clock-advance! clock (minutes 11L))
+    (expect "after the window" (throttle-allowed? th "ada") #t)
+    (throttle-failed! th "ada")
+    (expect "a failure after the window counts from one" (throttle-allowed? th "ada") #t)
+    (throttle-failed! th "bob")
+    (throttle-failed! th "bob")
+    (throttle-failed! th "bob")
+    (throttle-reset! th "bob")
+    (expect "a reset forgets" (throttle-allowed? th "bob") #t)
+    (expect "at least one attempt" (refused? #(make-throttle #:attempts 0)) #t)
+
+    ;; ---- Passwords ------------------------------------------------------------
+    (def stored (password-hash "kn33" #:iterations 1000))
+    (expect "the password" (password-matches? "kn33" (Some stored)) #t)
+    (expect "another password" (password-matches? "knee" (Some stored)) #f)
+    (expect "no such user" (password-matches? "kn33" None) #f))
+  0)

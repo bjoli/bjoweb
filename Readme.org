@@ -37,7 +37,7 @@ A worker fiber receives the call with its original environment intact, reads the
 
 For more details, see ~(std inbox)~.
 
-** The five modules
+** The six modules
 
 | Module               | What is in it                                       | ASP.NET? |
 |----------------------+-----------------------------------------------------+----------|
@@ -45,9 +45,10 @@ For more details, see ~(std inbox)~.
 | ~(bjoweb router)~    | routes, patterns, matching                           | no       |
 | ~(bjoweb html)~      | SXML as a literal, escaping, rendering               | no       |
 | ~(bjoweb multipart)~ | a ~multipart/form-data~ body, one part at a time; ~(bjoweb core)~ passes it on | no |
+| ~(bjoweb auth)~      | logins, handlers that get the user, cross-site requests, a throttle | no |
 | ~(bjoweb server)~    | Kestrel, the inbox, the workers, the two conversions, the upgrade | all of it |
 
-Four of the five never name an ASP.NET type, which is why most of this package
+Five of the six never name an ASP.NET type, which is why most of this package
 can be unit-tested with no socket anywhere:
 
 #+BEGIN_SRC scheme
@@ -277,6 +278,16 @@ Because `pipeline` takes a target handler followed by a variable number of middl
 #+END_SRC
 
 Here, `logger` wraps `auth`, which wraps `home`. The request flows through `logger`, then `auth`, then `home`.
+
+~with-middleware~ does the same to each route of a router, and to its
+fallback, so that one middleware guards a whole site:
+
+#+BEGIN_SRC scheme
+(serve (with-middleware (router ...) logger (cross-origin-guard)) #:port 8080)
+#+END_SRC
+
+The middleware runs after the route matched, so it sees the parameters the
+route bound. A 405 is answered by the router, and goes through none of them.
 
 ** Streaming
 
@@ -550,6 +561,140 @@ A ~HEAD~ with no ~HEAD~ route of its own is answered by the ~GET~ one.
 ~(route "OPTIONS" "/*path" preflight)~ is the general form, for verbs with no
 helper.
 
+** Logins
+
+~(bjoweb auth)~ keeps logins on the server, and gives a handler the user as an
+argument:
+
+#+BEGIN_SRC scheme
+(import (bjoweb auth))
+
+(def auth (make-auth (memory-store) find-user))   ; find-user: (-bjo-> string (Option User))
+
+(: submit-ache (-bjo-> Request User Response))
+(defbjo (submit-ache req user)
+  (save-ache! user (request-form-or req "ache" ""))
+  (redirect "/aches"))
+
+(def app
+  (with-middleware
+    (router
+      (route-get  "/"       (with-optional-user auth home))
+      (route-get  "/login"  (bjoroutine (req) (login-page req)))
+      (route-post "/login"  post-login)
+      (route-post "/logout" (bjoroutine (req) (with-logout auth req (redirect "/"))))
+      (route-post "/aches"  (with-user auth submit-ache)))
+    (cross-origin-guard)))
+#+END_SRC
+
+*A handler that needs a user cannot be routed without the check.*
+~submit-ache~ is a ~(-bjo-> Request User Response)~, which is not a ~Handler~,
+and ~with-user~ is the only way from one to the other. Without a login, a
+~GET~ goes to ~/login?next=/the/path~ and anything else is 401.
+~with-optional-user~ gives the handler an ~(Option User)~ instead, for a page
+that everybody can see.
+
+Logging in and out add to an answer, as ~with-cookie~ does:
+
+| ~(with-login auth req user-id r)~        | a new login, and its cookie on ~r~; ~#:remember #t~ keeps the cookie |
+| ~(with-logout auth req r)~               | ends the request's login, and deletes the cookie |
+| ~(logout-everywhere! auth user-id)~      | ends all logins of the user                      |
+| ~(request-user auth req)~                | the user, as an ~Option~, for a handler of your own |
+
+The program keeps its users and their passwords. A login page that uses
+~(std crypto hash)~ for the passwords:
+
+#+BEGIN_SRC scheme
+(def attempts (make-throttle #:attempts 5 #:window (duration #:minutes 15L)))
+
+(: post-login (-bjo-> Request Response))
+(defbjo (post-login req)
+  (def name (request-form-or req "name" ""))
+  (def next (safe-next (request-form-or req "next" "/")))
+  (def key (str name " " (request-client req)))
+  (cond
+    ((not (throttle-allowed? attempts key))
+     (respond 429 "Too many attempts. Try again later.\n"))
+    (else
+     (def user (find-user-by-name name))
+     (def stored (match user ((Some u) (Some (user-hash u))) (None None)))
+     (cond
+       ((password-matches? (request-form-or req "password" "") stored)
+        (throttle-reset! attempts key)
+        (with-login auth req (user-id (option-ref user)) (redirect next)))
+       (else
+        (throttle-failed! attempts key)
+        (login-page req #:error "Wrong name or password."))))))
+#+END_SRC
+
+- ~password-matches?~ takes ~None~ when there is no such user, and then takes
+  as long as a check of a real hash. The time of the answer does not tell
+  which names exist.
+- ~safe-next~ gives ~next~ only when it is a path on this site. A login page
+  that goes to any ~next~ can send users to a site an attacker chose.
+- ~make-throttle~ counts failures for each key in a window. A check of a
+  password takes a core for a few hundred milliseconds, so check the throttle
+  first.
+
+*** What a login is
+
+The cookie, ~__Host-session~, holds a random token of 256 bits. It is
+~HttpOnly~, ~Secure~ and ~SameSite=Lax~. The ~__Host-~ prefix tells the browser
+to keep it only when it was set over https (or on localhost), for ~Path=/~, and
+for this host alone. Served over plain http on another host, give
+~make-auth~ ~#:cookie "session" #:secure #f~.
+
+The store holds the SHA-256 of the token, not the token, so a store that leaks
+gives nobody a login. Each login gets a new token, and the token the request
+had before is removed: a token that an attacker put in the browser names
+nothing after the user logs in.
+
+A login ends when it was not used for ~#:idle~ (one day), or when it is older
+than ~#:lifetime~ (30 days), whichever is first. A use moves the idle limit,
+but at most once a minute, so that a page with many requests does not write to
+the store for each one. The time is read from ~current-clock~, so a test can
+move it with a manual clock.
+
+*** A store of your own
+
+~memory-store~ keeps the logins in the process, and they are lost when it
+stops. A store is a record of four bjoroutines, so the logins can go in the
+program's database:
+
+#+BEGIN_SRC scheme
+(SessionStore
+  (load         (bjoroutine (key) ...))           ; (Option Login)
+  (save!        (bjoroutine (key login) ...))
+  (remove!      (bjoroutine (key) ...))
+  (remove-user! (bjoroutine (user) ...)))
+#+END_SRC
+
+A ~Login~ is a user ID and three times, in milliseconds since 1970: ~created~,
+~seen~ and ~expires~. A store can delete a login after ~expires~ without
+asking, as ~memory-store~ does while it grows. In SQL that is one
+~DELETE ... WHERE expires < ?~ now and then. A field may be a ~fun~ that does
+not suspend, as ~memory-store~'s are; one that queries a database is a
+~bjoroutine~.
+
+*** Cross-site requests
+
+A form on another site can post to this one, and the browser sends this site's
+cookies with it. ~SameSite=Lax~ stops that in current browsers.
+~(cross-origin-guard)~ stops it with the headers that browsers add to each
+request, as Go's ~http.CrossOriginProtection~ does:
+
+1. ~GET~, ~HEAD~ and ~OPTIONS~ are allowed. They must not change anything.
+2. ~Sec-Fetch-Site~ of ~same-origin~, or ~none~ (the user typed the address),
+   is allowed, and any other value is refused with 403.
+3. Without it, ~Origin~ must name the host of the request.
+4. Without either, the request did not come from a browser, and it is allowed:
+   a request that a program sends does not have the user's cookies.
+
+~#:trusted ["https://friend.example"]~ allows origins from other sites. There
+is no token to put in each form, so a streamed upload needs nothing more.
+The host is ~request-host~, so behind a proxy it needs ~#:trusted-proxies~ to
+be right (see Behind a proxy).
+
 ** Running it
 
 ~serve~ is what a ~main~ wants: start, serve until Ctrl-C, stop.
@@ -681,8 +826,9 @@ reconnect.
 
 ** What this is not
 
-No dependency injection, no configuration system, no authentication, no content
-negotiation, no TLS, no HTTP/2. Kestrel can do all of those and none of them is
+No dependency injection, no configuration system, no user accounts or password
+storage (logins are here, see Logins), no content negotiation, no TLS, no
+HTTP/2. Kestrel can do all of those and none of them is
 here; a reverse proxy in front does TLS and HTTP/2 (see Behind a proxy).
 Websockets are here, without the compression extension, and so are streamed
 bodies both ways and server-sent events.
@@ -767,8 +913,25 @@ not have it; ~dotnet/aspnet~ does.
 
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 46 checks, no server anywhere
+bjo run tests/auth.bjo    ;; 71 checks, no server anywhere
 bjo run tests/demo.bjo    ;; 106 checks, a real socket
 #+END_SRC
+
+~tests/auth.bjo~ makes requests with ~make-request~ and sends back the cookie
+a response set, as a browser would, with a manual clock bound to
+~current-clock~. It checks the cookie's attributes; that the store holds the
+hash of the token and not the token; a handler that gets the user, and the
+redirect or 401 without one, for no cookie, a token never made, a cookie that
+is not a token, and the hash of a token sent as one. Then time: a login used
+every 20 minutes outlives an idle limit of 30, one left alone does not, and
+neither outlives its lifetime. A login removes the token the request had, a
+logout deletes the cookie and the login, ~logout-everywhere!~ ends one user's
+logins and not another's, and a user that is gone takes the login with it. The
+memory store prunes ended logins as it grows. ~safe-next~ refuses another
+host, ~//host~ and ~/\host~. The cross-origin guard is tried with each value of
+~Sec-Fetch-Site~, with ~Origin~ alone, with a trusted origin, with neither,
+and over a whole router through ~with-middleware~. Then the throttle and its
+window, and ~password-matches?~ with and without a user.
 
 ~tests/html.bjo~ is the renderer on its own: shapes and indentation, text never
 touched — a link and then a full stop, inline elements side by side, text beside

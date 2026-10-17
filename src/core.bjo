@@ -61,7 +61,7 @@
 
 (import (std prelude))
 (import (only (std ports) read-some byte-pipe write-bytes!))
-(import (only (std inbox) make-inbox inbox-close! inbox-closed))
+(import (only (std inbox) WhenFull make-inbox inbox-close! inbox-closed))
 (import (net websocket protocol))
 (import (bjoweb multipart))
 

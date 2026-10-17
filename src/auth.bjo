@@ -58,7 +58,7 @@
 (import (std prelude))
 (import (only (std atomic) make-atomic atomic-ref atomic-update!))
 (import (only (std random) random-bytes!))
-(import (only (std datetime) duration duration->milliseconds duration->seconds
+(import (only (std datetime) Duration duration duration->milliseconds duration->seconds
               now instant->unix-milliseconds))
 (import (std crypto hash))
 (import (bjoweb core))

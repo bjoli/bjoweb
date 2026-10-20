@@ -27,7 +27,7 @@
 ;; This one only waits; a real one would read a file or call a service.
 (: slowly (-bjo-> Request Response))
 (defbjo (slowly req)
-  (sync (timeout 250))
+  (sync (timeout (milliseconds 250)))
   (text "that took a moment\n"))
 
 (defbjo (main args)

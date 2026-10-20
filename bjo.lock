@@ -1,5 +1,5 @@
 (lock
   (locked
-    (package (name (net websocket)) (version "0.5.0")
+    (package (name (net websocket)) (version "0.6.0")
              (source (git (url "https://github.com/bjoli/websocket")))
-             (commit "faf7a51d0382df47a888bbdabf16be8665d60bc4"))))
+             (commit "2f9959479b50e7459d723dcff7a8fd7d49560e3b"))))

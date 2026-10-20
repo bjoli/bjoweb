@@ -94,14 +94,14 @@
 ;; next request is not held up by it.
 (: slow (-bjo-> Request Response))
 (defbjo (slow req)
-  (sync (timeout 30))
+  (sync (timeout (milliseconds 30)))
   (text "eventually"))
 
 ;; Slow enough that a burst cannot drain while it arrives, for the overflow
 ;; check at the end.
 (: dawdle (-bjo-> Request Response))
 (defbjo (dawdle req)
-  (sync (timeout 400))
+  (sync (timeout (milliseconds 400)))
   (text "done"))
 
 (def busy-app (router (route-get "/" dawdle)))
@@ -256,7 +256,7 @@
   (try
       (let go ()
         (line out "tick")
-        (ignore (sync (timeout 10)))
+        (ignore (sync (timeout (milliseconds 10))))
         (go))
     #:finally (ignore (inbox-post! writer-ended unit))))
 
@@ -268,7 +268,7 @@
   (try
       (let ()
         (line out "waiting")
-        (ignore (sync (timeout 600000))))
+        (ignore (sync (timeout (minutes 10)))))
     #:finally (ignore (inbox-post! writer-ended unit))))
 
 (: should-not-run (-bjo-> OutputPort void))
@@ -286,9 +286,9 @@
 (defbjo (leave-slowly req)
   (ignore (inbox-post! progress "started"))
   (with-shield
-    (ignore (sync (timeout 300)))
+    (ignore (sync (timeout (milliseconds 300))))
     (ignore (inbox-post! progress "saved")))
-  (ignore (sync (timeout 600)))
+  (ignore (sync (timeout (milliseconds 600))))
   (ignore (inbox-post! progress "finished"))
   (text "done"))
 
@@ -300,7 +300,7 @@
 
 (: fail-soon (-bjo-> void))
 (defbjo (fail-soon)
-  (ignore (sync (timeout 50)))
+  (ignore (sync (timeout (milliseconds 50))))
   (raise (cast Exception (Boom. "the handler's fiber exploded"))))
 
 ;; Text, flushed once in the middle.
@@ -322,7 +322,7 @@
 (: one-then-quiet (-bjo-> EventSink void))
 (defbjo (one-then-quiet es)
   (ignore (send-event! es "first"))
-  (ignore (sync (timeout 600000))))
+  (ignore (sync (timeout (minutes 10)))))
 
 ;; A line break in an event name would let whoever chose the name write fields
 ;; of their own.
@@ -398,8 +398,8 @@
     (route-get    "/stream/waiting" (fun (req) (stream say-then-wait)))
     (route-get    "/stream/head"    (fun (req) (stream should-not-run)))
     ;; --- server-sent events ---
-    (route-get    "/events/some"    (fun (req) (event-stream some-events #:retry 2500)))
-    (route-get    "/events/quiet"   (fun (req) (event-stream one-then-quiet #:keep-alive 50)))
+    (route-get    "/events/some"    (fun (req) (event-stream some-events #:retry (Some (milliseconds 2500)))))
+    (route-get    "/events/quiet"   (fun (req) (event-stream one-then-quiet #:keep-alive (Some (milliseconds 50)))))
     (route-get    "/events/bad"     (fun (req) (event-stream badly-named)))
     (route-get    "/events/escape"  (fun (req) (event-stream escaping)))))
 
@@ -536,7 +536,7 @@
 (defbjo (all-that-arrives in)
   (let go ((acc ""))
     (match (sync (choose (wrap (read-some-evt in) (fun (r) (Some r)))
-                         (wrap (timeout 3000) (fun (u) None))))
+                         (wrap (timeout (seconds 3)) (fun (u) None))))
       ((Some (Ok (Some bs))) (go (str acc (bytes->string bs #:replace (Some #\xFFFD)))))
       (_ acc))))
 
@@ -610,13 +610,13 @@
 
 ;; `so-far`, and whatever arrives on `in` after it until `needle` is in it, the
 ;; stream ends, or nothing has arrived for `ms` milliseconds.
-(: read-until (-bjo-> InputPort string int string string))
+(: read-until (-bjo-> InputPort string long string string))
 (defbjo (read-until in needle ms so-far)
   (let go ((acc so-far))
     (if (string-contains? acc needle)
         acc
         (match (sync (choose (wrap (read-some-evt in) (fun (r) (Some r)))
-                             (wrap (timeout ms) (fun (u) None))))
+                             (wrap (timeout (milliseconds ms)) (fun (u) None))))
           ((Some (Ok (Some bs))) (go (str acc (bytes->string bs #:replace (Some #\xFFFD)))))
           (_ acc)))))
 
@@ -661,28 +661,28 @@
   ;; The scope has closed the socket by now.
   (str (if (string-contains? seen "tick") "ticking" "never ticked")
        (sync (choose (wrap (inbox-recv writer-ended) (fun (u) ", then stopped"))
-                     (wrap (timeout 5000) (fun (u) ", still running"))))))
+                     (wrap (timeout (seconds 5)) (fun (u) ", still running"))))))
 
 ;; Whether `should-not-run` ran.
 (: probed (-bjo-> string))
 (defbjo (probed)
   (sync (choose (wrap (inbox-recv head-probe) (fun (u) "called"))
-                (wrap (timeout 500) (fun (u) "not called")))))
+                (wrap (timeout (milliseconds 500)) (fun (u) "not called")))))
 
 ;; Asks for `path` and hangs up `ms` milliseconds later.
-(: ask-and-leave (-bjo-> int string int void))
+(: ask-and-leave (-bjo-> int string long void))
 (defbjo (ask-and-leave port path ms)
   (with-scope
     (match (tcp-connect "127.0.0.1" port)
-      ((Ok (Tuple in out)) (send-get! out path) (ignore (sync (timeout ms))))
+      ((Ok (Tuple in out)) (send-get! out path) (ignore (sync (timeout (milliseconds ms)))))
       ((Err e) unit))))
 
 ;; Everything posted to `progress` until nothing has been for `ms`.
-(: progress-until-quiet (-bjo-> int string))
+(: progress-until-quiet (-bjo-> long string))
 (defbjo (progress-until-quiet ms)
   (let go ((said (vec-empty)))
     (match (sync (choose (wrap (inbox-recv progress) (fun (s) (Some s)))
-                         (wrap (timeout ms) (fun (u) None))))
+                         (wrap (timeout (milliseconds ms)) (fun (u) None))))
       ((Some s) (go (vec-add said s)))
       (None (string-join said ",")))))
 
@@ -733,7 +733,7 @@
 (defbjo (late-send base)
   (ignore (fetched (http-get (str base "/events/escape"))))
   (match (sync (choose (wrap (inbox-recv kept-sinks) (fun (s) (Some s)))
-                       (wrap (timeout 3000) (fun (u) None))))
+                       (wrap (timeout (seconds 3)) (fun (u) None))))
     (None "no sink was kept")
     ((Some es)
      (with-cancel (stop)
@@ -741,7 +741,7 @@
                                      (fun (r) (match r
                                                 ((Ok sent) (if sent "sent" "#f"))
                                                 ((Err e) (.-Message e)))))
-                               (wrap (timeout 3000) (fun (u) "still waiting")))))
+                               (wrap (timeout (seconds 3)) (fun (u) "still waiting")))))
        (stop (Requested "checked"))
        said))))
 
@@ -1317,7 +1317,7 @@
                                      (fun (r) (match r
                                                 ((Ok (Tuple code body)) (int->string code))
                                                 ((Err e) (.-Message e)))))
-                               (wrap (timeout 3000) (fun (u) "timed out"))))
+                               (wrap (timeout (seconds 3)) (fun (u) "timed out"))))
                  "200")
          (def before (monotonic-ms))
          (stop-server! server)
@@ -1328,7 +1328,7 @@
                  "cut off")
          (expect "and its writer is stopped"
                  (sync (choose (wrap (inbox-recv writer-ended) (fun (u) "stopped"))
-                               (wrap (timeout 3000) (fun (u) "still running"))))
+                               (wrap (timeout (seconds 3)) (fun (u) "still running"))))
                  "stopped")))))
 
   ;; --- a client that goes away ----------------------------------------------

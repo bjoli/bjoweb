@@ -142,7 +142,7 @@
 (type (: Upgrade (Record (: session Session)
                          (: protocol string)
                          (: max-message int)
-                         (: keep-alive int))))
+                         (: keep-alive (Option Duration)))))
 
 ;; What writes a streamed body, on a fiber of its own. The port is the response
 ;; body: what is written goes out when the writer flushes it or its buffer
@@ -543,10 +543,9 @@
 ;; calling `session`. Headers added with `with-header` go out with the `101`.
 ;;
 ;; `#:max-message` bounds one message after reassembly; a bigger one closes the
-;; socket with 1009. `#:keep-alive` is how many idle milliseconds pass before a
-;; ping, 0 for none.
-(: websocket (-> Session (#:protocol string) (#:max-message int) (#:keep-alive int) Response))
-(defun (websocket session #:protocol "" #:max-message 1048576 #:keep-alive 30000)
+;; socket with 1009.
+(: websocket (-> Session (#:protocol string) (#:max-message int) (#:keep-alive (Option Duration)) Response))
+(defun (websocket session #:protocol "" #:max-message 1048576 #:keep-alive (Some (seconds 30)))
   (Response (status 101) (content-type "") (headers (vec-empty))
             (body (Upgraded (Upgrade (session session)
                                      (protocol protocol)
@@ -614,14 +613,14 @@
 ;;
 ;; A comment goes out at once, so that the stream is seen to be open before
 ;; there is anything to say, and another after every `#:keep-alive`
-;; milliseconds without an event, 0 for none, so that no proxy on the way
-;; takes a quiet stream for a dead one. `#:retry`, when it is not 0, tells the
-;; browser how many milliseconds to wait before it reconnects.
+;; without an event, so that no proxy on the way
+;; takes a quiet stream for a dead one. `#:retry` tells the
+;; browser how long to wait before it reconnects.
 ;;
 ;; A browser reconnects on its own, with the last `#:id` it saw as the
 ;; `Last-Event-ID` request header, for the handler to carry on from.
-(: event-stream (-> (-bjo-> EventSink void) (#:keep-alive int) (#:retry int) Response))
-(defun (event-stream writer #:keep-alive 15000 #:retry 0)
+(: event-stream (-> (-bjo-> EventSink void) (#:keep-alive (Option Duration)) (#:retry (Option Duration)) Response))
+(defun (event-stream writer #:keep-alive (Some (seconds 15)) #:retry None)
   (with-header (with-header (stream (bjoroutine (out) (run-events writer keep-alive retry out))
                                     #:content-type "text/event-stream")
                             "Cache-Control" "no-cache")
@@ -668,11 +667,13 @@
 
 ;; Once the writer has returned, anything it started is stopped, and a sink
 ;; that has outlived the stream answers `#f`.
-(: run-events (-bjo-> (-bjo-> EventSink void) int int OutputPort void))
+(: run-events (-bjo-> (-bjo-> EventSink void) (Option Duration) (Option Duration) OutputPort void))
 (defbjo (run-events writer keep-alive retry port)
   (def texts (make-chan))
   (def over (make-inbox 1 DropNewest))
-  (say! port (str ":\n" (if (> retry 0) (str "retry: " (int->string retry) "\n\n") "")))
+  (say! port (str ":\n" (match retry
+                           ((Some d) (str "retry: " (->str (duration->timer-ms d)) "\n\n"))
+                           (None ""))))
   (def ending
     (try
         (with-cancel (stop)
@@ -686,8 +687,8 @@
     ((Err e) (raise e))))
 
 ;; Writes what the writer sends, and a comment whenever it has been quiet for
-;; `keep-alive` milliseconds, until it returns.
-(: relay (-bjo-> OutputPort (Chan string) (Promise Unit) int (Result Exception Unit)))
+;; `keep-alive`, until it returns.
+(: relay (-bjo-> OutputPort (Chan string) (Promise Unit) (Option Duration) (Result Exception Unit)))
 (defbjo (relay port texts running keep-alive)
   (let go ()
     (match (sync (choose (wrap (chan-recv texts) (fun (t) (Said t)))
@@ -697,8 +698,11 @@
       (Quiet (say! port ":\n") (go))
       ((Finished r) r))))
 
-(: quiet-for (-> int (Event Unit)))
-(defun (quiet-for ms) (if (> ms 0) (timeout ms) (never)))
+(: quiet-for (-> (Option Duration) (Event Unit)))
+(defun (quiet-for keep-alive)
+  (match keep-alive
+    ((Some d) (timeout d))
+    (None (never))))
 
 (: say! (-bjo-> OutputPort string void))
 (defbjo (say! port text)

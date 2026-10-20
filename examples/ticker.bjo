@@ -28,7 +28,7 @@
   (bjoroutine (es)
     (let go ((n from))
       (ignore (send-event! es (int->string n) #:id (int->string n)))
-      (ignore (sync (timeout 1000)))
+      (ignore (sync (timeout (seconds 1))))
       (go (+ n 1)))))
 
 ;; One past the last id the browser saw, or 0 for a first visit. The header is
@@ -61,6 +61,6 @@ events.onerror = () => { count.textContent += ' (reconnecting)'; };"))
            ;; A second, rather than the browser's three or so, since the point
            ;; is to watch it come back.
            (route-get "/count" (fun (req) (event-stream (count-from (resumed-at req))
-                                                        #:retry 1000))))
+                                                        #:retry (Some (seconds 1))))))
          #:port 8080)
   0)

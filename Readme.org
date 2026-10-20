@@ -301,7 +301,7 @@ long computation — rather than built in memory first:
     (when (> i 0)
       (write-string out (str (int->string i) "\n"))
       (flush-port out)
-      (ignore (sync (timeout 1000)))
+      (ignore (sync (timeout (seconds 1))))
       (go (- i 1)))))
 
 (router (route-get "/countdown" (fun (req) (stream-text countdown))))
@@ -349,7 +349,7 @@ For a browser's ~EventSource~: a stream of events, each of them sent whole.
   (bjoroutine (es)
     (let go ((n from))
       (ignore (send-event! es (int->string n) #:id (int->string n)))
-      (ignore (sync (timeout 1000)))
+      (ignore (sync (timeout (seconds 1))))
       (go (+ n 1)))))
 
 (router (route-get "/count" (fun (req) (event-stream (count-from 0)))))
@@ -368,9 +368,11 @@ dealt with as they are there. On top of that:
 - A comment goes out at once, so that the stream is seen to be open before
   there is anything to say, even through a proxy that holds the head back
   until some body arrives. Another goes out after every ~#:keep-alive~
-  milliseconds without an event, 15 seconds unless told otherwise and 0 for
-  none, so that nothing on the way closes a quiet stream as idle.
-- ~#:retry~ is how many milliseconds the browser waits before reconnecting.
+  without an event, an ~(Option Duration)~: ~(Some (seconds 15))~ unless told
+  otherwise and ~None~ for none, so that nothing on the way closes a quiet
+  stream as idle.
+- ~#:retry~ is how long the browser waits before reconnecting, an
+  ~(Option Duration)~: ~None~, the default, sends none.
 - ~Cache-Control: no-cache~ goes with it, and ~X-Accel-Buffering: no~ for nginx,
   which otherwise buffers.
 - ~send-event!~ returns once the event has been handed to the loop that owns
@@ -450,7 +452,8 @@ server, as a handler has.
 ~websocket~ takes ~#:protocol~, the ~Sec-WebSocket-Protocol~ to answer with;
 ~#:max-message~, the largest message after reassembly, 1 MiB unless told
 otherwise, above which the socket is closed with 1009; and ~#:keep-alive~, how
-many idle milliseconds before a ping, 30 seconds unless told otherwise.
+long the socket is idle before a ping, an ~(Option Duration)~: ~(Some (seconds
+30))~ unless told otherwise, and ~None~ for never.
 
 A session is ordinary Bjolang over ~(net websocket protocol)~, so it can be tested with
 no server: ~ports->websocket~ over two ~byte-pipe~ s is a socket with nothing

@@ -10,14 +10,11 @@
 ;;                  (body (@ (class "card"))
 ;;                        "hello " (b ,name))))
 ;;
-;; No macro and no per-tag functions. A quoted literal with nesting in it
-;; *stands for* a union, and which case each piece becomes is decided by its
-;; shape before anything is inferred: a symbol is a tag, a string is text, a
-;; nested list is a child node. The expected type comes from the parameter the
-;; literal is passed to — which is why `render` and friends take `Nodes`, the
-;; alias for `(List Node)`, rather than `Node`. A literal's *elements* are
-;; injected; the literal itself is not, so a `Node` parameter would have
-;; nothing to push down and you would get `string` against `Symbol`.
+;; No macro and no per-tag functions. A quoted literal is read by the grammar
+;; `Nodes`, and which case each piece becomes is decided by its shape before
+;; anything is inferred: a symbol is a tag, a string is text, a nested list is
+;; a child node. The expected type comes from the parameter the literal is
+;; passed to.
 ;;
 ;; See `TestFiles/100_literal_elaboration.bjo` for the mechanism.
 ;;
@@ -77,14 +74,13 @@
 (: raw (-> string Raw))
 (defun (raw markup) (Raw (html markup)))
 
-(type-rec
-  (: Node (Union (: NText string)
-                 (: NRaw Raw)
-                 (: NSym Symbol)
-                 (: NInt int)
-                 (: NSub (List Node))))
-  ;; What a parameter must say. See the head of this file.
-  (: Nodes (Alias (List Node))))
+(def/grammar Nodes
+  (Nodes (List Node))
+  (Node (:or (: NText string)
+             (: NRaw ,Raw)
+             (: NSym symbol)
+             (: NInt int)
+             (: NSub (Node ...)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Escaping

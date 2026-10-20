@@ -41,6 +41,10 @@
   (App         (: Microsoft.AspNetCore.Builder.WebApplication))
   (AppBuilder  (: Microsoft.AspNetCore.Builder.WebApplicationBuilder))
   (Pipeline    (: Microsoft.AspNetCore.Builder.IApplicationBuilder))
+  (RequestDelegate (: Microsoft.AspNetCore.Http.RequestDelegate))
+  (Delegate    (: System.Delegate))
+  (ClrType     (: System.Type))
+  (MethodInfo  (: System.Reflection.MethodInfo))
   (Ctx         (: Microsoft.AspNetCore.Http.HttpContext))
   (Incoming    (: Microsoft.AspNetCore.Http.HttpRequest))
   (Outgoing    (: Microsoft.AspNetCore.Http.HttpResponse))
@@ -94,9 +98,17 @@
   (app-run       (: Microsoft.AspNetCore.Builder.WebApplication.RunAsync (-> App string void)
                     #:async #:uncancellable))
 
-  ;; Registers middleware. Uses the `Func<HttpContext, Func<Task>, Task>` overload.
-  (use!          (: Microsoft.AspNetCore.Builder.UseExtensions.Use
-                    (-> Pipeline (-> Ctx (-> Task) Task) Pipeline)))
+  ;; The last step of the pipeline. `Use` with a `Func<HttpContext, Func<Task>,
+  ;; Task>` made a closure and a delegate for `next` on every request, 133
+  ;; bytes, and `knock` never calls `next`.
+  (run!          (: Microsoft.AspNetCore.Builder.RunExtensions.Run
+                    (-> Pipeline RequestDelegate void)))
+  ;; A lambda is a `Func<HttpContext, Task>`, and `Run` takes a
+  ;; `RequestDelegate`: the same method, made once into the other type.
+  (as-delegate   (: System.Delegate.CreateDelegate (-> ClrType Object MethodInfo Delegate)))
+  (clr-type      (: System.Type.GetType (-> string ClrType)))
+  (fn-target     (: System.Delegate.Target (-> Delegate Object) #:get))
+  (fn-method     (: System.Delegate.Method (-> Delegate MethodInfo) #:get))
   (use-static-files! (: Microsoft.AspNetCore.Builder.StaticFileExtensions.UseStaticFiles
                         (-> Pipeline Pipeline)))
 
@@ -106,6 +118,11 @@
   ;; Token triggered when the client disconnects.
   (ctx-aborted   (: Microsoft.AspNetCore.Http.HttpContext.RequestAborted (-> Ctx CancellationToken) #:get))
   (in-method     (: Microsoft.AspNetCore.Http.HttpRequest.Method      (-> Incoming string) #:get))
+  ;; The method and the scheme as Kestrel's own strings, which
+  ;; `known-words` is keyed by.
+  (in-method/clr (: Microsoft.AspNetCore.Http.HttpRequest.Method      (-> Incoming System.String) #:get))
+  (in-scheme/clr (: Microsoft.AspNetCore.Http.HttpRequest.Scheme      (-> Incoming System.String) #:get))
+  (clr-length    (: System.String.Length (-> System.String int) #:get))
   (in-path       (: Microsoft.AspNetCore.Http.HttpRequest.Path        (-> Incoming PathText) #:get))
   (in-query      (: Microsoft.AspNetCore.Http.HttpRequest.QueryString (-> Incoming QueryText) #:get))
   (in-headers    (: Microsoft.AspNetCore.Http.HttpRequest.Headers     (-> Incoming HeaderDict) #:get))
@@ -117,7 +134,9 @@
 
   ;; --- Writing a response ---
   (out-status!   (: Microsoft.AspNetCore.Http.HttpResponse.StatusCode  (-> Outgoing int void) #:set))
-  (out-type!     (: Microsoft.AspNetCore.Http.HttpResponse.ContentType (-> Outgoing string void) #:set))
+  (out-type!     (: Microsoft.AspNetCore.Http.HttpResponse.ContentType (-> Outgoing System.String void) #:set))
+  (out-length!   (: Microsoft.AspNetCore.Http.HttpResponse.ContentLength
+                    (-> Outgoing (System.Nullable long) void) #:set))
   (out-headers   (: Microsoft.AspNetCore.Http.HttpResponse.Headers     (-> Outgoing HeaderDict) #:get))
   (header-add!   (: Microsoft.AspNetCore.Http.HeaderDictionaryExtensions.Append
                     (-> HeaderDict string Values void)))
@@ -246,10 +265,10 @@
   (set-environment-variable! "ASPNETCORE_WEBROOT" static-dir)
   (build-app (slim-builder)))
 
-;; Middleware function bridging Kestrel requests to the worker inbox.
+;; The pipeline's last step, bridging Kestrel requests to the worker inbox.
 ;; Returns a 503 if the queue is full.
-(: knock (-> (Inbox (Call Ctx Unit)) Ctx (-> Task) Task))
-(defun (knock requests ctx next)
+(: knock (-> (Inbox (Call Ctx Unit)) Ctx Task))
+(defun (knock requests ctx)
   (match (inbox-try-call/token requests ctx (ctx-aborted ctx))
     ((Some answering) (cast Task answering))
     (None (refuse! ctx))))
@@ -297,12 +316,18 @@
      (ignore (call-reply! c unit))
      unit)))
 
+(: knock-step (-> (Inbox (Call Ctx Unit)) (-> Ctx Task)))
+(defun (knock-step requests) (fun (ctx) (knock requests ctx)))
+
 (: install-inbox! (-> App (Inbox (Call Ctx Unit)) bool void))
 (defun (install-inbox! app requests static-files?)
   (when static-files?
     (ignore (use-static-files! (cast Pipeline app))))
-  (ignore (use! (cast Pipeline app)
-                (fun (ctx next) (knock requests ctx next)))))
+  (def step (cast Delegate (cast Object (knock-step requests))))
+  (run! (cast Pipeline app)
+        (cast RequestDelegate
+              (as-delegate (clr-type "Microsoft.AspNetCore.Http.RequestDelegate, Microsoft.AspNetCore.Http.Abstractions")
+                           (fn-target step) (fn-method step)))))
 
 ;; Starts the server asynchronously. Workers are spawned in the caller's scope.
 ;;
@@ -483,15 +508,20 @@
 ;; runs, and it gets a fiber that waits for that and cancels the scope.
 (: handled (-bjo-> Serving (Call Ctx Unit) Request (Option (Result Exception Response))))
 (defbjo (handled serving c req)
+  (def router (record-ref serving router))
+  ;; A scope that can be cancelled costs a token and a canceller more than one
+  ;; that cannot, so it is made only for `#:cancel-on-disconnect`.
   (def outcome
-    (try (with-cancel (stop)
-           (when (record-ref serving cancel-on-disconnect)
-             ;; Cancelled with the scope when the handler is done.
-             (spawn/daemon (let ()
-                             (sync (call-abandoned c))
-                             (stop (Requested "the client has gone")))))
-           (handle (record-ref serving router) req))
-         #:catch (System.Exception)))
+    (if (record-ref serving cancel-on-disconnect)
+        (try (with-cancel (stop)
+               ;; Cancelled with the scope when the handler is done.
+               (spawn/daemon (let ()
+                               (sync (call-abandoned c))
+                               (stop (Requested "the client has gone"))))
+               (handle router req))
+             #:catch (System.Exception))
+        (try (with-scope (handle router req))
+             #:catch (System.Exception))))
   (if (client-gone? (call-request c)) None (Some outcome)))
 
 ;; Whether the client has gone. The call is abandoned when this token fires,
@@ -714,7 +744,7 @@
   (def headers (collect-headers (in-headers in)))
   (match (reached-as trusted ctx headers)
     ((Tuple scheme host client)
-     (make-request/streamed (in-method in)
+     (make-request/streamed (known-word (in-method/clr in))
                             ;; The path text is already percent-decoded.
                             (text-or-empty (path-text (in-path in)))
                             (parse-query (text-or-empty (query-text (in-query in))))
@@ -783,6 +813,41 @@
           (:do (mutablemap-set! table name (string-downcase name))))
     table))
 
+;; The methods and schemes a request names, as Bjolang strings made once and
+;; keyed by Kestrel's string, so that reading one converts nothing.
+(: known-words (MutableMap System.String string))
+(def known-words
+  ;; Not `table`: the generated C# puts the locals of every top-level `def`
+  ;; in one scope, so a second `table` collides with the first.
+  (let ((words (mutablemap)))
+    (loop (:for word ["GET" "HEAD" "POST" "PUT" "PATCH" "DELETE" "OPTIONS" "http" "https"])
+          (:do (mutablemap-set! words (string->clr-string word) word)))
+    words))
+
+(: known-word (-> System.String string))
+(defun (known-word clr)
+  (def known (mutablemap-ref-or known-words clr ""))
+  (if (string-empty? known) (clr-string->string clr) known))
+
+;; The content types bjoweb's own answers use, as .NET strings made once, so
+;; that setting one converts nothing; about 74 bytes a response.
+(: known-content-types (MutableMap string System.String))
+(def known-content-types
+  (let ((types (mutablemap)))
+    (loop (:for ct ["text/plain; charset=utf-8" "text/html; charset=utf-8"
+                    "application/json; charset=utf-8" "application/octet-stream"
+                    "text/event-stream"])
+          (:do (mutablemap-set! types ct (string->clr-string ct))))
+    types))
+
+(: no-clr-string System.String)
+(def no-clr-string (string->clr-string ""))
+
+(: clr-content-type (-> string System.String))
+(defun (clr-content-type ct)
+  (def known (mutablemap-ref-or known-content-types ct no-clr-string))
+  (if (= (clr-length known) 0) (string->clr-string ct) known))
+
 (: header-name (-> string string))
 (defun (header-name name)
   (def known (mutablemap-ref-or known-header-names name ""))
@@ -840,7 +905,7 @@
 ;; ignored.
 (: reached-as (-> (Vec Network) Ctx Headers (Tuple string string string)))
 (defun (reached-as trusted ctx headers)
-  (def scheme (in-scheme (ctx-request ctx)))
+  (def scheme (known-word (in-scheme/clr (ctx-request ctx))))
   (def host (headers-ref-or headers "host" ""))
   (match (peer-ip ctx)
     ((Some ip) (if (and (forwarding? headers) (trusted? trusted ip))
@@ -942,19 +1007,19 @@
 (: send-fixed! (-bjo-> Ctx Body void))
 (defbjo (send-fixed! ctx body)
   (def out (ctx-response ctx))
-  (def head? (= (in-method (ctx-request ctx)) "HEAD"))
+  (def head? (= (known-word (in-method/clr (ctx-request ctx))) "HEAD"))
   (match body
     ((Text s)
-     (content-length! out (int->string (string-length s)))
+     (content-length! out (cast System.Int64 (string-length s)))
      (unless (or head? (string-empty? s))
        (body-write-text! (out-body out) (.AsMemory s))))
     ((Bytes data) (send-bytes! out data head?))
-    (_ (content-length! out "0"))))
+    (_ (content-length! out 0L))))
 
 (: send-bytes! (-bjo-> Outgoing (Array byte) bool void))
 (defbjo (send-bytes! out bytes head?)
   (def n (array-length bytes))
-  (content-length! out (int->string n))
+  (content-length! out (cast System.Int64 n))
   (when (and (> n 0) (not head?))
     (body-write! (out-body out) bytes 0 n)))
 
@@ -974,8 +1039,8 @@
      (try
          (let ()
            (write-head! ctx answer #t)
-           (content-length! (ctx-response ctx) (.ToString (file-length opened)))
-           (unless (= (in-method in) "HEAD")
+           (content-length! (ctx-response ctx) (file-length opened))
+           (unless (= (known-word (in-method/clr in)) "HEAD")
              (copy-to! file (out-body (ctx-response ctx)))))
        #:finally (dispose! file)))
     ((Err e)
@@ -987,9 +1052,11 @@
                   " cannot send " path ": " (.-Message e)))
         (write-response! ctx (server-error)))))))
 
-(: content-length! (-> Outgoing string void))
+;; Kestrel's own property, not a header: a header took the number as a
+;; Bjolang string, then a .NET one, about 125 bytes a response.
+(: content-length! (-> Outgoing long void))
 (defun (content-length! out n)
-  (header-add! (out-headers out) "Content-Length" (Values. n)))
+  (out-length! out (cast (System.Nullable long) n)))
 
 ;; The status, the content type and the headers. `drop-length` leaves out a
 ;; `Content-Length` among them, for a body whose length is known here.
@@ -997,7 +1064,7 @@
 (defun (write-head! ctx answer drop-length)
   (def out (ctx-response ctx))
   (out-status! out (response-status answer))
-  (out-type! out (response-content-type answer))
+  (out-type! out (clr-content-type (response-content-type answer)))
   (loop (:for h (response-headers answer))
         (:do (match h
                ((Tuple name value)

@@ -672,7 +672,7 @@
   (def texts (make-chan))
   (def over (make-inbox 1 DropNewest))
   (say! port (str ":\n" (match retry
-                           ((Some d) (str "retry: " (->str (duration->timer-ms d)) "\n\n"))
+                           ((Some d) (str "retry: " (displayed (duration->timer-ms d)) "\n\n"))
                            (None ""))))
   (def ending
     (try

@@ -281,6 +281,16 @@
   (header-add! (out-headers out) "Retry-After" (Values. "1"))
   nothing-to-do)
 
+;; The URL Kestrel listens at. An IPv6 address has colons of its own, so it
+;; goes in brackets, `http://[::1]:8080`; one written in brackets already is
+;; left as it is.
+(: listen-url (-> string int string))
+(defun (listen-url host port)
+  (def bracketed (if (and (string-contains? host ":") (not (string-starts-with? host "[")))
+                     (str "[" host "]")
+                     host))
+  (str "http://" bracketed ":" (int->string port)))
+
 (: latch (-> (Inbox Unit)))
 (defun (latch) (make-inbox 1 DropNewest))
 
@@ -357,7 +367,7 @@
   (def requests (make-request-inbox queue))
   (def going-away (latch))
   (def app (new-app quiet static-dir))
-  (def url (str "http://" host ":" (int->string port)))
+  (def url (listen-url host port))
   (ignore (.Add (app-urls app) url))
   (install-inbox! app requests static-files)
   (watch-host! app going-away)
@@ -410,7 +420,7 @@
   (def requests (make-request-inbox queue))
   (def going-away (latch))
   (def app (new-app quiet static-dir))
-  (def url (str "http://" host ":" (int->string port)))
+  (def url (listen-url host port))
   ;; Taken now: a host that fails is disposed before its failure arrives here.
   (def up (started (app-lifetime app)))
   (install-inbox! app requests static-files)
@@ -742,16 +752,18 @@
 (defun (read-request ctx trusted max-body)
   (def in (ctx-request ctx))
   (def headers (collect-headers (in-headers in)))
+  (def query-all (parse-query-all (text-or-empty (query-text (in-query in)))))
   (match (reached-as trusted ctx headers)
     ((Tuple scheme host client)
      (make-request/streamed (known-word (in-method/clr in))
                             ;; The path text is already percent-decoded.
                             (text-or-empty (path-text (in-path in)))
-                            (parse-query (text-or-empty (query-text (in-query in))))
+                            (map-map-values (fun (vs) (vec-ref vs 0)) query-all)
                             headers
                             (fun (limit) (open-body ctx limit))
                             max-body
-                            #:scheme scheme #:host host #:client client))))
+                            #:scheme scheme #:host host #:client client
+                            #:query-all (Some query-all)))))
 
 ;; The body as a port, with Kestrel's limit on it set to `limit`: a read past
 ;; it raises a `BadHttpRequestException` saying 413, and so does the first

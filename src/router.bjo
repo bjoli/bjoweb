@@ -240,12 +240,24 @@
        i)
       (else (go (+ i 1))))))
 
-;; Returns all methods that match the path pieces.
+;; The methods the path is served for, each once: the ones its routes name, in
+;; route order, then `HEAD` if one of them is `GET`, then `OPTIONS`, which
+;; `handle` answers for every path that has a route. Empty when no route has
+;; the path.
 (: allowed-methods (-> Router (Array string) (Vec string)))
 (defun (allowed-methods rt pieces)
-  (loop (:for r (record-ref rt routes))
-        (:when (segments-match? (record-ref r segments) pieces))
-        (:acc out (vecing (record-ref r method)))))
+  (def written
+    (loop (:for r (record-ref rt routes))
+          (:when (segments-match? (record-ref r segments) pieces))
+          (:acc out (folding (vec-empty) (add-missing out (record-ref r method))))))
+  (if (vec-empty? written)
+      written
+      (add-missing (if (vec-contains written "GET") (add-missing written "HEAD") written)
+                   "OPTIONS")))
+
+(: add-missing (-> (Vec string) string (Vec string)))
+(defun (add-missing methods m)
+  (if (vec-contains methods m) methods (vec-add methods m)))
 
 ;; Matches a request against the router's routes.
 ;; Falls back to matching GET routes for HEAD requests.
@@ -279,9 +291,16 @@
           (else (go (+ i 1))))))
 
 ;; Dispatches a request to the appropriate handler based on the router.
+;;
+;; An `OPTIONS` that no route of its own takes is answered 204 with `Allow`,
+;; as RFC 9110 asks. A CORS preflight needs more headers than that, so a
+;; program that takes cross-origin requests gives `OPTIONS` a route.
 (: handle (-bjo-> Router Request Response))
 (defbjo (handle rt req)
   (match (router-match rt req)
     ((Matched bound handler) (handler bound))
-    ((WrongMethod allow) (method-not-allowed allow))
+    ((WrongMethod allow)
+     (if (= (request-method req) "OPTIONS")
+         (respond 204 "" #:headers [(Tuple "Allow" allow)])
+         (method-not-allowed allow)))
     (Unmatched ((record-ref rt fallback) req))))

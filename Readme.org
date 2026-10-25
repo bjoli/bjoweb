@@ -92,15 +92,28 @@ taking a fallback: ~(request-query-or req "page" "1")~. The last three are what 
 client used, which behind a reverse proxy is not what the connection says; see
 Behind a proxy.
 
+A query parameter given more than once is the first of its values to
+~request-query~. ~(request-query-all req "tag")~ is every value, in the order
+they came: ~?tag=a&tag=b~ is ~["a" "b"]~, and a parameter that is not there is
+~[]~.
+
 *** Reading the body
 
 | ~(request-body req)~                | the whole body as UTF-8 text, or ~""~              |
 | ~(request-bytes req)~               | the whole body as it came, an ~(Array byte)~       |
 | ~(request-form req "email")~        | a form field, urlencoded or multipart; ~-or~ too   |
+| ~(request-form-all req "tag")~      | every value of a field, in order; ~[]~ if none    |
+| ~(request-json req)~                | the body as JSON: ~(Ok json)~ or ~(Err why)~    |
+| ~(request-json-as req)~             | the same, read as the type wanted              |
 | ~(request-body-port req)~           | the body as a ~InputPort~, read as it arrives  |
 
+A field given more than once — the ticked boxes of a checkbox group, the
+options of a ~<select multiple>~ — is the first of its values to
+~request-form~, and all of them to ~request-form-all~. In a multipart form,
+the parts that are files are left out of both.
+
 A body is read when a handler first asks for it, not before, so a request
-answered 401 or 404 is never read at all. That is why these four suspend,
+answered 401 or 404 is never read at all. That is why these suspend,
 where the rest of a request's accessors do not: a handler that reads the body
 is a ~defbjo~ or a ~bjoroutine~, and a ~(fun (req) ...)~ that tries is a
 compile error. What is read is kept, so a middleware and the handler after it
@@ -131,6 +144,40 @@ An upload too big to hold goes through the port, which has its own limit:
 There is one port. Once it is taken, ~request-body~ and the rest raise; a body
 already read into memory is served from there instead. A request made with
 ~make-request~ has its body in memory already, and no limit applies to it.
+
+*** JSON
+
+~request-json~ reads the body as a ~Json~, the tree of ~(text json)~, which
+~(bjoweb core)~ passes on with its cases. ~request-json-as~ reads it as the
+type the handler wants: a record declared with ~def/json-type~ from
+~(text json-codec)~, a ~Vec~ or a ~Map~ of one, or any type with a ~json->~
+instance. ~json~ answers with any value that has a ~->json~ instance:
+
+#+BEGIN_SRC scheme
+(import (text json-codec))
+
+(def/json-type
+  (: Item (Record (: name string)
+                  (: count int)
+                  (: tags (Vec string) #:default []))))
+
+(: add-items (-bjo-> Request Response))
+(defbjo (add-items req)
+  (match (: (request-json-as req) (Result string (Vec Item)))
+    ((Ok items) (json items #:status 201))
+    ((Err why) (bad-request why))))
+#+END_SRC
+
+Both answer a ~Result~, and a body that is not JSON, or not of the shape
+wanted, is an ~Err~ saying what was wrong: ~line 1, column 7: '}' does not
+begin a value~, or ~Item.count: expected an integer~. What to answer then is
+the handler's to decide; ~bad-request~ sends the message back as a 400.
+
+The body is read into memory, so ~#:max-body~ applies, and a body over it
+still raises and is answered 413. A middleware and the handler can both read
+it. It has to be UTF-8, as JSON is: one that is not is an ~Err~, not read with
+U+FFFD in it. The ~Content-Type~ is not looked at. ~json~ writes the keys of an
+object in sorted order, since a ~Map~ does not keep the order they came in.
 
 *** Forms with files in them
 
@@ -179,7 +226,8 @@ as they arrive.
 
 | ~(text "hi")~                  | ~text/plain; charset=utf-8~            |
 | ~(html "<p>hi</p>")~           | ~text/html; charset=utf-8~             |
-| ~(json-text "{\"a\":1}")~      | ~application/json; charset=utf-8~      |
+| ~(json value)~                 | ~application/json; charset=utf-8~, from any value with ~->json~; see JSON |
+| ~(json-text "{\"a\":1}")~      | the same, from text that is JSON already |
 | ~(respond 418 "no" #:content-type "text/plain")~ | anything else        |
 | ~(binary bytes)~               | ~application/octet-stream~, or ~#:content-type~ |
 | ~(file "/srv/cat.png" #:content-type "image/png")~ | a file, sent from the disk |
@@ -555,7 +603,10 @@ Three things happen to a request:
 
 - a route matches — its handler runs;
 - the *path* matches but no route has that verb — 405, with the ~Allow~ header
-  the RFC asks for and nobody sends;
+  the RFC asks for and nobody sends. It names each method once, ~HEAD~ where
+  there is a ~GET~, and ~OPTIONS~. An ~OPTIONS~ that no route takes is
+  answered 204 with the same ~Allow~; a CORS preflight needs more headers than
+  that, so a program that takes cross-origin requests gives ~OPTIONS~ a route;
 - nothing matches — the fallback, which is a plain 404 until
   ~(with-fallback rt handler)~ says otherwise.
 
@@ -858,6 +909,19 @@ handed to a waiting receiver is taken. See Bjolang's changelog for all three.
 From 0.9.0 on it needs one with a single ~OutputPort~ type ("One output port
 type, which writes UTF-8").
 
+*** From 0.11 to 0.12
+
+- ~Request~ has a ~query-all~ field, every value of each query parameter. A
+  program that builds one as a record, rather than with ~make-request~, has to
+  name it. ~make-request~ takes ~#:query-all~ for a request with a parameter
+  given more than once.
+- ~Allow~ on a 405 names each method once, and ~HEAD~ and ~OPTIONS~ too. An
+  ~OPTIONS~ with no route of its own is answered 204, not 405.
+- ~(bjoweb core)~ exports ~json~, ~request-json~ and ~request-json-as~, and
+  passes on ~Json~ with its cases. A module that has its own ~json~, or
+  imports ~Json~ from ~(text json)~ as well, has two of one name to choose
+  between.
+
 *** From 0.8 to 0.9
 
 - A ~stream~ or ~stream-text~ writer is ~(-bjo-> OutputPort void)~, for both:
@@ -917,7 +981,7 @@ not have it; ~dotnet/aspnet~ does.
 #+BEGIN_SRC sh
 bjo run tests/html.bjo    ;; 46 checks, no server anywhere
 bjo run tests/auth.bjo    ;; 71 checks, no server anywhere
-bjo run tests/demo.bjo    ;; 106 checks, a real socket
+bjo run tests/demo.bjo    ;; 135 checks, a real socket
 #+END_SRC
 
 ~tests/auth.bjo~ makes requests with ~make-request~ and sends back the cookie
@@ -943,11 +1007,14 @@ left byte for byte, escaping in text and in attribute values, that an attribute
 value never gains a newline, computed content through ~,~, ~raw~ and a script,
 fragments, and the document and response wrappers.
 
-A hundred and six checks: the routing table on its own, and cookies read from a
-header and written to one — decoded, unquoted, the first of two with one name,
+A hundred and thirty-five checks: the routing table on its own — with an
+~Allow~ that names each method once, and an ~OPTIONS~ answered 204 unless a
+route of its own takes it — query strings, forms and JSON read from requests
+made by hand, and cookies read from a header and written to one — decoded, unquoted, the first of two with one name,
 the careful defaults, a deleted cookie, any text there and back, and what is
 refused. Then a real Kestrel on a port the test picks, fetched over a socket
-with ~(std http)~ — percent-encoded paths, query strings, request headers, a
+with ~(std http)~ — percent-encoded paths, query strings and every value of a
+repeated parameter or form field, request headers, a
 POST body, a suspending handler, a handler that raises, the 404 and the 405, a
 redirect, two ~Cookie~ headers read as one and two cookies set as two
 ~Set-Cookie~ lines (those two over a plain socket, to send the headers as an
@@ -971,6 +1038,12 @@ answered 413 whether its length was said or it came chunked, an upload of 5000
 bytes through the port, and 5000 bytes that nobody reads, which are not
 refused. Leaving the limit unset, or answering Kestrel's refusal with a 500,
 makes the 413 checks fail.
+
+JSON: a body read as a tree and as records, read twice, and answered in JSON
+with sorted keys and the status asked for; a body that is not JSON, and one
+of the wrong shape, an ~Err~ saying where and which field, which a handler
+answers 400 with; and one that is not UTF-8, an ~Err~ rather than read with
+U+FFFD in it.
 
 Multipart: a form whose file is left out, made by hand and sent; and parts
 read one at a time past a preamble — a file bigger than both ~#:max-body~ and
@@ -1010,7 +1083,8 @@ The test's client is on loopback, so to the first server it is a trusted proxy:
 its ~X-Forwarded-*~ are believed, but not an address written left of the one
 it added, and a trusted proxy further out is looked past. A server told to
 trust only other networks ignores the same headers, and one told to trust a
-host name does not start. Nor does one on a port something else listens on,
+host name does not start. One on ~#:host "::1"~ listens at ~http://[::1]:~
+and serves there. Nor does one on a port something else listens on,
 and the scope it was started in still ends: leaving its workers waiting there,
 as 0.5.0 did, makes the test hang.
 

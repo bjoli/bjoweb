@@ -19,6 +19,10 @@
 ** DONE cross-origin-guard: Sec-Fetch-Site, then Origin, as Go's CrossOriginProtection
 ** DONE safe-next, password-matches?, a throttle
 ** DONE with-middleware: one middleware over a whole router
+* DONE Fields given more than once: request-query-all, request-form-all, parse-query-all
+* DONE Allow names each method once, with HEAD and OPTIONS; OPTIONS answered 204
+* DONE An IPv6 #:host is listened at in brackets
+* DONE JSON: request-json, request-json-as, json; Json passed on with its cases
 * TODO Logins: a store in SQLite, with a DELETE of ended logins
 * TODO Logins: flash messages, which need data on a login and not only the user
 * TODO An access log, with the client's address

@@ -25,10 +25,11 @@
   request-scheme request-host request-client
   request-query request-header request-param
   request-query-or request-header-or request-param-or
+  request-query-all
   request-cookie request-cookie-or
 
   ;; Its body, which is read when it is asked for, and so suspends.
-  request-body request-bytes request-body-port request-form request-form-or
+  request-body request-bytes request-body-port request-form request-form-or request-form-all
 
   ;; A multipart body, one part at a time; the part functions are
   ;; `(bjoweb multipart)`'s.
@@ -36,11 +37,14 @@
   part-name part-filename part-content-type part-header
   part-read-some part-bytes part-text
 
+  ;; A JSON body. `Json` is `(text json)`'s, passed on with its cases.
+  request-json request-json-as
+
   ;; What a query string and an urlencoded form are written in.
-  parse-query
+  parse-query parse-query-all
 
   ;; Making an answer.
-  respond text html json-text binary file redirect
+  respond text html json json-text binary file redirect
   not-found method-not-allowed bad-request server-error
 
   ;; Answers written as they are produced.
@@ -64,9 +68,15 @@
 (import (only (std inbox) WhenFull make-inbox inbox-close! inbox-closed))
 (import (net websocket protocol))
 (import (bjoweb multipart))
+(import (only (text json) Json read-json json->string))
+(import (text json-codec))
 
 ;; A multipart body's parts, passed on so that one import is enough.
 (re-export Parts Part)
+
+;; What `request-json` answers, passed on with its cases, so that a handler
+;; can match on it with this import alone.
+(re-export Json)
 
 (import/class
   (Refusal   (: System.ArgumentException (-> string Refusal)))
@@ -110,7 +120,7 @@
 (type (: RequestBody #:opaque (Record (: source BodySource)
                                       (: limit int)
                                       (: state (Box BodyState))
-                                      (: form (Box (Option (Map string string)))))))
+                                      (: form (Box (Option (Map string (Vec string))))))))
 
 ;; A request's headers: the names lower-cased, each with its value, in the
 ;; order they came. A name that came more than once has one value, its values
@@ -124,9 +134,12 @@
 ;; Note: `headers` keys are lower-cased. `body` is read when it is first asked
 ;; for, not before. `scheme`, `host` and `client` are what the client used,
 ;; which behind a proxy is not what the connection says: see `request-client`.
+;; `query` has the first value of each parameter, and `query-all` every value,
+;; in the order they came.
 (type (: Request (Record (: method string)
                          (: path string)
                          (: query (Map string string))
+                         (: query-all (Map string (Vec string)))
                          (: headers Headers)
                          (: params (Map string string))
                          (: body RequestBody)
@@ -185,12 +198,18 @@
 ;; client.
 ;;
 ;; The body is in memory already, so no limit applies to reading it.
+;;
+;; `#:query-all` gives each parameter every value it has, for a request with a
+;; parameter given more than once; without it, each has the one value in
+;; `query`.
 (: make-request (-> string string (Map string string) (Map string string) string
                     (#:scheme string) (#:host string) (#:client string)
+                    (#:query-all (Option (Map string (Vec string))))
                     Request))
-(defun (make-request method path query headers body #:scheme "http" #:host "" #:client "")
-  (new-request method path query (map->headers headers) (InMemory (string->bytes body)) 0
-               scheme host client))
+(defun (make-request method path query headers body #:scheme "http" #:host "" #:client ""
+                     #:query-all None)
+  (new-request method path query (all-or-each query query-all) (map->headers headers)
+               (InMemory (string->bytes body)) 0 scheme host client))
 
 ;; The same, with a body that is read from a port when it is asked for: the
 ;; server's kind. `open` is given a limit and answers the body as a port that
@@ -199,10 +218,20 @@
 (: make-request/streamed (-> string string (Map string string) Headers
                              (-> int InputPort) int
                              (#:scheme string) (#:host string) (#:client string)
+                             (#:query-all (Option (Map string (Vec string))))
                              Request))
 (defun (make-request/streamed method path query headers open max-body
-                              #:scheme "http" #:host "" #:client "")
-  (new-request method path query headers (FromPort open) max-body scheme host client))
+                              #:scheme "http" #:host "" #:client "" #:query-all None)
+  (new-request method path query (all-or-each query query-all) headers (FromPort open) max-body
+               scheme host client))
+
+;; Every value of each parameter: `all` when it was given, or else the one
+;; value each has in `firsts`.
+(: all-or-each (-> (Map string string) (Option (Map string (Vec string))) (Map string (Vec string))))
+(defun (all-or-each firsts all)
+  (match all
+    ((Some given) given)
+    (None (map-map-values (fun (v) [v]) firsts))))
 
 ;; Headers from lower-cased names and their values, at the same index. The
 ;; arrays become the headers', and are not to be written afterwards.
@@ -244,13 +273,14 @@
           ((= (array-ref names i) name) i)
           (else (go (+ i 1))))))
 
-(: new-request (-> string string (Map string string) Headers BodySource int
+(: new-request (-> string string (Map string string) (Map string (Vec string)) Headers BodySource int
                    string string string
                    Request))
-(defun (new-request method path query headers source limit scheme host client)
+(defun (new-request method path query query-all headers source limit scheme host client)
   (Request (method method)
            (path path)
            (query query)
+           (query-all query-all)
            (headers headers)
            (params (map-empty))
            (body (RequestBody (source source)
@@ -298,6 +328,11 @@
 ;; if a parameter is provided multiple times.
 (: request-query (-> Request string (Option string)))
 (defun (request-query r name) (map-try-ref (record-ref r query) name))
+
+;; Every value of a query parameter, in the order they came: `?tag=a&tag=b`
+;; is `["a" "b"]`. Empty if absent.
+(: request-query-all (-> Request string (Vec string)))
+(defun (request-query-all r name) (map-ref-or (record-ref r query-all) name (vec-empty)))
 
 ;; Gets a header value case-insensitively.
 (: request-header (-> Request string (Option string)))
@@ -421,12 +456,25 @@
 ;; so the server's `#:max-body` applies; a form with files in it that are too
 ;; big for that is read with `request-parts` instead.
 (: request-form (-bjo-> Request string (Option string)))
-(defbjo (request-form r name) (map-try-ref (form-of r) name))
+(defbjo (request-form r name)
+  (match (map-try-ref (form-of r) name)
+    ((Some values) (Some (vec-ref values 0)))
+    (None None)))
 
 (: request-form-or (-bjo-> Request string string string))
-(defbjo (request-form-or r name fallback) (map-ref-or (form-of r) name fallback))
+(defbjo (request-form-or r name fallback)
+  (match (request-form r name)
+    ((Some v) v)
+    (None fallback)))
 
-(: form-of (-bjo-> Request (Map string string)))
+;; Every value of a form field, in the order they came: the boxes of a
+;; checkbox group that were ticked, or the options of a `<select multiple>`.
+;; Empty if absent. Reads the body as `request-form` does.
+(: request-form-all (-bjo-> Request string (Vec string)))
+(defbjo (request-form-all r name) (map-ref-or (form-of r) name (vec-empty)))
+
+;; Every field and all its values. No field has an empty `Vec`.
+(: form-of (-bjo-> Request (Map string (Vec string))))
 (defbjo (form-of r)
   (def kept (record-ref (record-ref r body) form))
   (match (box-ref kept)
@@ -436,7 +484,7 @@
      (def fields
        (cond
          ((string-starts-with? content-type "application/x-www-form-urlencoded")
-          (parse-query (request-body r)))
+          (parse-query-all (request-body r)))
          (else
           (match (multipart-boundary content-type)
             ((Some boundary) (text-fields (read-parts (bytes-port (request-bytes r)) boundary)))
@@ -445,7 +493,7 @@
      fields)))
 
 ;; The parts that are not files, as a form.
-(: text-fields (-bjo-> Parts (Map string string)))
+(: text-fields (-bjo-> Parts (Map string (Vec string))))
 (defbjo (text-fields parts)
   (let go ((fields (map-empty)))
     (match (next-part! parts)
@@ -453,9 +501,12 @@
       ((Some p)
        (match (part-filename p)
          ((Some file) (go fields))
-         (None (go (if (map-contains? fields (part-name p))
-                       fields
-                       (map-set fields (part-name p) (part-text p))))))))))
+         (None (go (add-value fields (part-name p) (part-text p)))))))))
+
+;; `value` after the values `name` has already.
+(: add-value (-> (Map string (Vec string)) string string (Map string (Vec string))))
+(defun (add-value all name value)
+  (map-set all name (vec-add (map-ref-or all name (vec-empty)) value)))
 
 ;; The parts of a `multipart/form-data` body, one at a time as `next-part!`
 ;; asks for them, so that a file in it is never held whole. The body is taken
@@ -468,6 +519,41 @@
   (match (multipart-boundary (request-header-or r "content-type" ""))
     ((Some boundary) (read-parts (request-body-port r #:max-body max-body) boundary))
     (None (raise (cast Exception (Violation. "the body is not multipart/form-data"))))))
+
+;; ---------------------------------------------------------------------------
+;; A JSON body
+;; ---------------------------------------------------------------------------
+;;
+;; The body is read into memory as `request-bytes` reads it, so the server's
+;; `#:max-body` applies and a middleware can read it too. The JSON is read from
+;; those bytes and not from `request-body`, which turns bytes that are not UTF-8
+;; into U+FFFD: a JSON document has to be UTF-8, and one that is not is an
+;; `Err`.
+
+;; The body as JSON, or `(Err why)` when it is not JSON, saying where:
+;; `line 1, column 7: '}' does not begin a value`. What to answer then is the
+;; handler's to decide; `(bad-request why)` is the usual answer. A body over
+;; `#:max-body` still raises, and the server answers 413. The `Content-Type` is
+;; not looked at.
+(: request-json (-bjo-> Request (Result string Json)))
+(defbjo (request-json r) (read-json (bytes-port (request-bytes r))))
+
+;; The body as JSON, read as the type the caller wants: a record declared with
+;; `def/json-type`, a `Vec` or a `Map` of one, or any type with a `json->`
+;; instance. `(Err why)` when the body is not JSON, as for `request-json`, or
+;; not of that shape, saying which field was wrong:
+;; `Order.items: Item.id: expected an integer`.
+(: request-json-as (-bjo-> Request (Result string %a)) (where (json-> %a)))
+(defbjo (request-json-as r)
+  (match (request-json r)
+    ((Ok j) (json-> j))
+    ((Err why) (Err why))))
+
+;; Answers with `value` as JSON: a `Json`, a record declared with
+;; `def/json-type`, a `Vec`, a `Map` with string keys, or anything else with a
+;; `->json` instance. The keys of an object are written in sorted order.
+(: json (-> %a (#:status int) Response) (where (->json %a)))
+(defun (json value #:status 200) (json-text (json->string (->json value)) #:status status))
 
 (: read-to-end (-bjo-> InputPort (Array byte)))
 (defbjo (read-to-end p)
@@ -493,7 +579,12 @@
 ;; `a=1&b=two+words` as a map, decoded, with `+` read as a space. A leading `?`
 ;; is skipped, and the first value is kept for a name given more than once.
 (: parse-query (-> string (Map string string)))
-(defun (parse-query raw)
+(defun (parse-query raw) (query-firsts (parse-query-all raw)))
+
+;; The same, with every value of a name given more than once, in the order
+;; they came: `tag=a&tag=b` is `tag` with `["a" "b"]`.
+(: parse-query-all (-> string (Map string (Vec string))))
+(defun (parse-query-all raw)
   (def text (if (string-starts-with? raw "?") (drop-first raw) raw))
   ;; Most requests have no query.
   (if (string-empty? text)
@@ -502,13 +593,17 @@
             (:when (not (string-empty? pair)))
             (:acc all (folding (map-empty) (add-parameter all pair))))))
 
-(: add-parameter (-> (Map string string) string (Map string string)))
+;; The first value of each name.
+(: query-firsts (-> (Map string (Vec string)) (Map string string)))
+(defun (query-firsts all) (map-map-values (fun (vs) (vec-ref vs 0)) all))
+
+(: add-parameter (-> (Map string (Vec string)) string (Map string (Vec string))))
 (defun (add-parameter all pair)
   (def parts (string-split pair "="))
   (def name (url-decode (vec-ref parts 0)))
   ;; Splits on the first '=' to separate key and value.
   (def value (if (< (vec-length parts) 2) "" (url-decode (join-rest parts))))
-  (if (map-contains? all name) all (map-set all name value)))
+  (add-value all name value))
 
 (: join-rest (-> (Vec string) string))
 (defun (join-rest parts)

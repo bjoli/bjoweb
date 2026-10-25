@@ -37,6 +37,7 @@
 (import (bjoweb server))
 (import (net websocket protocol))
 (import (net websocket client))
+(import (text json-codec))
 
 ;; ---------------------------------------------------------------------------
 ;; A free port, chosen here
@@ -172,6 +173,43 @@
 (: show-query (-bjo-> Request Response))
 (defbjo (show-query req)
   (text (str (request-query-or req "a" "-") ";" (request-query-or req "b" "-"))))
+
+;; Every value of `tag`, and the first one, which `request-query` still gives.
+(: show-query-all (-bjo-> Request Response))
+(defbjo (show-query-all req)
+  (text (str (string-join (request-query-all req "tag") ",") ";" (request-query-or req "tag" "-")
+             ";" (int->string (vec-length (request-query-all req "none"))))))
+
+;; --- JSON bodies -------------------------------------------------------------
+
+(def/json-type
+  (: Item (Record (: name string) (: count int) (: tags (Vec string) #:default []))))
+
+;; The body read as a `Vec` of items, answered with their total and the items
+;; back.
+(: total-items (-bjo-> Request Response))
+(defbjo (total-items req)
+  (match (: (request-json-as req) (Result string (Vec Item)))
+    ((Err why) (bad-request why))
+    ((Ok items)
+     (def total (loop (:for i items) (:acc (summing (record-ref i count)))))
+     (json (map-set (map-set (map-empty) "total" (JsonInt (cast long total)))
+                    "items" (->json items))
+           #:status 201))))
+
+;; The body as a tree, answered with its kind.
+(: json-kind (-bjo-> Request Response))
+(defbjo (json-kind req)
+  (match (request-json req)
+    ((Err why) (bad-request why))
+    ((Ok (JsonObj m)) (text (str "object of " (int->string (map-length m)))))
+    ((Ok (JsonArr v)) (text (str "array of " (int->string (iarray-length v)))))
+    ((Ok _) (text "something else"))))
+
+(: show-form-all (-bjo-> Request Response))
+(defbjo (show-form-all req)
+  (text (str (string-join (request-form-all req "tag") ",") ";" (request-form-or req "tag" "-")
+             ";" (int->string (vec-length (request-form-all req "none"))))))
 
 (: show-header (-bjo-> Request Response))
 (defbjo (show-header req)
@@ -365,6 +403,10 @@
     (route-post   "/ignore"       (fun (req) (text "ignored")))
     (route-post   "/parts"        list-parts)
     (route-get    "/query"        show-query)
+    (route-get    "/query-all"    show-query-all)
+    (route-post   "/form-all"     show-form-all)
+    (route-post   "/json/total"   total-items)
+    (route-post   "/json/kind"    json-kind)
     (route-get    "/headers"      show-header)
     (route-get    "/static/*path" show-rest)
     (route-get    "/environment"  from-the-environment)
@@ -892,6 +934,38 @@
     ((WrongMethod allow) (str "405 " allow))
     (Unmatched "404")))
 
+;; A POST with a JSON body, made by hand.
+(: json-request (-> string Request))
+(defun (json-request body)
+  (make-request "POST" "/" (map-empty) (map-set (map-empty) "content-type" "application/json") body))
+
+(: response-text-or (-> Response string))
+(defun (response-text-or r)
+  (match (response-text r)
+    ((Some s) s)
+    (None "no text")))
+
+;; Two `GET` routes that both match `/users/me`, and a `POST` and an
+;; `OPTIONS` of their own.
+(: users-app Router)
+(def users-app
+  (router
+    (route-get  "/users/me"     (fun (req) (text "me")))
+    (route-get  "/users/:id"    (fun (req) (text "someone")))
+    (route-post "/users/:id"    (fun (req) (text "posted")))
+    (route "OPTIONS" "/cors"    (fun (req) (with-header (text "") "Access-Control-Allow-Origin" "*")))
+    (route-get  "/cors"         (fun (req) (text "cors")))))
+
+;; The status and the `Allow` header `handle` answers with.
+(: handled-allow (-bjo-> Router string string string))
+(defbjo (handled-allow rt method path)
+  (def r (handle rt (make-request method path (map-empty) (map-empty) "")))
+  (def allow (loop (:for h (response-headers r))
+                   (:acc found (folding "" (match h
+                                             ((Tuple "Allow" v) v)
+                                             (_ found))))))
+  (str (int->string (response-status r)) " " allow))
+
 ;; ---------------------------------------------------------------------------
 ;; Running it
 ;; ---------------------------------------------------------------------------
@@ -905,8 +979,96 @@
   (expect "a trailing slash is the same path" (what-happens "GET" "/hello/ada/") "matched ada")
   (expect "one segment too many"   (what-happens "GET" "/hello/ada/x") "404")
   (expect "nothing claims it"      (what-happens "GET" "/nowhere") "404")
-  (expect "the wrong verb"         (what-happens "PUT" "/") "405 GET")
+  (expect "the wrong verb, with HEAD and OPTIONS allowed beside GET"
+          (what-happens "PUT" "/") "405 GET, HEAD, OPTIONS")
   (expect "HEAD is served by GET"  (what-happens "HEAD" "/") "matched ")
+  (expect "two routes of one method name it once in Allow"
+          (handled-allow users-app "PUT" "/users/me") "405 GET, POST, HEAD, OPTIONS")
+  (expect "an OPTIONS with no route of its own is 204, with Allow"
+          (handled-allow users-app "OPTIONS" "/users/me") "204 GET, POST, HEAD, OPTIONS")
+  (expect "an OPTIONS route of its own answers instead"
+          (match (handle users-app (make-request "OPTIONS" "/cors" (map-empty) (map-empty) ""))
+            (r (str (int->string (response-status r)) " "
+                    (string-join (vec-map (fun (h) (match h ((Tuple n v) n))) (response-headers r)) ","))))
+          "200 Access-Control-Allow-Origin")
+  (expect "and its method is in the Allow of another"
+          (handled-allow users-app "DELETE" "/cors") "405 OPTIONS, GET, HEAD")
+  (expect "an OPTIONS for a path nothing has is the fallback's"
+          (handled-allow users-app "OPTIONS" "/nowhere") "404 ")
+
+  ;; --- fields given more than once, with nothing running -------------------
+  (expect "a query parsed with every value of a name"
+          (map-ref-or (parse-query-all "?tag=a&b=1&tag=two+words&tag=") "tag" (vec-empty))
+          ["a" "two words" ""])
+  (expect "and with the first, as before"
+          (map-ref-or (parse-query "tag=a&tag=b") "tag" "-") "a")
+  (expect "a request made by hand has each query value once"
+          (request-query-all (make-request "GET" "/" (map-set (map-empty) "tag" "a") (map-empty) "")
+                             "tag")
+          ["a"])
+  (expect "or every value it is given"
+          (request-query-all (make-request "GET" "/" (map-set (map-empty) "tag" "a") (map-empty) ""
+                                           #:query-all (Some (parse-query-all "tag=a&tag=b")))
+                             "tag")
+          ["a" "b"])
+  (expect "every value of a form field"
+          (request-form-all (make-request "POST" "/" (map-empty)
+                                          (map-set (map-empty) "content-type"
+                                                   "application/x-www-form-urlencoded")
+                                          "tag=a&x=1&tag=b")
+                            "tag")
+          ["a" "b"])
+  (expect "a form field that is not there has no values"
+          (request-form-all (make-request "POST" "/" (map-empty) (map-empty) "") "tag")
+          (vec-empty))
+
+  ;; --- JSON, with nothing running ------------------------------------------
+  (expect "a JSON body as a tree"
+          (match (request-json (json-request "{\"b\": [1, 2.5, null], \"a\": \"x\"}"))
+            ((Ok (JsonObj m)) (str (int->string (map-length m)) " "
+                                   (match (map-ref-or m "b" JsonNull)
+                                     ((JsonArr v) (int->string (iarray-length v)))
+                                     (_ "?"))))
+            ((Ok _) "not an object")
+            ((Err why) why))
+          "2 3")
+  (expect "a body that is not JSON is an Err saying where"
+          (match (request-json (json-request "[1, 2,]"))
+            ((Ok _) "read")
+            ((Err why) why))
+          "line 1, column 7: ']' does not begin a value")
+  (expect "a JSON body read as a record"
+          (match (: (request-json-as (json-request "{\"name\":\"nails\",\"count\":3}")) (Result string Item))
+            ((Ok i) (str (record-ref i name) " " (int->string (record-ref i count)) " "
+                         (int->string (vec-length (record-ref i tags)))))
+            ((Err why) why))
+          "nails 3 0")
+  (expect "a JSON body of the wrong shape is an Err saying which field"
+          (match (: (request-json-as (json-request "[{\"name\":\"nails\",\"count\":\"3\"}]"))
+                    (Result string (Vec Item)))
+            ((Ok _) "read")
+            ((Err why) why))
+          "Item.count: expected an integer")
+  (expect "and one that is not JSON at all, as for request-json"
+          (match (: (request-json-as (json-request "{")) (Result string Item))
+            ((Ok _) "read")
+            ((Err why) why))
+          "line 1, column 2: the document ended inside an object")
+  (expect "a JSON body read twice, as a middleware and its handler may"
+          (let ((r (json-request "{\"name\":\"nails\",\"count\":3}")))
+            (ignore (request-json r))
+            (match (: (request-json-as r) (Result string Item))
+              ((Ok i) (record-ref i name))
+              ((Err why) why)))
+          "nails")
+  (expect "an answer in JSON, from a record, sorted by key"
+          (let ((r (json (Item (name "nails") (count 3) (tags ["iron"])))))
+            (str (response-content-type r) " " (int->string (response-status r)) " "
+                 (response-text-or r)))
+          "application/json; charset=utf-8 200 {\"count\":3,\"name\":\"nails\",\"tags\":[\"iron\"]}")
+  (expect "from a map, with a status"
+          (response-text-or (json (map-set (map-empty) "ok" #t) #:status 202))
+          "{\"ok\":true}")
   (expect "a request made by hand is for the host in its headers"
           (request-host (make-request "GET" "/" (map-empty) (map-set (map-empty) "host" "example.com")
                                       ""))
@@ -984,6 +1146,47 @@
               (expect "a query string, with + for a space"
                       (body-of (str base "/query?a=1&b=two+words")) (Tuple 200 "1;two words"))
 
+              (expect "a query parameter given more than once, every value in order"
+                      (body-of (str base "/query-all?tag=b&x=1&tag=a+c&tag=b"))
+                      (Tuple 200 "b,a c,b;b;0"))
+
+              (expect "a form field given more than once"
+                      (fetched (http-post (str base "/form-all")
+                                          (http/Form [(Tuple "tag" "red") (Tuple "x" "1")
+                                                      (Tuple "tag" "blue")])))
+                      (Tuple 200 "red,blue;red;0"))
+
+              ;; --- JSON bodies --------------------------------------------
+              ;; Over a plain socket, to send bytes that are not UTF-8.
+              (def as-json "Content-Type: application/json\r\n")
+              (def json-post (bjoroutine (path body)
+                               (post-raw port path
+                                         (str as-json "Content-Length: "
+                                              (int->string (array-length body)) "\r\n")
+                                         body)))
+
+              (expect "a JSON body read as records, answered in JSON"
+                      (json-post "/json/total"
+                                 (string->bytes "[{\"name\":\"nails\",\"count\":3},{\"name\":\"screws\",\"count\":4,\"tags\":[\"m4\"]}]"))
+                      (str "201 | {\"items\":[{\"count\":3,\"name\":\"nails\",\"tags\":[]},"
+                           "{\"count\":4,\"name\":\"screws\",\"tags\":[\"m4\"]}],\"total\":7}"))
+
+              (expect "a JSON body of the wrong shape, answered 400 by the handler with why"
+                      (json-post "/json/total" (string->bytes "[{\"name\":\"nails\"}]"))
+                      "400 | 400 Bad Request: Item: the object has no \"count\" field\n")
+
+              (expect "a body that is not JSON, answered 400 by the handler with where"
+                      (json-post "/json/kind" (string->bytes "{\"a\": }"))
+                      "400 | 400 Bad Request: line 1, column 7: '}' does not begin a value\n")
+
+              (expect "a JSON body that is not UTF-8 is refused, not read as U+FFFD"
+                      (vec-ref (string-split (json-post "/json/kind" #[34 255 34]) " ") 0)
+                      "400")
+
+              (expect "a JSON body as a tree"
+                      (json-post "/json/kind" (string->bytes "[1, 2, 3]"))
+                      "200 | array of 3")
+
               (expect "a request header"
                       (fetched (http-get (str base "/headers") #:headers [(Tuple "X-Note" "hi")]))
                       (Tuple 200 "hi"))
@@ -1046,6 +1249,14 @@
               (expect "a multipart form, its file left out"
                       (post-multipart port "/form" multipart small-form)
                       "200 | 1;two words")
+
+              (expect "a multipart field given more than once, its file left out"
+                      (post-multipart port "/form-all" multipart
+                                      (str (form-part "tag" "" "one")
+                                           (form-part "tag" "f.txt" "a file")
+                                           (form-part "tag" "" "two")
+                                           "--XyZ--\r\n"))
+                      "200 | one,two;one;0")
 
               ;; `f` is bigger than #:max-body and than a window, and is full of
               ;; line breaks and dashes that begin like a boundary. `g` ends
@@ -1400,6 +1611,19 @@
                         (Tuple "X-Forwarded-Proto" "https")
                         (Tuple "X-Forwarded-Host" "example.com")])
                   (str "http 127.0.0.1:" (int->string wary-port) " 127.0.0.1"))
+        #:finally (stop-server! server))))
+
+  ;; An IPv6 address as the host. Its colons are its own, so the URL Kestrel
+  ;; is given has it in brackets.
+  (def v6-port (free-port))
+  (with-scope
+    (let ((server (start-server app #:host "::1" #:port v6-port #:workers 1)))
+      (try
+          (let ()
+            (expect "an IPv6 host is listened at in brackets"
+                    (server-url server) (str "http://[::1]:" (int->string v6-port)))
+            (expect "and is served there"
+                    (body-of (str "http://[::1]:" (int->string v6-port) "/")) (Tuple 200 "hello")))
         #:finally (stop-server! server))))
 
   ;; A name is not looked up: what it stands for may change once the server

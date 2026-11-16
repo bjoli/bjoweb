@@ -252,12 +252,12 @@
           (:acc out (folding (vec-empty) (add-missing out (record-ref r method))))))
   (if (vec-empty? written)
       written
-      (add-missing (if (vec-contains written "GET") (add-missing written "HEAD") written)
+      (add-missing (if (vec-contains? written "GET") (add-missing written "HEAD") written)
                    "OPTIONS")))
 
 (: add-missing (-> (Vec string) string (Vec string)))
 (defun (add-missing methods m)
-  (if (vec-contains methods m) methods (vec-add methods m)))
+  (if (vec-contains? methods m) methods (vec-add methods m)))
 
 ;; Matches a request against the router's routes.
 ;; Falls back to matching GET routes for HEAD requests.

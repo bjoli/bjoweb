@@ -56,7 +56,7 @@
   escape escape-attribute)
 
 (import (std prelude))
-(import (only (std hashset) list->hashset hashset-contains?))
+(import (only (std hashset) HashSet list->hashset hashset-contains?))
 (import (bjoweb core))
 
 ;; ---------------------------------------------------------------------------

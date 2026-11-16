@@ -352,7 +352,7 @@
 
 (: string-any-control? (-> string bool))
 (defun (string-any-control? s)
-  (match (string-index (fun (c) (def n (char->integer c)) (or (< n 32) (= n 127))) s)
+  (match (string-find (fun (c) (def n (char->int c)) (or (< n 32) (= n 127))) s)
     ((Some _) #t)
     (None #f)))
 

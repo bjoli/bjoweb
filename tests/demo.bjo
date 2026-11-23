@@ -579,7 +579,7 @@
   (let go ((acc ""))
     (match (sync (choose (wrap (read-some-evt in) (fun (r) (Some r)))
                          (wrap (timeout (seconds 3)) (fun (u) None))))
-      ((Some (Ok (Some bs))) (go (str acc (bytes->string bs #:replace (Some #\xFFFD)))))
+      ((Some (Ok (Some bs))) (go (str acc (bytes->string/lossy bs))))
       (_ acc))))
 
 ;; A POST over a plain socket, with `framing` saying how long its body is and
@@ -659,7 +659,7 @@
         acc
         (match (sync (choose (wrap (read-some-evt in) (fun (r) (Some r)))
                              (wrap (timeout (milliseconds ms)) (fun (u) None))))
-          ((Some (Ok (Some bs))) (go (str acc (bytes->string bs #:replace (Some #\xFFFD)))))
+          ((Some (Ok (Some bs))) (go (str acc (bytes->string/lossy bs))))
           (_ acc)))))
 
 ;; The first part arrives while the writer is still waiting to write the

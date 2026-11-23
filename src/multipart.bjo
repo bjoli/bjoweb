@@ -35,7 +35,7 @@
 ;; an error here.
 (: lenient-text (-> (Array byte) int int string))
 (defun (lenient-text bytes start end)
-  (bytes->string bytes #:start start #:end end #:replace (Some #\xFFFD)))
+  (bytes->string/lossy bytes #:start start #:end end))
 
 ;; ---------------------------------------------------------------------------
 ;; The types

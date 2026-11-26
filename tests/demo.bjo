@@ -1125,7 +1125,7 @@
           "refused | refused | refused | refused | a=1; Path=/; Secure; HttpOnly; SameSite=None")
 
   ;; --- and now a real socket -----------------------------------------------
-  (file-write-text served-file served-text)
+  (raise-err (file-write-text served-file served-text))
   (def port (free-port))
   (def base (str "http://127.0.0.1:" (int->string port)))
 
@@ -1653,6 +1653,6 @@
           "refused")
   (stop-it holder)
 
-  (file-delete served-file)
+  (raise-err (file-delete served-file))
   (println "bjoweb ok")
   0)

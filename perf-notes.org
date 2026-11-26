@@ -94,6 +94,8 @@ Measured with ~dotnet-counters~ (total allocated / requests), two runs each:
 | headers in two arrays, known names lower-cased once          | 4087-4090 |
 | the router matches on slices in an array, binds only the winner | 3583-3588 |
 | ~handled~ calls the handler on the worker's fiber            | 2778-2779 |
+| ~Run~, ~ContentLength~, ~with-scope~ (see "The last 2.8 KB") | 2499-2500 |
+| method, scheme and content type from tables made once        | 2330-2333 |
 
 - *The log category* (~server.bjo~, ~new-app~): while
   ~Microsoft.AspNetCore.Hosting.Diagnostics~ logs at any level, ASP.NET starts
@@ -211,13 +213,98 @@ p99.9 in the 5 s runs stays near the 10-20 ms that Go and Kestrel show, while
 the 20 s counter run gave 1.9 ms; some of that floor may be the first
 seconds after a server starts. Not looked into.
 
+* The last 2.8 KB
+
+Traced again after ~handled~ changed (2,820 B a request sampled), with the
+analyzer also giving the types each bjoweb function allocated, since the
+compiler inlines callees into a state machine and the stacks then end in its
+~MoveNext~.
+
+** What was changed
+
+- *The pipeline's last step* (~install-inbox!~): ~Use(Func<HttpContext,
+  Func<Task>, Task>)~ wraps every request in a closure and a delegate for
+  ~next~, 133 bytes, and ~knock~ never calls ~next~. It is now
+  ~RunExtensions.Run~, which takes a ~RequestDelegate~. A Bjolang lambda is a
+  ~Func<HttpContext, Task>~ and the compiler does not convert it to another
+  delegate type, so it is converted once at start-up with
+  ~Delegate.CreateDelegate~ from the lambda's target and method.
+- *~Content-Length~* (~content-length!~): Kestrel's ~ContentLength~ property,
+  not a header; the header took the number as a Bjolang string and then a
+  .NET one, about 125 bytes a response.
+- *~handled~*: ~with-scope~ unless ~#:cancel-on-disconnect~, which alone
+  needs the canceller of ~with-cancel~. This saved less than expected (486 ->
+  438 B): ~with-scope~ makes nearly all that ~with-cancel~ does, a child token
+  included.
+- *Strings from tables* (~known-words~, ~known-content-types~): the method and
+  the scheme are read as Kestrel's .NET strings (an import that declares
+  ~System.String~ keeps it) and looked up for a Bjolang string made once; the
+  content types of bjoweb's own answers are looked up for a .NET string made
+  once. ~send-fixed!~ and ~write-file!~ compared the method with ~"HEAD"~
+  after converting it, for every response; they use the table too.
+
+All of bjoweb's tests pass. With DATAS on, 25k/s: p99 1.4-1.5 ms, p99.9
+5.2-6.1 ms.
+
+A compiler bug found on the way: the locals of every top-level ~def~ go into
+one C# scope, so two ~(def a (let ((table ...)) ...))~ and ~(def b (let
+((table ...)) ...))~ collide, and the second ~table~ takes the first's type
+("A local variable named 'table' is already defined", and a conversion
+error). ~known-words~ and ~known-content-types~ name theirs differently.
+
+** Where 2.3 KB a request goes now
+
+From the trace before the string tables (2,538 B sampled); the tables took
+~170 B out of ~answer-now~, ~write-response!~ and ~send-fixed!~.
+
+| B/req | where                     | what                                               |
+|-------+---------------------------+----------------------------------------------------|
+|   454 | ~collect-headers~         | names and values converted (324), the two arrays   |
+|   438 | ~handled~                 | the scope: ~Scope~ 111, ~Landing~ 61, ~DynEnv~ 59, its ~Promise<Unit>~ 46, a child token (~Promise<CancelReason>~ 33, ~ForwardWaiter~ 38), closures 59 |
+|   432 | ~answer-now~ (~read-request~ inlined) | strings 142 (path, method, scheme), ~Request~ 89, ~RequestBody~ 61, the body-opening closure 68, its two boxes 72 |
+|   322 | ~worker~                  | one sync of the ~choose~: ~SyncState~, two sinks, two delegates, a ~RecvNode~, a gate node |
+|   273 | ~knock~ (the runtime's inbox call) | ~Call~ 95, its ~Task~ and completion source 88, a ~Gate~ for ~call-abandoned~ with its own lock object 72 |
+|   130 | ~router-match~            | the ~Request~ copy with params 103, ~Matched~      |
+|   103 | the handler               | its ~Response~ and text: the program's own         |
+|    99 | ~path-pieces~             | two slices, the array                              |
+|    86 | ~bind-params~             | the params ~Map~                                   |
+|    62 | ~answer~                  | the ~handed-off~ box                               |
+
+** What would take more
+
+In the runtime, each measured above, none done:
+
+- *A scope made lazily*, ~300-400 B. ~with-scope~ makes its landing, its
+  promise, a new environment and a child token at once, though most handlers
+  spawn nothing and are never cancelled. Making them on the first spawn or
+  the first use of the token is a change in ~Scope.cs~, the most delicate
+  part of the runtime.
+- *A single "receive, or ~None~ once closed" event* in ~(std inbox)~, ~200 B:
+  the worker syncs a ~choose~ of two wrapped events where one event could park
+  directly, as ~chan-get~ does.
+- *~call-abandoned~'s gate made lazily* in ~Call~, ~72 B: nearly no call is
+  ever asked whether it was abandoned through the gate.
+- ~import/extern~ of a property of a generic struct (~KeyValuePair`2.Key~)
+  resolves the declaration and fails at the call. With it, header names could
+  be looked up by Kestrel's string as the method is, ~100 B for four
+  headers. A compiler change.
+
+In bjoweb:
+
+- The ~handed-off~ box, 62 B: a return value would do if nothing after the
+  hand-off can raise; it is subtle for what it saves.
+- ~RequestBody~'s two boxes as one, and the closure that opens the body,
+  ~70-140 B; the closure exists because ~(bjoweb core)~ knows nothing of
+  ASP.NET, and replacing it changes ~make-request/streamed~ again.
+- One array of names and values, not two, ~30 B.
+
 * What is left
 
 - The old bjoweb is in a worktree at ~/tmp/ab/bjoweb-old~ for comparisons;
   ~git worktree remove~ it when done.
 - Other events that, like the gate, keep a losing branch's waiter until they
   fire: worth a look at every ~Publish~ that only adds to a list.
-- What the 2.8 KB a request is now: not traced since ~handled~ changed.
+- The runtime and bjoweb items under "What would take more".
 - DATAS: decide whether a server should turn it off. That needs its memory
   cost measured, and a manifest ~runtime~ setting for
   ~System.GC.DynamicAdaptationMode~ in Bjolang if so.

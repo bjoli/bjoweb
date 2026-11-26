@@ -7,24 +7,26 @@
 ;;     bjo run tests/demo.bjo
 ;;
 ;; It starts a real Kestrel on a port the test picked, fetches from it with
-;; `(std http)`, and stops it again. Nothing is faked: the requests go out over
+;; `(std http client)`, and stops it again. Nothing is faked: the requests go out over
 ;; a socket and come back through the inbox.
 ;;
-;; `(std http)` is imported with its types under a prefix and three defs renamed,
+;; `(std http client)` is imported with its types under a prefix and three defs renamed,
 ;; because it and `(bjoweb core)` both have a `Request`, a `Response`, a `Body`,
-;; a `response-status`, a `response-headers` and a `response-text`. One set is
+;; a `response-status`, a `response-headers`, a `response-text` and a
+;; `make-request`. The test builds no request with the client's `make-request`, so it
+;; leaves it out. One set is
 ;; about the thing being sent and the other about the thing being served, and
 ;; they are not the same types. `prefix-types` for the types, because `rename`
 ;; is for defs and macros only, and it takes the unions' constructors along with
-;; it — hence `http/Text` and `http/DELETE` below.
+;; it — hence `http/Empty` and `http/DELETE` below.
 ;;
 ;; The checks on the bytes a body goes out as are made over a plain socket,
-;; because `(std http)` tidies away what they are about: it drops a leading
+;; because `(std http client)` tidies away what they are about: it drops a leading
 ;; byte order mark while it decodes.
 
 (import (std prelude))
 (import (std simpletest))
-(import (prefix-types (rename (std http)
+(import (prefix-types (rename (except (std http client) make-request)
                               (response-status http-status)
                               (response-headers http-headers)
                               (response-text http-text))
@@ -452,7 +454,7 @@
 (: fetched (-bjo-> http/Request (Tuple int string)))
 (defbjo (fetched req)
   (match (fetch req)
-    ((Err e) (Tuple 0 (.-Message e)))
+    ((Err e) (Tuple 0 (http-error-message e)))
     ((Ok r)
      (let* ((body (http-text r))
             (code (http-status r)))
@@ -467,7 +469,7 @@
 (: status-and-retry (-bjo-> string (Tuple int string)))
 (defbjo (status-and-retry url)
   (match (fetch (http-get url))
-    ((Err e) (Tuple 0 (.-Message e)))
+    ((Err e) (Tuple 0 (http-error-message e)))
     ((Ok r)
      (let* ((code (http-status r))
             (retry (match (response-header r "retry-after")
@@ -515,7 +517,7 @@
 (: length-of (-bjo-> http/Request string))
 (defbjo (length-of req)
   (match (fetch req)
-    ((Err e) (.-Message e))
+    ((Err e) (http-error-message e))
     ((Ok r)
      (let* ((code (http-status r))
             (n (match (response-header r "content-length") ((Some v) v) (None "-"))))
@@ -736,7 +738,7 @@
 (: header-values (-bjo-> string (Vec string) string))
 (defbjo (header-values url names)
   (match (fetch (http-get url))
-    ((Err e) (.-Message e))
+    ((Err e) (http-error-message e))
     ((Ok r)
      (let ((values (loop (:for n names)
                          (:acc out (vecing (match (response-header r n)
@@ -1152,7 +1154,7 @@
 
               (expect "a form field given more than once"
                       (fetched (http-post (str base "/form-all")
-                                          (http/Form [(Tuple "tag" "red") (Tuple "x" "1")
+                                          (form-body [(Tuple "tag" "red") (Tuple "x" "1")
                                                       (Tuple "tag" "blue")])))
                       (Tuple 200 "red,blue;red;0"))
 
@@ -1206,17 +1208,17 @@
                       (body-of (str base "/static/css/site.css")) (Tuple 200 "css/site.css"))
 
               (expect "a body sent and read back"
-                      (fetched (http-post (str base "/echo") (http/Text "ping")))
+                      (fetched (http-post (str base "/echo") (text-body "ping")))
                       (Tuple 200 "{\"said\":\"ping\"}"))
 
               ;; --- request bodies -----------------------------------------
               (expect "a form"
                       (fetched (http-post (str base "/form")
-                                     (http/Form [(Tuple "a" "1") (Tuple "b" "two words")])))
+                                     (form-body [(Tuple "a" "1") (Tuple "b" "two words")])))
                       (Tuple 200 "1;two words"))
 
               (expect "a body asked for twice is read once"
-                      (fetched (http-post (str base "/twice") (http/Text "ping")))
+                      (fetched (http-post (str base "/twice") (text-body "ping")))
                       (Tuple 200 "ping|ping"))
 
               (expect "bytes, as they came"
@@ -1224,7 +1226,7 @@
                       "200 | 0.1.254.255.")
 
               (expect "a body over #:max-body is refused with 413"
-                      (match (fetched (http-post (str base "/echo") (http/Text (xs 2000))))
+                      (match (fetched (http-post (str base "/echo") (text-body (xs 2000))))
                         ((Tuple code body) code))
                       413)
 
@@ -1236,11 +1238,11 @@
                       "413")
 
               (expect "a handler that takes the body as a port may take more"
-                      (fetched (http-post (str base "/upload") (http/Text (xs 5000))))
+                      (fetched (http-post (str base "/upload") (text-body (xs 5000))))
                       (Tuple 200 "5000"))
 
               (expect "a body nobody reads is not refused"
-                      (fetched (http-post (str base "/ignore") (http/Text (xs 5000))))
+                      (fetched (http-post (str base "/ignore") (text-body (xs 5000))))
                       (Tuple 200 "ignored"))
 
               ;; --- multipart ----------------------------------------------

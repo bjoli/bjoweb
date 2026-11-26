@@ -1013,7 +1013,7 @@ route of its own takes it — query strings, forms and JSON read from requests
 made by hand, and cookies read from a header and written to one — decoded, unquoted, the first of two with one name,
 the careful defaults, a deleted cookie, any text there and back, and what is
 refused. Then a real Kestrel on a port the test picks, fetched over a socket
-with ~(std http)~ — percent-encoded paths, query strings and every value of a
+with ~(std http client)~ — percent-encoded paths, query strings and every value of a
 repeated parameter or form field, request headers, a
 POST body, a suspending handler, a handler that raises, the 404 and the 405, a
 redirect, two ~Cookie~ headers read as one and two cookies set as two
@@ -1023,7 +1023,7 @@ through four workers, each getting the answer to its own question. Then a second
 server with one worker and one queue slot, to see that six at once come back
 ~200x2 503+retry-after=1x4~ and that it still serves afterwards.
 
-Bodies are checked byte for byte over a plain TCP socket, because ~(std http)~
+Bodies are checked byte for byte over a plain TCP socket, because ~(std http client)~
 drops a byte order mark while it decodes: text goes out as UTF-8 with none,
 bytes go out as they are, and a 204 sends nothing whatever its handler gave it.
 And ~Content-Length~: in bytes rather than characters, 0 for an empty body, the
